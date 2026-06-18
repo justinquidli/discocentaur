@@ -5,10 +5,13 @@
  * - Claude assistant with per-channel conversation history
  * - Quidli Connect API: lookup wallet addresses for Discord users
  * - x402 payment support (pay-per-request in USDC on Base, no API key needed)
+ * - Per-user Quidli API keys: DM !connect YOUR_KEY to use your own Smart Send wallet
  */
 
 import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
+import { DatabaseSync } from 'node:sqlite';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { createWalletClient, http, parseUnits, encodeFunctionData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -32,6 +35,8 @@ const {
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
+  MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
+  BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
@@ -54,6 +59,53 @@ const DISCORD_MSG_LIMIT = 1900;
 const EDIT_THROTTLE_MS = 750;
 const QUIDLI_BASE_URL = 'https://api.connect.quid.li';
 
+// ─── Encryption helpers ───────────────────────────────────────────────────────
+
+// AES-256-GCM encryption using MASTER_ENCRYPTION_KEY from .env.
+// If no key is set, values are stored in plaintext (with a warning on startup).
+const encKey = MASTER_ENCRYPTION_KEY ? Buffer.from(MASTER_ENCRYPTION_KEY, 'hex') : null;
+
+function encrypt(plaintext) {
+  if (!encKey) return plaintext;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', encKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // Store as iv:tag:ciphertext (all hex)
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decrypt(stored) {
+  if (!encKey) return stored;
+  const [ivHex, tagHex, dataHex] = stored.split(':');
+  const decipher = createDecipheriv('aes-256-gcm', encKey, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  return decipher.update(Buffer.from(dataHex, 'hex')) + decipher.final('utf8');
+}
+
+// ─── Per-user key store ───────────────────────────────────────────────────────
+
+const db = new DatabaseSync('./users.db');
+db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
+  discord_id TEXT PRIMARY KEY,
+  api_key    TEXT NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch())
+)`);
+
+function getUserApiKey(discordId) {
+  const row = db.prepare('SELECT api_key FROM user_keys WHERE discord_id = ?').get(discordId);
+  if (!row) return null;
+  return decrypt(row.api_key);
+}
+
+function setUserApiKey(discordId, apiKey) {
+  db.prepare('INSERT OR REPLACE INTO user_keys (discord_id, api_key) VALUES (?, ?)').run(discordId, encrypt(apiKey));
+}
+
+function deleteUserApiKey(discordId) {
+  db.prepare('DELETE FROM user_keys WHERE discord_id = ?').run(discordId);
+}
+
 // ─── Wallet (for x402 payments) ───────────────────────────────────────────────
 
 let walletClient;
@@ -72,19 +124,19 @@ if (BOT_WALLET_PRIVATE_KEY) {
  * Call Quidli with x402 payment fallback.
  * If QUIDLI_API_KEY is set, uses that instead of paying.
  */
-async function quidliFetch(path, options = {}) {
+async function quidliFetch(path, options = {}, apiKey = QUIDLI_API_KEY) {
   const url = `${QUIDLI_BASE_URL}${path}`;
 
   const headers = {
     'Content-Type': 'application/json',
-    ...(QUIDLI_API_KEY ? { 'x-api-key': QUIDLI_API_KEY } : {}),
+    ...(apiKey ? { 'x-api-key': apiKey } : {}),
     ...(options.headers ?? {}),
   };
 
   const res = await fetch(url, { ...options, headers });
 
-  // x402: payment required — handle the payment flow
-  if (res.status === 402 && walletClient) {
+  // x402: payment required — handle the payment flow (only when using host wallet, not per-user keys)
+  if (res.status === 402 && walletClient && !apiKey) {
     const paymentDetails = await res.json();
     console.log('[x402] payment required:', JSON.stringify(paymentDetails, null, 2));
 
@@ -223,15 +275,21 @@ async function getDiscordRoleMembers(roleQuery, excludeIds = []) {
 
 // ─── Quidli drop ─────────────────────────────────────────────────────────────
 
-async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }) {
-  if (!QUIDLI_API_KEY) {
-    throw new Error('QUIDLI_API_KEY is required for drops (x402 not supported on /drop). Add it to .env.');
+async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
+  // Quidli requires exactly one of id or username per recipient — prefer id if both are set
+  recipients = recipients.map(({ type, id, username }) => {
+    if (id) return { type, id };
+    if (username) return { type, username };
+    return { type };
+  });
+  if (!apiKey) {
+    throw new Error('No Quidli API key available for this drop. DM me `!connect <your-api-key>` to link your account, or ask the bot owner to configure a host key.');
   }
   const idempotencyKey = crypto.randomUUID();
   const res = await quidliFetch('/drop', {
     method: 'POST',
     body: JSON.stringify({ idempotencyKey, chainId, tokenContract, amountInWeiPerRecipient, recipients }),
-  });
+  }, apiKey);
   return res.json();
 }
 
@@ -257,8 +315,8 @@ const RECIPIENT_SCHEMA = {
       enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin'],
       description: 'The social platform type',
     },
-    id: { type: 'string', description: 'Numeric user ID on that platform' },
-    username: { type: 'string', description: 'Handle/username on that platform' },
+    id: { type: 'string', description: 'Numeric user ID on that platform. Use EITHER id OR username, never both.' },
+    username: { type: 'string', description: 'Handle/username on that platform. Use EITHER id OR username, never both.' },
   },
   required: ['type'],
 };
@@ -337,7 +395,7 @@ const tools = [
   },
 ];
 
-async function runTool(name, input, { senderId, botId } = {}) {
+async function runTool(name, input, { senderId, botId, senderApiKey, senderUser } = {}) {
   if (name === 'discord_get_role_members') {
     // Always exclude the sender and the bot, regardless of what Claude passes
     const alwaysExclude = [senderId, botId].filter(Boolean);
@@ -350,7 +408,22 @@ async function runTool(name, input, { senderId, botId } = {}) {
     return JSON.stringify(results, null, 2);
   }
   if (name === 'quidli_drop') {
-    const result = await quidliDrop(input);
+    // Key priority: personal key → owner fallback to host key → block
+    const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      // DM the user privately so the setup instructions don't appear in the channel
+      if (senderUser) {
+        senderUser.send(
+          'To send tokens, you need to connect your Quidli account first.\n\n' +
+          'Get your API key at https://connect.quid.li, then DM me:\n`!connect <your-api-key>`'
+        ).catch(() => {});
+      }
+      return JSON.stringify({
+        error: 'User has no Quidli API key connected. I\'ve sent them a DM with setup instructions. Let them know to check their DMs.',
+      });
+    }
+    const result = await quidliDrop(input, keyToUse);
     return JSON.stringify(result, null, 2);
   }
   if (name === 'quidli_score') {
@@ -508,7 +581,14 @@ async function handleMessage(message) {
 
   // Prefix with sender identity so Claude knows who "me/I/my" refers to
   const senderName = message.member?.displayName ?? message.author.username;
-  const contextualText = `[Sent by @${senderName} (Discord ID: ${message.author.id})]\n${text}`;
+  const senderApiKey = getUserApiKey(message.author.id);
+  const isOwner = BOT_OWNER_ID && message.author.id === BOT_OWNER_ID;
+  const walletNote = senderApiKey
+    ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
+    : isOwner
+      ? '[User is the bot owner — drops will use the host Smart Send wallet]'
+      : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
+  const contextualText = `[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`;
   addToHistory(contextId, 'user', contextualText);
 
   let accumulated = '';
@@ -549,6 +629,8 @@ async function handleMessage(message) {
               const result = await runTool(block.name, block.input, {
                 senderId: message.author.id,
                 botId: message.client.user.id,
+                senderApiKey,
+                senderUser: message.author,
               });
               return {
                 type: 'tool_result',
@@ -587,6 +669,43 @@ async function handleMessage(message) {
   }
 }
 
+// ─── DM command handler ───────────────────────────────────────────────────────
+
+async function handleDM(message) {
+  const content = message.content.trim();
+
+  if (content.startsWith('!connect ')) {
+    const apiKey = content.slice('!connect '.length).trim();
+    if (!apiKey) {
+      await message.reply('Please provide your API key: `!connect <your-api-key>`');
+      return;
+    }
+    setUserApiKey(message.author.id, apiKey);
+    await message.reply(
+      '✅ Connected! Drops will now use your Smart Send wallet.\n\n' +
+      '⚠️ Your API key is stored encrypted and only has access to your Smart Send balance — not your main wallet. ' +
+      'Keep only amounts you\'re comfortable with for sending. DM `!revoke` anytime to disconnect.'
+    );
+    return;
+  }
+
+  if (content === '!revoke') {
+    const had = getUserApiKey(message.author.id);
+    deleteUserApiKey(message.author.id);
+    await message.reply(had
+      ? '🗑️ Your API key has been removed. You won\'t be able to send tokens to others until you reconnect with `!connect <your-api-key>`.'
+      : "You don't have a key stored. Nothing to remove.");
+    return;
+  }
+
+  await message.reply(
+    'Available commands:\n' +
+    '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
+    '`!revoke` — remove your stored API key\n\n' +
+    'Get a Quidli API key at https://connect.quid.li'
+  );
+}
+
 // ─── Discord client ───────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -604,6 +723,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
   console.log(`   Model: ${CLAUDE_MODEL}`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
+  console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   if (ACTIVE_CHANNELS.size > 0) {
     console.log(`   Active channels: ${[...ACTIVE_CHANNELS].join(', ')}`);
   } else {
@@ -615,6 +735,12 @@ client.once(Events.ClientReady, (c) => {
 });
 
 client.on(Events.MessageCreate, (message) => {
+  if (message.author.bot) return;
+  // DMs: handle !connect / !revoke commands
+  if (!message.guild) {
+    handleDM(message).catch((err) => console.error('[dm] unhandled error:', err));
+    return;
+  }
   handleMessage(message).catch((err) =>
     console.error('[bot] unhandled error:', err)
   );

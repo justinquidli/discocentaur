@@ -1,6 +1,9 @@
 # Environment variables — never commit this
 .env
 
+# Per-user API key database — contains sensitive data, never commit
+*.db
+
 # Dependencies
 node_modules/
 
