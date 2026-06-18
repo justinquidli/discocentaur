@@ -1,0 +1,12 @@
+# Environment variables — never commit this
+.env
+
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
