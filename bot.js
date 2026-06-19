@@ -30,13 +30,14 @@ const {
   CLAUDE_MODEL = 'claude-sonnet-4-6',
   DISCORD_ACTIVE_CHANNELS = '',
   DISCORD_ALLOWED_USERS = '',
-  SYSTEM_PROMPT = 'You are a helpful assistant in a Discord server powered by Quidli Connect. You can: (1) look up ETH/SOL wallet addresses for people by their social identity (Discord, Farcaster, email, etc.) using quidli_lookup; (2) send tokens to people using quidli_drop; (3) check web3 reputation scores using quidli_score. Be concise and friendly.',
+  SYSTEM_PROMPT = 'You are a helpful assistant in a Discord server powered by Quidli Connect. You can: (1) look up ETH/SOL wallet addresses for people by their social identity (Discord, Farcaster, email, etc.) using quidli_lookup; (2) send tokens to people using quidli_drop; (3) check web3 reputation scores using quidli_score; (4) search the web for real-time info using web_search; (5) schedule conditional drops using conditional_drop. Be concise and friendly. IMPORTANT: When scheduling a conditional_drop tied to a real-world event (match, game, announcement, etc.), always use web_search first to find the event\'s scheduled time, then set checkInMinutes to 30 minutes after the event is expected to end. Never guess the check time — always look it up.',
   BOT_WALLET_PRIVATE_KEY,
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
+  BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
@@ -91,6 +92,14 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
   api_key    TEXT NOT NULL,
   created_at INTEGER DEFAULT (unixepoch())
 )`);
+db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
+  id         TEXT PRIMARY KEY,
+  sender_id  TEXT NOT NULL,
+  drop_input TEXT NOT NULL,
+  execute_at INTEGER NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch()),
+  executed   INTEGER DEFAULT 0
+)`);
 
 function getUserApiKey(discordId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE discord_id = ?').get(discordId);
@@ -104,6 +113,225 @@ function setUserApiKey(discordId, apiKey) {
 
 function deleteUserApiKey(discordId) {
   db.prepare('DELETE FROM user_keys WHERE discord_id = ?').run(discordId);
+}
+
+// ─── Scheduled drops ─────────────────────────────────────────────────────────
+
+async function executeScheduledDrop(jobId) {
+  const job = db.prepare('SELECT * FROM scheduled_drops WHERE id = ? AND executed = 0').get(jobId);
+  if (!job) return; // already executed, cancelled, or missing
+
+  db.prepare('UPDATE scheduled_drops SET executed = 1 WHERE id = ?').run(jobId);
+
+  const stored = JSON.parse(job.drop_input);
+  const isOwner = BOT_OWNER_ID && job.sender_id === BOT_OWNER_ID;
+  const senderApiKey = getUserApiKey(job.sender_id);
+  const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+
+  try {
+    if (!keyToUse) throw new Error('No API key available — sender may have revoked their key.');
+
+    // If a presenceFilter was stored, resolve recipients NOW (at execution time)
+    let dropInput = { ...stored };
+    if (stored.presenceFilter) {
+      const { statuses, roleId, excludeIds = [] } = stored.presenceFilter;
+      const liveMembers = await getMembersByStatus(statuses, roleId, [job.sender_id, ...excludeIds]);
+      if (liveMembers.length === 0) {
+        const user = await client.users.fetch(job.sender_id).catch(() => null);
+        if (user) await user.send(`⚠️ Your scheduled drop ran but no members matched the status filter at execution time.`).catch(() => {});
+        return;
+      }
+      dropInput.recipients = liveMembers;
+      delete dropInput.presenceFilter;
+    }
+
+    const result = await quidliDrop(dropInput, keyToUse);
+    if (result.transferHash) result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
+
+    // DM the sender
+    const user = await client.users.fetch(job.sender_id).catch(() => null);
+    if (user) {
+      const recipientCount = dropInput.recipients?.length ?? 1;
+      await user.send(
+        `✅ Your scheduled drop executed!\n` +
+        `Sent to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
+        (result.basescanUrl ? `Transaction: ${result.basescanUrl}` : '')
+      ).catch(() => {});
+    }
+    // DM each Discord recipient
+    if (result.transferHash) {
+      const discordRecipients = (dropInput.recipients ?? []).filter((r) => r.type === 'discord' && r.id);
+      for (const r of discordRecipients) {
+        const recipientUser = await client.users.fetch(r.id).catch(() => null);
+        if (recipientUser) {
+          recipientUser.send(
+            `🎉 You just received tokens!\n` +
+            `Transaction: https://basescan.org/tx/${result.transferHash}`
+          ).catch(() => {});
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[scheduled-drop] ${jobId} failed:`, err.message);
+    const user = await client.users.fetch(job.sender_id).catch(() => null);
+    if (user) {
+      await user.send(`⚠️ Your scheduled drop failed: ${err.message}`).catch(() => {});
+    }
+  }
+}
+
+function scheduleDropJob(jobId, executeAt) {
+  const delay = Math.max(0, executeAt - Date.now());
+  setTimeout(() => executeScheduledDrop(jobId), delay);
+}
+
+function loadPendingDrops() {
+  const pending = db.prepare('SELECT id, drop_input, execute_at FROM scheduled_drops WHERE executed = 0').all();
+  for (const job of pending) {
+    const stored = JSON.parse(job.drop_input);
+    const isConditional = stored.type === 'conditional';
+    const executeAt = job.execute_at * 1000;
+    const delay = Math.max(0, executeAt - Date.now());
+    if (isConditional) {
+      setTimeout(() => executeConditionalDrop(job.id), delay);
+    } else {
+      scheduleDropJob(job.id, executeAt);
+    }
+    console.log(`[scheduled-drop] re-queued ${isConditional ? 'conditional' : 'regular'} ${job.id} (executes in ${Math.round(delay / 60000)}m)`);
+  }
+}
+
+// ─── Web search (Brave) ───────────────────────────────────────────────────────
+
+async function braveSearch(query) {
+  if (!BRAVE_SEARCH_API_KEY) throw new Error('BRAVE_SEARCH_API_KEY is not set');
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+        'X-Subscription-Token': BRAVE_SEARCH_API_KEY,
+      },
+    });
+    if (!res.ok) throw new Error(`Brave Search error ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    console.log(`[brave-search] "${query}" → ${data.web?.results?.length ?? 0} results`);
+    return (data.web?.results ?? []).map((r) => ({
+      title: r.title,
+      url: r.url,
+      description: r.description,
+    }));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ─── Conditional drop executor ────────────────────────────────────────────────
+
+async function executeConditionalDrop(jobId) {
+  const job = db.prepare('SELECT * FROM scheduled_drops WHERE id = ? AND executed = 0').get(jobId);
+  if (!job) return;
+
+  db.prepare('UPDATE scheduled_drops SET executed = 1 WHERE id = ?').run(jobId);
+
+  const stored = JSON.parse(job.drop_input);
+  const { condition, dropParams } = stored;
+
+  const senderUser = await client.users.fetch(job.sender_id).catch(() => null);
+
+  try {
+    // Use Claude to evaluate the condition via web search
+    const evalMessages = [
+      {
+        role: 'user',
+        content: `You are evaluating whether a condition is true or false so a token drop can be executed or cancelled.\n\nCondition: "${condition}"\n\nSearch the web to find the answer, then respond with ONLY a JSON object: {"result": true} or {"result": false}. Do not include anything else.`,
+      },
+    ];
+
+    const evalTools = [{
+      name: 'web_search',
+      description: 'Search the web for current information',
+      input_schema: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+      },
+    }];
+
+    let evalMessages2 = evalMessages;
+    let conditionMet = false;
+
+    for (let i = 0; i < 5; i++) {
+      const evalRes = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 512,
+        tools: evalTools,
+        messages: evalMessages2,
+      });
+
+      if (evalRes.stop_reason === 'tool_use') {
+        const toolBlock = evalRes.content.find((b) => b.type === 'tool_use');
+        const searchResults = await braveSearch(toolBlock.input.query);
+        evalMessages2 = [
+          ...evalMessages2,
+          { role: 'assistant', content: evalRes.content },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolBlock.id, content: JSON.stringify(searchResults) }] },
+        ];
+        continue;
+      }
+
+      // Parse the final answer
+      const text = evalRes.content.find((b) => b.type === 'text')?.text ?? '';
+      const match = text.match(/\{.*"result"\s*:\s*(true|false).*\}/s);
+      if (match) conditionMet = match[1] === 'true';
+      break;
+    }
+
+    if (!conditionMet) {
+      if (senderUser) await senderUser.send(`❌ Condition not met: "${condition}"\nDrop cancelled.`).catch(() => {});
+      return;
+    }
+
+    // Condition met — execute the drop
+    const isOwner = BOT_OWNER_ID && job.sender_id === BOT_OWNER_ID;
+    const senderApiKey = getUserApiKey(job.sender_id);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) throw new Error('No API key available — sender may have revoked their key.');
+
+    let resolvedDrop = { ...dropParams };
+    if (dropParams.presenceFilter) {
+      const { statuses, roleId, excludeIds = [] } = dropParams.presenceFilter;
+      resolvedDrop.recipients = await getMembersByStatus(statuses, roleId, [job.sender_id, ...excludeIds]);
+      delete resolvedDrop.presenceFilter;
+    }
+
+    const result = await quidliDrop(resolvedDrop, keyToUse);
+    if (result.transferHash) result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
+
+    if (senderUser) {
+      const recipientCount = resolvedDrop.recipients?.length ?? 1;
+      await senderUser.send(
+        `✅ Condition met: "${condition}"\n` +
+        `Drop executed to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
+        (result.basescanUrl ? `Transaction: ${result.basescanUrl}` : '')
+      ).catch(() => {});
+    }
+
+    // DM recipients
+    if (result.transferHash) {
+      for (const r of (resolvedDrop.recipients ?? []).filter((r) => r.type === 'discord' && r.id)) {
+        const u = await client.users.fetch(r.id).catch(() => null);
+        if (u) u.send(`🎉 You received tokens!\nTransaction: https://basescan.org/tx/${result.transferHash}`).catch(() => {});
+      }
+    }
+
+  } catch (err) {
+    console.error(`[conditional-drop] ${jobId} failed:`, err.message);
+    if (senderUser) await senderUser.send(`⚠️ Conditional drop failed: ${err.message}`).catch(() => {});
+  }
 }
 
 // ─── Wallet (for x402 payments) ───────────────────────────────────────────────
@@ -273,6 +501,86 @@ async function getDiscordRoleMembers(roleQuery, excludeIds = []) {
     }));
 }
 
+// ─── Discord message search ───────────────────────────────────────────────────
+
+async function searchDiscordMessages({ query, channelId, withinMinutes = 60, excludeIds = [], currentChannelId }) {
+  const targetChannelId = channelId || currentChannelId;
+  if (!targetChannelId) throw new Error('No channel ID available');
+
+  const channel = await client.channels.fetch(targetChannelId).catch(() => null);
+  if (!channel) throw new Error(`Channel ${targetChannelId} not found or not accessible`);
+  if (!channel.isTextBased()) throw new Error('Channel is not a text channel');
+
+  const since = Date.now() - withinMinutes * 60 * 1000;
+  const excluded = new Set(excludeIds);
+  const matchingUsers = new Map(); // id → user info
+
+  let lastId = null;
+  let done = false;
+
+  while (!done) {
+    const options = { limit: 100 };
+    if (lastId) options.before = lastId;
+
+    const messages = await channel.messages.fetch(options);
+    if (messages.size === 0) break;
+
+    for (const msg of messages.values()) {
+      if (msg.createdTimestamp < since) { done = true; break; }
+      if (msg.author.bot) continue;
+      if (excluded.has(msg.author.id)) continue;
+      if (query && !msg.content.toLowerCase().includes(query.toLowerCase())) continue;
+      if (!matchingUsers.has(msg.author.id)) {
+        matchingUsers.set(msg.author.id, {
+          type: 'discord',
+          id: msg.author.id,
+          username: msg.author.username,
+          displayName: msg.member?.displayName ?? msg.author.username,
+        });
+      }
+    }
+
+    lastId = messages.last()?.id;
+    if (messages.size < 100) break;
+  }
+
+  return [...matchingUsers.values()];
+}
+
+// ─── Presence-based member lookup ────────────────────────────────────────────
+
+async function getMembersByStatus(statuses, roleId, excludeIds = []) {
+  await ensureMembersFetched();
+  const statusSet = new Set(statuses.map((s) => s.toLowerCase()));
+  const excluded = new Set(excludeIds);
+
+  let members = activeGuild.members.cache;
+
+  // Filter by role if requested
+  if (roleId) {
+    const role = activeGuild.roles.cache.find(
+      (r) => r.id === roleId || r.name.toLowerCase() === roleId.toLowerCase()
+    );
+    if (!role) throw new Error(`Role "${roleId}" not found`);
+    members = role.members;
+  }
+
+  return members
+    .filter((m) => {
+      if (m.user.bot) return false;
+      if (excluded.has(m.id)) return false;
+      const presence = m.presence?.status ?? 'offline';
+      return statusSet.has(presence);
+    })
+    .map((m) => ({
+      type: 'discord',
+      id: m.id,
+      username: m.user.username,
+      displayName: m.displayName,
+      status: m.presence?.status ?? 'offline',
+    }));
+}
+
 // ─── Quidli drop ─────────────────────────────────────────────────────────────
 
 async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
@@ -323,6 +631,48 @@ const RECIPIENT_SCHEMA = {
 
 const tools = [
   {
+    name: 'web_search',
+    description:
+      'Search the web for current information — match results, news, prices, scores, anything real-time. Use whenever the user asks about something that may have happened recently or you need up-to-date facts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'The search query.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'conditional_drop',
+    description:
+      'Schedule a token drop that only executes if a real-world condition is true at a future check time (e.g. "if France wins tonight", "if BTC is above $100k tomorrow morning"). ' +
+      'IMPORTANT: Only use this if the condition can be verified as a clear YES or NO via a web search. ' +
+      'If the condition is ambiguous or cannot be verified objectively, refuse and ask the user to rephrase. ' +
+      'ALWAYS use web_search before calling this tool to find the scheduled time of the event, then set checkInMinutes to 30 minutes after the event is expected to end. Never guess or assume a check time.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        condition: { type: 'string', description: 'The condition to evaluate, stated as a clear yes/no question. E.g. "Did France win their FIFA World Cup match today?"' },
+        checkInMinutes: { type: 'number', description: 'How many minutes from now to check the condition and potentially execute the drop.' },
+        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Explicit list of recipients. Use this OR presenceFilter, not both.' },
+        presenceFilter: {
+          type: 'object',
+          description: 'Resolve recipients by presence status at execution time.',
+          properties: {
+            statuses: { type: 'array', items: { type: 'string', enum: ['online', 'idle', 'dnd', 'offline'] } },
+            roleId: { type: 'string' },
+            excludeIds: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['statuses'],
+        },
+        amountInWeiPerRecipient: { type: 'string' },
+        tokenContract: { type: 'string' },
+        chainId: { type: 'number' },
+      },
+      required: ['condition', 'checkInMinutes', 'amountInWeiPerRecipient', 'tokenContract'],
+    },
+  },
+  {
     name: 'quidli_lookup',
     description:
       'Look up the Ethereum and Solana wallet addresses for one or more people by their social identity (Discord, email, Farcaster, GitHub, Telegram, LinkedIn, Twitter, phone). Use whenever someone asks for a wallet address.',
@@ -363,6 +713,95 @@ const tools = [
     },
   },
   {
+    name: 'discord_search_messages',
+    description:
+      'Search recent messages in a Discord channel and return the unique users who sent matching messages. Use when asked to find users based on what they typed (e.g. "everyone who said gm in the last hour", "users who mentioned launch today"). If no channelId is specified, searches the current channel.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Text to search for in messages (case-insensitive). Omit to match all messages.' },
+        channelId: { type: 'string', description: 'Discord channel ID to search. Omit to search the current channel.' },
+        withinMinutes: { type: 'number', description: 'How far back to search in minutes. Default: 60.' },
+        excludeIds: { type: 'array', items: { type: 'string' }, description: 'Discord user IDs to exclude from results.' },
+      },
+    },
+  },
+  {
+    name: 'discord_get_members_by_status',
+    description:
+      'Get Discord members filtered by their online status (online, idle, dnd, offline). Use when someone wants to send tokens only to members who are currently active or online. Requires the Presence Intent to be enabled in the Discord Developer Portal.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        statuses: {
+          type: 'array',
+          items: { type: 'string', enum: ['online', 'idle', 'dnd', 'offline'] },
+          description: 'List of statuses to include. E.g. ["online", "idle"] for active members.',
+        },
+        roleId: { type: 'string', description: 'Optional: only include members with this role (name or ID).' },
+        excludeIds: { type: 'array', items: { type: 'string' }, description: 'Discord user IDs to exclude (always include the sender\'s ID).' },
+      },
+      required: ['statuses'],
+    },
+  },
+  {
+    name: 'schedule_drop',
+    description:
+      'Schedule a Quidli token drop to execute in the future (e.g. "in 1 hour", "in 30 minutes"). The job is stored in the database so it survives bot restarts. Use when someone says "send X in N minutes/hours" or "schedule a drop for later". Do NOT use for immediate drops — use quidli_drop for those.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        delayMinutes: { type: 'number', description: 'How many minutes from now to execute the drop.' },
+        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Explicit list of recipients. Use this OR presenceFilter, not both.' },
+        presenceFilter: {
+          type: 'object',
+          description: 'Instead of a fixed recipient list, resolve recipients by presence status at execution time. Use when the user says things like "everyone online in 1 hour".',
+          properties: {
+            statuses: { type: 'array', items: { type: 'string', enum: ['online', 'idle', 'dnd', 'offline'] } },
+            roleId: { type: 'string', description: 'Optional role name or ID to further filter members.' },
+            excludeIds: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['statuses'],
+        },
+        amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per recipient.' },
+        tokenContract: { type: 'string', description: 'Token contract address.' },
+        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+      },
+      required: ['delayMinutes', 'amountInWeiPerRecipient', 'tokenContract'],
+    },
+  },
+  {
+    name: 'list_scheduled_drops',
+    description: 'List all pending (not yet executed) scheduled drops for the current user. Use when someone asks what drops they have scheduled or wants to see their queue.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'reschedule_drop',
+    description:
+      'Update the check time of a pending scheduled or conditional drop. Use when someone says "push it back", "change the time", or "recheck the time". ' +
+      'If they ask to recheck the event time, use web_search first to find when the event ends, then call this with the correct newCheckInMinutes. ' +
+      'Get the job ID from list_scheduled_drops if needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'The job ID to reschedule.' },
+        newCheckInMinutes: { type: 'number', description: 'New delay in minutes from NOW to check/execute.' },
+      },
+      required: ['jobId', 'newCheckInMinutes'],
+    },
+  },
+  {
+    name: 'cancel_scheduled_drop',
+    description: 'Cancel a pending scheduled drop by its job ID. Use when someone wants to cancel a drop they scheduled. Get the job ID from list_scheduled_drops first if needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'The job ID of the scheduled drop to cancel.' },
+      },
+      required: ['jobId'],
+    },
+  },
+  {
     name: 'quidli_score',
     description:
       'Get the web3 reputation/social score for a user (Quidli score, Neynar, Lens, Ethos). Accepts any social identity — Discord, Farcaster, email, etc. The Quidli registry resolves identities across platforms automatically. Use when someone asks about reputation, trustworthiness, or social standing.',
@@ -395,13 +834,122 @@ const tools = [
   },
 ];
 
-async function runTool(name, input, { senderId, botId, senderApiKey, senderUser } = {}) {
+async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
+  console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+  if (name === 'web_search') {
+    const results = await braveSearch(input.query);
+    return JSON.stringify(results, null, 2);
+  }
+  if (name === 'conditional_drop') {
+    const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      if (senderUser) {
+        senderUser.send(
+          'To schedule conditional drops, connect your Quidli account first.\n\n' +
+          'Get your API key at https://connect.quid.li, then DM me:\n`!connect <your-api-key>`'
+        ).catch(() => {});
+      }
+      return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
+    }
+    const { condition, checkInMinutes, ...dropParams } = input;
+    const executeAt = Math.floor((Date.now() + checkInMinutes * 60 * 1000) / 1000);
+    const jobId = crypto.randomUUID();
+    // Store type=conditional so the executor knows to evaluate the condition first
+    db.prepare('INSERT INTO scheduled_drops (id, sender_id, drop_input, execute_at) VALUES (?, ?, ?, ?)')
+      .run(jobId, senderId, JSON.stringify({ type: 'conditional', condition, dropParams }), executeAt);
+    setTimeout(() => executeConditionalDrop(jobId), Math.max(0, checkInMinutes * 60 * 1000));
+    return JSON.stringify({
+      success: true,
+      jobId,
+      condition,
+      checkAt: new Date(executeAt * 1000).toISOString(),
+      message: `Conditional drop set. I'll check "${condition}" in ${checkInMinutes} minutes and DM you the outcome.`,
+    });
+  }
   if (name === 'discord_get_role_members') {
     // Always exclude the sender and the bot, regardless of what Claude passes
     const alwaysExclude = [senderId, botId].filter(Boolean);
     const excludeIds = [...new Set([...(input.excludeIds ?? []), ...alwaysExclude])];
     const members = await getDiscordRoleMembers(input.roleName, excludeIds);
     return JSON.stringify(members, null, 2);
+  }
+  if (name === 'discord_get_members_by_status') {
+    const alwaysExclude = [senderId, botId].filter(Boolean);
+    const excludeIds = [...new Set([...(input.excludeIds ?? []), ...alwaysExclude])];
+    const members = await getMembersByStatus(input.statuses, input.roleId, excludeIds);
+    return JSON.stringify(members, null, 2);
+  }
+  if (name === 'list_scheduled_drops') {
+    const jobs = db.prepare('SELECT id, drop_input, execute_at FROM scheduled_drops WHERE sender_id = ? AND executed = 0 ORDER BY execute_at ASC').all(senderId);
+    if (jobs.length === 0) return JSON.stringify({ pending: [] });
+    return JSON.stringify({
+      pending: jobs.map((j) => ({
+        jobId: j.id,
+        scheduledFor: new Date(j.execute_at * 1000).toISOString(),
+        drop: JSON.parse(j.drop_input),
+      })),
+    }, null, 2);
+  }
+  if (name === 'reschedule_drop') {
+    const job = db.prepare('SELECT id, sender_id, drop_input FROM scheduled_drops WHERE id = ? AND executed = 0').get(input.jobId);
+    if (!job) return JSON.stringify({ error: 'No pending drop found with that ID.' });
+    if (job.sender_id !== senderId) return JSON.stringify({ error: 'You can only reschedule your own drops.' });
+    const newExecuteAt = Math.floor((Date.now() + input.newCheckInMinutes * 60 * 1000) / 1000);
+    db.prepare('UPDATE scheduled_drops SET execute_at = ? WHERE id = ?').run(newExecuteAt, input.jobId);
+    // Re-queue with new time
+    const stored = JSON.parse(job.drop_input);
+    const isConditional = stored.type === 'conditional';
+    const delay = Math.max(0, input.newCheckInMinutes * 60 * 1000);
+    if (isConditional) {
+      setTimeout(() => executeConditionalDrop(input.jobId), delay);
+    } else {
+      setTimeout(() => executeScheduledDrop(input.jobId), delay);
+    }
+    return JSON.stringify({
+      success: true,
+      newCheckAt: new Date(newExecuteAt * 1000).toISOString(),
+      message: `Rescheduled — will check in ${input.newCheckInMinutes} minutes.`,
+    });
+  }
+  if (name === 'cancel_scheduled_drop') {
+    const job = db.prepare('SELECT id, sender_id FROM scheduled_drops WHERE id = ? AND executed = 0').get(input.jobId);
+    if (!job) return JSON.stringify({ error: 'No pending drop found with that ID.' });
+    if (job.sender_id !== senderId) return JSON.stringify({ error: 'You can only cancel your own scheduled drops.' });
+    db.prepare('UPDATE scheduled_drops SET executed = 1 WHERE id = ?').run(input.jobId);
+    return JSON.stringify({ success: true, message: 'Scheduled drop cancelled.' });
+  }
+  if (name === 'schedule_drop') {
+    const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      if (senderUser) {
+        senderUser.send(
+          'To schedule token drops, you need to connect your Quidli account first.\n\n' +
+          'Get your API key at https://connect.quid.li, then DM me:\n`!connect <your-api-key>`'
+        ).catch(() => {});
+      }
+      return JSON.stringify({ error: 'User has no Quidli API key connected. Sent them a DM with setup instructions.' });
+    }
+    const { delayMinutes, ...dropInput } = input;
+    const executeAt = Math.floor((Date.now() + delayMinutes * 60 * 1000) / 1000); // unix seconds
+    const jobId = crypto.randomUUID();
+    db.prepare('INSERT INTO scheduled_drops (id, sender_id, drop_input, execute_at) VALUES (?, ?, ?, ?)')
+      .run(jobId, senderId, JSON.stringify(dropInput), executeAt);
+    scheduleDropJob(jobId, executeAt * 1000);
+    const executeDate = new Date(executeAt * 1000);
+    return JSON.stringify({
+      success: true,
+      jobId,
+      scheduledFor: executeDate.toISOString(),
+      message: `Drop scheduled for ${delayMinutes} minute${delayMinutes !== 1 ? 's' : ''} from now. I'll DM you when it executes.`,
+    });
+  }
+  if (name === 'discord_search_messages') {
+    const alwaysExclude = [senderId, botId].filter(Boolean);
+    const excludeIds = [...new Set([...(input.excludeIds ?? []), ...alwaysExclude])];
+    const results = await searchDiscordMessages({ ...input, excludeIds, currentChannelId });
+    return JSON.stringify(results, null, 2);
   }
   if (name === 'quidli_lookup') {
     const results = await quidliLookup(input.recipients);
@@ -424,6 +972,23 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser 
       });
     }
     const result = await quidliDrop(input, keyToUse);
+    if (result.transferHash) {
+      result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
+    }
+    console.log('[drop] result:', JSON.stringify(result, null, 2));
+    // DM each Discord recipient to let them know they received tokens
+    if (result.transferHash) {
+      const discordRecipients = (input.recipients ?? []).filter((r) => r.type === 'discord' && r.id);
+      for (const r of discordRecipients) {
+        const recipientUser = await client.users.fetch(r.id).catch(() => null);
+        if (recipientUser) {
+          recipientUser.send(
+            `🎉 You just received tokens from someone in your server!\n` +
+            `Transaction: https://basescan.org/tx/${result.transferHash}`
+          ).catch(() => {});
+        }
+      }
+    }
     return JSON.stringify(result, null, 2);
   }
   if (name === 'quidli_score') {
@@ -631,6 +1196,7 @@ async function handleMessage(message) {
                 botId: message.client.user.id,
                 senderApiKey,
                 senderUser: message.author,
+                currentChannelId: message.channelId,
               });
               return {
                 type: 'tool_result',
@@ -713,6 +1279,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,   // needed for online/idle/dnd status — enable in Developer Portal
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
   ],
@@ -732,6 +1299,8 @@ client.once(Events.ClientReady, (c) => {
   // Store the first guild for role lookups
   activeGuild = c.guilds.cache.first() ?? null;
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
+  // Re-queue any scheduled drops that survived a restart
+  loadPendingDrops();
 });
 
 client.on(Events.MessageCreate, (message) => {
