@@ -244,10 +244,11 @@ async function executeConditionalDrop(jobId) {
 
   try {
     // Use Claude to evaluate the condition via web search
+    const evalNow = new Date();
     const evalMessages = [
       {
         role: 'user',
-        content: `You are evaluating whether a condition is true or false so a token drop can be executed or cancelled.\n\nCondition: "${condition}"\n\nSearch the web to find the answer, then respond with ONLY a JSON object: {"result": true} or {"result": false}. Do not include anything else.`,
+        content: `You are evaluating whether a condition is true or false so a token drop can be executed or cancelled.\n\nCurrent date and time: ${evalNow.toUTCString()}\n\nCondition: "${condition}"\n\nSearch the web to find the answer. Use the current year (${evalNow.getFullYear()}) in your searches. Then respond with ONLY a JSON object: {"result": true} or {"result": false}. Do not include anything else.`,
       },
     ];
 
@@ -273,12 +274,15 @@ async function executeConditionalDrop(jobId) {
       });
 
       if (evalRes.stop_reason === 'tool_use') {
-        const toolBlock = evalRes.content.find((b) => b.type === 'tool_use');
-        const searchResults = await braveSearch(toolBlock.input.query);
+        const toolBlocks = evalRes.content.filter((b) => b.type === 'tool_use');
+        const toolResults = await Promise.all(toolBlocks.map(async (tb) => {
+          const searchResults = await braveSearch(tb.input.query);
+          return { type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(searchResults) };
+        }));
         evalMessages2 = [
           ...evalMessages2,
           { role: 'assistant', content: evalRes.content },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolBlock.id, content: JSON.stringify(searchResults) }] },
+          { role: 'user', content: toolResults },
         ];
         continue;
       }
@@ -1153,7 +1157,9 @@ async function handleMessage(message) {
     : isOwner
       ? '[User is the bot owner — drops will use the host Smart Send wallet]'
       : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
-  const contextualText = `[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`;
+  const now = new Date();
+  const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
+  const contextualText = `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`;
   addToHistory(contextId, 'user', contextualText);
 
   let accumulated = '';
