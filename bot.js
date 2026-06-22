@@ -100,6 +100,18 @@ db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   created_at INTEGER DEFAULT (unixepoch()),
   executed   INTEGER DEFAULT 0
 )`);
+db.exec(`CREATE TABLE IF NOT EXISTS watchers (
+  id            TEXT PRIMARY KEY,
+  sender_id     TEXT NOT NULL,
+  channel_id    TEXT NOT NULL,
+  trigger_phrase TEXT NOT NULL,
+  drop_input    TEXT NOT NULL,
+  max_winners   INTEGER DEFAULT 1,
+  winner_count  INTEGER DEFAULT 0,
+  winner_ids    TEXT DEFAULT '[]',
+  created_at    INTEGER DEFAULT (unixepoch()),
+  fired         INTEGER DEFAULT 0
+)`);
 
 function getUserApiKey(discordId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE discord_id = ?').get(discordId);
@@ -806,6 +818,39 @@ const tools = [
     },
   },
   {
+    name: 'create_watcher',
+    description:
+      'Watch a Discord channel for a trigger phrase and automatically send tokens to whoever types it first. Use when someone says "send X to the first person who types Y" or "reward anyone who says Z in this channel". The drop fires automatically without any @mention needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        triggerPhrase: { type: 'string', description: 'The phrase to watch for (case-insensitive match).' },
+        channelId: { type: 'string', description: 'Channel to watch. Omit to use the current channel.' },
+        maxWinners: { type: 'number', description: 'How many people can win. Default 1 ("first person only").' },
+        amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per winner.' },
+        tokenContract: { type: 'string', description: 'Token contract address.' },
+        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+      },
+      required: ['triggerPhrase', 'amountInWeiPerRecipient', 'tokenContract'],
+    },
+  },
+  {
+    name: 'list_watchers',
+    description: 'List all active channel watchers for the current user.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'cancel_watcher',
+    description: 'Cancel an active channel watcher. Get the watcher ID from list_watchers if needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        watcherId: { type: 'string', description: 'The watcher ID to cancel.' },
+      },
+      required: ['watcherId'],
+    },
+  },
+  {
     name: 'quidli_score',
     description:
       'Get the web3 reputation/social score for a user (Quidli score, Neynar, Lens, Ethos). Accepts any social identity — Discord, Farcaster, email, etc. The Quidli registry resolves identities across platforms automatically. Use when someone asks about reputation, trustworthiness, or social standing.',
@@ -870,6 +915,30 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
       checkAt: new Date(executeAt * 1000).toISOString(),
       message: `Conditional drop set. I'll check "${condition}" in ${checkInMinutes} minutes and DM you the outcome.`,
     });
+  }
+  if (name === 'create_watcher') {
+    const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      if (senderUser) senderUser.send('To create watchers, connect your Quidli account first.\n\nGet your API key at https://connect.quid.li, then DM me:\n`!connect <your-api-key>`').catch(() => {});
+      return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
+    }
+    const watcherId = crypto.randomUUID();
+    const dropInput = { amountInWeiPerRecipient: input.amountInWeiPerRecipient, tokenContract: input.tokenContract, chainId: input.chainId ?? 8453 };
+    db.prepare('INSERT INTO watchers (id, sender_id, channel_id, trigger_phrase, drop_input, max_winners) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(watcherId, senderId, input.channelId ?? currentChannelId, input.triggerPhrase, JSON.stringify(dropInput), input.maxWinners ?? 1);
+    return JSON.stringify({ success: true, watcherId, message: `Watching for "${input.triggerPhrase}" in this channel. First person to type it gets the drop.` });
+  }
+  if (name === 'list_watchers') {
+    const watchers = db.prepare('SELECT id, trigger_phrase, channel_id, max_winners, winner_count FROM watchers WHERE sender_id = ? AND fired = 0').all(senderId);
+    return JSON.stringify(watchers, null, 2);
+  }
+  if (name === 'cancel_watcher') {
+    const watcher = db.prepare('SELECT id, sender_id FROM watchers WHERE id = ? AND fired = 0').get(input.watcherId);
+    if (!watcher) return JSON.stringify({ error: 'No active watcher found with that ID.' });
+    if (watcher.sender_id !== senderId) return JSON.stringify({ error: 'You can only cancel your own watchers.' });
+    db.prepare('UPDATE watchers SET fired = 1 WHERE id = ?').run(input.watcherId);
+    return JSON.stringify({ success: true, message: 'Watcher cancelled.' });
   }
   if (name === 'discord_get_role_members') {
     // Always exclude the sender and the bot, regardless of what Claude passes
@@ -1278,6 +1347,52 @@ async function handleDM(message) {
   );
 }
 
+// ─── Channel watchers ─────────────────────────────────────────────────────────
+
+async function checkWatchers(message) {
+  const watchers = db.prepare('SELECT * FROM watchers WHERE channel_id = ? AND fired = 0').all(message.channelId);
+  if (watchers.length === 0) return;
+
+  for (const watcher of watchers) {
+    if (!message.content.toLowerCase().includes(watcher.trigger_phrase.toLowerCase())) continue;
+    if (message.author.id === watcher.sender_id) continue; // creator can't win their own watcher
+
+    const winnerIds = JSON.parse(watcher.winner_ids);
+    if (winnerIds.includes(message.author.id)) continue; // already won
+
+    winnerIds.push(message.author.id);
+    const newCount = watcher.winner_count + 1;
+    const done = newCount >= watcher.max_winners ? 1 : 0;
+    db.prepare('UPDATE watchers SET winner_count = ?, winner_ids = ?, fired = ? WHERE id = ?')
+      .run(newCount, JSON.stringify(winnerIds), done, watcher.id);
+
+    const isOwner = BOT_OWNER_ID && watcher.sender_id === BOT_OWNER_ID;
+    const senderApiKey = getUserApiKey(watcher.sender_id);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      console.log(`[watcher] ${watcher.id} triggered but no API key for sender ${watcher.sender_id}`);
+      continue;
+    }
+
+    try {
+      const dropInput = {
+        ...JSON.parse(watcher.drop_input),
+        recipients: [{ type: 'discord', id: message.author.id }],
+      };
+      const result = await quidliDrop(dropInput, keyToUse);
+      if (result.transferHash) {
+        const url = `https://basescan.org/tx/${result.transferHash}`;
+        message.author.send(`🎉 You triggered the drop by typing "${watcher.trigger_phrase}"! Tokens are on the way.\nTransaction: ${url}`).catch(() => {});
+        const sender = await client.users.fetch(watcher.sender_id).catch(() => null);
+        if (sender) sender.send(`✅ Watcher triggered! ${message.author.username} typed "${watcher.trigger_phrase}".\nTransaction: ${url}`).catch(() => {});
+      }
+      console.log(`[watcher] ${watcher.id} fired for ${message.author.username}`);
+    } catch (err) {
+      console.error(`[watcher] drop failed:`, err.message);
+    }
+  }
+}
+
 // ─── Discord client ───────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -1316,6 +1431,8 @@ client.on(Events.MessageCreate, (message) => {
     handleDM(message).catch((err) => console.error('[dm] unhandled error:', err));
     return;
   }
+  // Check channel watchers on every message (no @mention needed)
+  checkWatchers(message).catch((err) => console.error('[watcher] error:', err));
   handleMessage(message).catch((err) =>
     console.error('[bot] unhandled error:', err)
   );
