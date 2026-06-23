@@ -30,7 +30,7 @@ const {
   CLAUDE_MODEL = 'claude-sonnet-4-6',
   DISCORD_ACTIVE_CHANNELS = '',
   DISCORD_ALLOWED_USERS = '',
-  SYSTEM_PROMPT = 'You are a helpful assistant in a Discord server powered by Quidli Connect. You can: (1) look up ETH/SOL wallet addresses for people by their social identity (Discord, Farcaster, email, etc.) using quidli_lookup; (2) send tokens to people using quidli_drop; (3) check web3 reputation scores using quidli_score; (4) search the web for real-time info using web_search; (5) schedule conditional drops using conditional_drop. Be concise and friendly. IMPORTANT: When scheduling a conditional_drop tied to a real-world event (match, game, announcement, etc.), always use web_search first to find the event\'s scheduled time, then set checkInMinutes to 30 minutes after the event is expected to end. Never guess the check time — always look it up.',
+  SYSTEM_PROMPT: SYSTEM_PROMPT_OVERRIDE,
   BOT_WALLET_PRIVATE_KEY,
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,               // Optional — if set, skips x402 payment
@@ -65,6 +65,79 @@ const ALLOWED_ROLES = new Set(
 const DISCORD_MSG_LIMIT = 1900;
 const EDIT_THROTTLE_MS = 750;
 const QUIDLI_BASE_URL = 'https://api.connect.quid.li';
+
+// ─── System prompt ────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT = SYSTEM_PROMPT_OVERRIDE || `
+You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Quidli Connect. Your job is to EXECUTE — not explain, not ask for confirmation, not hedge. When someone asks you to do something, do it.
+
+## Core philosophy
+- Bias toward action. If you have enough info to act, act.
+- Never ask "are you sure?" or "shall I proceed?" — if they asked, they're sure.
+- Only ask the user for more info after you've exhausted all tool options.
+- Be concise. One sentence for success, one sentence for failure.
+
+## Sending tokens (quidli_drop)
+- Call quidli_drop DIRECTLY with social identities — you do NOT need to call quidli_lookup first. Quidli resolves identities internally.
+- USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
+- Always generate a fresh UUID for idempotencyKey.
+- After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
+- If a recipient isn't in the registry, still attempt the drop — Quidli will hold it as a pending claim.
+- Use EXACTLY one of "id" or "username" per recipient, never both.
+
+## Looking up wallets (quidli_lookup)
+Only call quidli_lookup when the user specifically asks for a wallet address. Do NOT call it before drops.
+
+Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
+
+When a lookup fails, work through ALL available identifiers before giving up:
+1. If a Discord mention is in the message, try { type: "discord", id: "<DISCORD_ID>" } first (ID is in the message context as "(Discord ID: 123456)"), then { type: "discord", username: "<display_name>" }
+2. If a Farcaster handle is mentioned (e.g. @name.eth or /name), try { type: "farcaster", username: "<handle>" }
+3. If a Twitter/X handle is mentioned, try { type: "twitter", username: "<handle>" }
+4. If a Telegram username is mentioned, try { type: "telegram", username: "<handle>" }
+5. If an email is mentioned, try { type: "email", id: "<email>" }
+6. If a GitHub username is mentioned, try { type: "github", username: "<handle>" }
+7. If none of the above work, ask the user which other social handles the person has (Farcaster, Twitter, email, etc.) and try those.
+Only after exhausting all available identifiers, tell the user the person isn't in the Quidli registry yet.
+
+The same multi-identity fallback applies to quidli_drop and quidli_score — always try the most specific identifier first, then fall back through others.
+
+## Resolving Discord mentions
+Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names.
+
+## Checking reputation (quidli_score)
+Use quidli_score when asked about trust, reputation, or scores. Pass the most specific identity available.
+
+## Web search (web_search)
+Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
+
+## Scheduling drops (schedule_drop)
+Use schedule_drop when asked to send tokens at a future time. Store presenceFilter instead of recipients if the drop should target online users at execution time, not now.
+
+## Conditional drops (conditional_drop)
+Use conditional_drop when a drop depends on a real-world outcome ("if X wins", "if BTC hits $100k").
+ALWAYS use web_search first to find the event's scheduled end time. Set checkInMinutes to 30 minutes after the expected end. Never guess — look it up.
+
+## Channel watchers (create_watcher)
+Use create_watcher when asked to send tokens to whoever types a specific phrase. The watcher fires automatically when triggered.
+
+## Cancelling / rescheduling
+Use cancel_scheduled_drop or reschedule_drop for scheduled drops. Use cancel_watcher for watchers. Use list_scheduled_drops / list_watchers to show what's pending.
+
+## Presence-based drops (discord_get_members_by_status)
+Use discord_get_members_by_status to get currently online/idle/dnd members. For scheduled presence drops, store the filter — don't resolve recipients until execution time.
+
+## Tool retry behavior
+If a tool call returns an error or empty result:
+1. Analyze what went wrong.
+2. Try a different approach (different identity type, different parameters).
+3. Only report failure to the user after at least 2 attempts.
+
+## Response format
+- Success: state what you did + basescan URL if applicable. One or two sentences max.
+- Failure: state what you tried and what the user can do next. No raw JSON, no stack traces.
+- Never show internal error messages verbatim to the user.
+`.trim();
 
 // ─── Encryption helpers ───────────────────────────────────────────────────────
 
@@ -117,6 +190,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS watchers (
   winner_ids    TEXT DEFAULT '[]',
   created_at    INTEGER DEFAULT (unixepoch()),
   fired         INTEGER DEFAULT 0
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS channel_settings (
+  context_id TEXT PRIMARY KEY,
+  provider   TEXT NOT NULL DEFAULT 'anthropic',
+  updated_at INTEGER DEFAULT (unixepoch())
 )`);
 
 function getUserApiKey(discordId) {
@@ -889,6 +968,10 @@ const tools = [
   },
 ];
 
+// Tracks basescan URLs produced during a single handleMessage turn so they can
+// always be shown — even if the LLM forgets to include them in its response.
+const _pendingBasescanUrls = [];
+
 async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (name === 'web_search') {
@@ -1053,6 +1136,7 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     const result = await quidliDrop(input, keyToUse);
     if (result.transferHash) {
       result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
+      _pendingBasescanUrls.push(result.basescanUrl);
     }
     console.log('[drop] result:', JSON.stringify(result, null, 2));
     // DM each Discord recipient to let them know they received tokens
@@ -1128,14 +1212,29 @@ function getOpenAITools() {
 
 // ─── Provider switching ───────────────────────────────────────────────────────
 
-// Per-channel LLM provider (defaults to DEFAULT_LLM_PROVIDER)
-const channelProviders = new Map();
+// Per-channel LLM provider — persisted to SQLite so restarts don't reset it
+function getChannelProvider(contextId) {
+  const row = db.prepare('SELECT provider FROM channel_settings WHERE context_id = ?').get(contextId);
+  return row?.provider ?? DEFAULT_LLM_PROVIDER;
+}
+
+function setChannelProvider(contextId, provider) {
+  db.prepare(`INSERT INTO channel_settings (context_id, provider, updated_at)
+    VALUES (?, ?, unixepoch())
+    ON CONFLICT(context_id) DO UPDATE SET provider = excluded.provider, updated_at = unixepoch()`)
+    .run(contextId, provider);
+}
 
 function detectProviderSwitch(text) {
   const lower = text.toLowerCase();
-  if (/switch\s+to\s+(gemini|google)/.test(lower)) return 'gemini';
-  if (/switch\s+to\s+(openai|gpt|chatgpt|open\s+ai)/.test(lower)) return 'openai';
-  if (/switch\s+to\s+(claude|anthropic)/.test(lower)) return 'anthropic';
+  // Match "switch to X", "use X", "change to X", "switch X on", etc.
+  if (/(switch|change|use|swap)\s+(to\s+)?(gemini|google)/.test(lower)) return 'gemini';
+  if (/(switch|change|use|swap)\s+(to\s+)?(openai|gpt|chatgpt|open\s*ai)/.test(lower)) return 'openai';
+  if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic)/.test(lower)) return 'anthropic';
+  // Also match "gemini mode", "claude mode"
+  if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
+  if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
+  if (/\bclaude\s+mode\b/.test(lower)) return 'anthropic';
   return null;
 }
 
@@ -1159,6 +1258,23 @@ function getGeminiHistory(contextId) {
 function getOpenAIHistory(contextId) {
   if (!openaiHistories.has(contextId)) openaiHistories.set(contextId, []);
   return openaiHistories.get(contextId);
+}
+
+// ─── Friendly error messages ──────────────────────────────────────────────────
+
+function friendlyProviderError(provider, err) {
+  const msg = err.message ?? String(err);
+  // Quota / rate limit
+  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('rate limit')) {
+    const providerName = provider === 'gemini' ? 'Gemini' : provider === 'openai' ? 'OpenAI' : 'Anthropic';
+    return `⚠️ ${providerName} API quota exceeded. You can:\n• Wait a moment and try again\n• Switch back to Claude with \`switch to claude\`\n• Add billing to your ${providerName} account`;
+  }
+  // Auth errors
+  if (msg.includes('401') || msg.includes('403') || msg.includes('invalid') && msg.toLowerCase().includes('key')) {
+    return `⚠️ Invalid API key for ${provider}. Check your \`.env\` and restart the bot.`;
+  }
+  // Generic fallback — still friendlier than raw JSON
+  return `⚠️ ${provider} error: ${msg.slice(0, 200)}`;
 }
 
 // ─── Provider agentic loops ───────────────────────────────────────────────────
@@ -1452,8 +1568,8 @@ async function handleMessage(message) {
       await message.reply('⚠️ `OPENAI_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
       return;
     }
-    channelProviders.set(contextId, switchTarget);
-    // Clear all histories for this channel so the new provider starts fresh
+    setChannelProvider(contextId, switchTarget);
+    // Clear all in-memory histories for this channel so the new provider starts fresh
     anthropicHistories.delete(contextId);
     geminiHistories.delete(contextId);
     openaiHistories.delete(contextId);
@@ -1464,7 +1580,7 @@ async function handleMessage(message) {
     return;
   }
 
-  const provider = channelProviders.get(contextId) ?? DEFAULT_LLM_PROVIDER;
+  const provider = getChannelProvider(contextId);
 
   const replyMsg = await message.reply('_Thinking…_').catch((err) => {
     console.error('[discord] reply failed:', err.message);
@@ -1498,6 +1614,9 @@ async function handleMessage(message) {
   let accumulated = '';
   let modelLabel = CLAUDE_MODEL;
 
+  // Clear any leftover basescan URLs from a previous turn
+  _pendingBasescanUrls.length = 0;
+
   try {
     if (provider === 'gemini') {
       accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx);
@@ -1510,7 +1629,16 @@ async function handleMessage(message) {
       modelLabel = CLAUDE_MODEL;
     }
 
-    const finalText = (accumulated || '_(no response)_') + `\n-# ${modelLabel}`;
+    // Append any basescan URLs the LLM forgot to include
+    let finalText = accumulated || '_(no response)_';
+    for (const url of _pendingBasescanUrls) {
+      if (!finalText.includes(url)) {
+        finalText += `\n🔗 ${url}`;
+      }
+    }
+    _pendingBasescanUrls.length = 0;
+
+    finalText += `\n-# ${modelLabel}`;
     await editor.finalize(finalText);
 
   } catch (err) {
@@ -1526,7 +1654,7 @@ async function handleMessage(message) {
       const h = getAnthropicHistory(contextId);
       if (h.at(-1)?.role === 'user') h.pop();
     }
-    await editor.finalize(`⚠️ Error: ${err.message}`);
+    await editor.finalize(friendlyProviderError(provider, err));
   }
 }
 
