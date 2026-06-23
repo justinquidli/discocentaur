@@ -38,6 +38,12 @@ const {
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
+  // Multi-LLM provider support
+  DEFAULT_LLM_PROVIDER = 'anthropic', // anthropic | gemini | openai
+  GEMINI_API_KEY,
+  GEMINI_MODEL = 'gemini-2.0-flash',
+  OPENAI_API_KEY,
+  OPENAI_MODEL = 'gpt-4o',
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
@@ -1071,26 +1077,251 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
   throw new Error(`Unknown tool: ${name}`);
 }
 
-// ─── Anthropic client ─────────────────────────────────────────────────────────
+// ─── LLM clients ─────────────────────────────────────────────────────────────
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-// ─── Conversation history ─────────────────────────────────────────────────────
-
-const histories = new Map();
-const MAX_HISTORY = 40;
-
-function getHistory(channelId) {
-  if (!histories.has(channelId)) histories.set(channelId, []);
-  return histories.get(channelId);
+// Lazy Gemini client
+let _geminiClient = null;
+async function getGeminiClient() {
+  if (_geminiClient) return _geminiClient;
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set in .env');
+  const { GoogleGenAI } = await import('@google/genai');
+  _geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  return _geminiClient;
 }
 
-function addToHistory(channelId, role, content) {
-  const history = getHistory(channelId);
-  history.push({ role, content });
-  if (history.length > MAX_HISTORY) {
-    history.splice(0, history.length - MAX_HISTORY);
+// Lazy OpenAI client
+let _openaiClient = null;
+async function getOpenAIClient() {
+  if (_openaiClient) return _openaiClient;
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set in .env');
+  const { default: OpenAI } = await import('openai');
+  _openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+  return _openaiClient;
+}
+
+// ─── Tool format converters ───────────────────────────────────────────────────
+
+// Gemini: { functionDeclarations: [{ name, description, parameters }] }
+function getGeminiTools() {
+  return [{
+    functionDeclarations: tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    })),
+  }];
+}
+
+// OpenAI: [{ type: 'function', function: { name, description, parameters } }]
+function getOpenAITools() {
+  return tools.map((t) => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    },
+  }));
+}
+
+// ─── Provider switching ───────────────────────────────────────────────────────
+
+// Per-channel LLM provider (defaults to DEFAULT_LLM_PROVIDER)
+const channelProviders = new Map();
+
+function detectProviderSwitch(text) {
+  const lower = text.toLowerCase();
+  if (/switch\s+to\s+(gemini|google)/.test(lower)) return 'gemini';
+  if (/switch\s+to\s+(openai|gpt|chatgpt|open\s+ai)/.test(lower)) return 'openai';
+  if (/switch\s+to\s+(claude|anthropic)/.test(lower)) return 'anthropic';
+  return null;
+}
+
+// ─── Conversation history (per-provider) ─────────────────────────────────────
+
+const anthropicHistories = new Map(); // { role: 'user'|'assistant', content: string }[]
+const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[]
+const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
+const MAX_HISTORY = 40;
+
+function getAnthropicHistory(contextId) {
+  if (!anthropicHistories.has(contextId)) anthropicHistories.set(contextId, []);
+  return anthropicHistories.get(contextId);
+}
+
+function getGeminiHistory(contextId) {
+  if (!geminiHistories.has(contextId)) geminiHistories.set(contextId, []);
+  return geminiHistories.get(contextId);
+}
+
+function getOpenAIHistory(contextId) {
+  if (!openaiHistories.has(contextId)) openaiHistories.set(contextId, []);
+  return openaiHistories.get(contextId);
+}
+
+// ─── Provider agentic loops ───────────────────────────────────────────────────
+
+async function runAnthropicLoop(contextId, contextualText, editor, toolCtx) {
+  const history = getAnthropicHistory(contextId);
+  history.push({ role: 'user', content: contextualText });
+
+  // Work on a snapshot so intermediate tool-call turns don't pollute history
+  let messages = [...history];
+  let accumulated = '';
+
+  while (true) {
+    const response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      tools,
+      messages,
+    });
+
+    for (const block of response.content) {
+      if (block.type === 'text') {
+        accumulated += block.text;
+        editor.update(accumulated || '_Thinking…_');
+      }
+    }
+
+    if (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
+      messages = [...messages, { role: 'assistant', content: response.content }];
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (block) => {
+          editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
+          try {
+            const result = await runTool(block.name, block.input, toolCtx);
+            return { type: 'tool_result', tool_use_id: block.id, content: result };
+          } catch (err) {
+            console.error(`[tool] ${block.name} error:`, err.message);
+            return { type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true };
+          }
+        })
+      );
+      messages = [...messages, { role: 'user', content: toolResults }];
+      continue;
+    }
+
+    break;
   }
+
+  history.push({ role: 'assistant', content: accumulated });
+  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+  return accumulated;
+}
+
+async function runGeminiLoop(contextId, contextualText, editor, toolCtx) {
+  const ai = await getGeminiClient();
+  const history = getGeminiHistory(contextId);
+  history.push({ role: 'user', parts: [{ text: contextualText }] });
+
+  let contents = [...history];
+  let accumulated = '';
+
+  while (true) {
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      systemInstruction: SYSTEM_PROMPT,
+      contents,
+      tools: getGeminiTools(),
+    });
+
+    const parts = response.candidates?.[0]?.content?.parts ?? [];
+
+    for (const part of parts) {
+      if (part.text) {
+        accumulated += part.text;
+        editor.update(accumulated || '_Thinking…_');
+      }
+    }
+
+    const funcCalls = parts.filter((p) => p.functionCall);
+    if (funcCalls.length === 0) break;
+
+    // Add model turn (with function calls) to local content list
+    contents = [...contents, { role: 'model', parts }];
+
+    editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
+    const funcResponses = await Promise.all(
+      funcCalls.map(async (part) => {
+        const { name, args } = part.functionCall;
+        console.log(`[tool/gemini] ${name}`, JSON.stringify(args).slice(0, 120));
+        try {
+          const result = await runTool(name, args, toolCtx);
+          return { functionResponse: { name, response: { result } } };
+        } catch (err) {
+          console.error(`[tool/gemini] ${name} error:`, err.message);
+          return { functionResponse: { name, response: { error: err.message } } };
+        }
+      })
+    );
+
+    contents = [...contents, { role: 'user', parts: funcResponses }];
+  }
+
+  history.push({ role: 'model', parts: [{ text: accumulated }] });
+  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+  return accumulated;
+}
+
+async function runOpenAILoop(contextId, contextualText, editor, toolCtx) {
+  const openai = await getOpenAIClient();
+  const history = getOpenAIHistory(contextId);
+  history.push({ role: 'user', content: contextualText });
+
+  // Prepend system message each call (not stored in history)
+  let messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...history,
+  ];
+  let accumulated = '';
+
+  while (true) {
+    const response = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages,
+      tools: getOpenAITools(),
+      tool_choice: 'auto',
+    });
+
+    const choice = response.choices[0];
+    const msg = choice.message;
+
+    if (msg.content) {
+      accumulated += msg.content;
+      editor.update(accumulated || '_Thinking…_');
+    }
+
+    if (choice.finish_reason !== 'tool_calls' || !msg.tool_calls?.length) break;
+
+    messages = [...messages, msg];
+
+    editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
+    const toolResults = await Promise.all(
+      msg.tool_calls.map(async (tc) => {
+        let args;
+        try { args = JSON.parse(tc.function.arguments); } catch { args = {}; }
+        console.log(`[tool/openai] ${tc.function.name}`, JSON.stringify(args).slice(0, 120));
+        try {
+          const result = await runTool(tc.function.name, args, toolCtx);
+          return { role: 'tool', tool_call_id: tc.id, content: result };
+        } catch (err) {
+          console.error(`[tool/openai] ${tc.function.name} error:`, err.message);
+          return { role: 'tool', tool_call_id: tc.id, content: `Error: ${err.message}` };
+        }
+      })
+    );
+
+    messages = [...messages, ...toolResults];
+  }
+
+  history.push({ role: 'assistant', content: accumulated });
+  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+  return accumulated;
 }
 
 // ─── Discord helpers ──────────────────────────────────────────────────────────
@@ -1209,6 +1440,32 @@ async function handleMessage(message) {
     ? message.channelId
     : `${message.guildId ?? 'dm'}-${message.channelId}`;
 
+  // ── Provider switch detection ─────────────────────────────────────────────
+  const switchTarget = detectProviderSwitch(text);
+  if (switchTarget) {
+    // Validate API key exists before switching
+    if (switchTarget === 'gemini' && !GEMINI_API_KEY) {
+      await message.reply('⚠️ `GEMINI_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
+      return;
+    }
+    if (switchTarget === 'openai' && !OPENAI_API_KEY) {
+      await message.reply('⚠️ `OPENAI_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
+      return;
+    }
+    channelProviders.set(contextId, switchTarget);
+    // Clear all histories for this channel so the new provider starts fresh
+    anthropicHistories.delete(contextId);
+    geminiHistories.delete(contextId);
+    openaiHistories.delete(contextId);
+    const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
+      : switchTarget === 'openai' ? OPENAI_MODEL
+      : CLAUDE_MODEL;
+    await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
+    return;
+  }
+
+  const provider = channelProviders.get(contextId) ?? DEFAULT_LLM_PROVIDER;
+
   const replyMsg = await message.reply('_Thinking…_').catch((err) => {
     console.error('[discord] reply failed:', err.message);
     return null;
@@ -1217,7 +1474,7 @@ async function handleMessage(message) {
 
   const editor = createThrottledEditor(replyMsg);
 
-  // Prefix with sender identity so Claude knows who "me/I/my" refers to
+  // Prefix with sender identity so the LLM knows who "me/I/my" refers to
   const senderName = message.member?.displayName ?? message.author.username;
   const senderApiKey = getUserApiKey(message.author.id);
   const isOwner = BOT_OWNER_ID && message.author.id === BOT_OWNER_ID;
@@ -1229,83 +1486,46 @@ async function handleMessage(message) {
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
   const contextualText = `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`;
-  addToHistory(contextId, 'user', contextualText);
+
+  const toolCtx = {
+    senderId: message.author.id,
+    botId: message.client.user.id,
+    senderApiKey,
+    senderUser: message.author,
+    currentChannelId: message.channelId,
+  };
 
   let accumulated = '';
+  let modelLabel = CLAUDE_MODEL;
 
   try {
-    // Agentic loop: Claude can call tools, then continue responding
-    let messages = getHistory(contextId);
-
-    while (true) {
-      const response = await anthropic.messages.create({
-        model: CLAUDE_MODEL,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        tools,
-        messages,
-      });
-
-      // Collect any text from this turn
-      for (const block of response.content) {
-        if (block.type === 'text') {
-          accumulated += block.text;
-          editor.update(accumulated || '_Thinking…_');
-        }
-      }
-
-      // If Claude wants to use a tool, run it and continue
-      if (response.stop_reason === 'tool_use') {
-        const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
-
-        // Add Claude's response to messages
-        messages = [...messages, { role: 'assistant', content: response.content }];
-
-        // Run all tools and collect results
-        const toolResults = await Promise.all(
-          toolUseBlocks.map(async (block) => {
-            editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
-            try {
-              const result = await runTool(block.name, block.input, {
-                senderId: message.author.id,
-                botId: message.client.user.id,
-                senderApiKey,
-                senderUser: message.author,
-                currentChannelId: message.channelId,
-              });
-              return {
-                type: 'tool_result',
-                tool_use_id: block.id,
-                content: result,
-              };
-            } catch (err) {
-              console.error(`[tool] ${block.name} error:`, err.message);
-              return {
-                type: 'tool_result',
-                tool_use_id: block.id,
-                content: `Error: ${err.message}`,
-                is_error: true,
-              };
-            }
-          })
-        );
-
-        messages = [...messages, { role: 'user', content: toolResults }];
-        continue; // loop back to let Claude respond to tool results
-      }
-
-      // Claude is done
-      break;
+    if (provider === 'gemini') {
+      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx);
+      modelLabel = GEMINI_MODEL;
+    } else if (provider === 'openai') {
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx);
+      modelLabel = OPENAI_MODEL;
+    } else {
+      accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx);
+      modelLabel = CLAUDE_MODEL;
     }
 
-    const finalText = accumulated || '_(no response)_';
+    const finalText = (accumulated || '_(no response)_') + `\n-# ${modelLabel}`;
     await editor.finalize(finalText);
-    addToHistory(contextId, 'assistant', finalText);
 
   } catch (err) {
-    console.error('[claude] error:', err);
-    const history = getHistory(contextId);
-    if (history.at(-1)?.role === 'user') history.pop();
+    console.error(`[${provider}] error:`, err);
+    // Roll back the unpaired user message so history stays consistent
+    if (provider === 'gemini') {
+      const h = getGeminiHistory(contextId);
+      if (h.at(-1)?.role === 'user') h.pop();
+    } else if (provider === 'openai') {
+      const h = getOpenAIHistory(contextId);
+      if (h.at(-1)?.role === 'user') h.pop();
+    } else {
+      const h = getAnthropicHistory(contextId);
+      if (h.at(-1)?.role === 'user') h.pop();
+    }
     await editor.finalize(`⚠️ Error: ${err.message}`);
   }
 }
@@ -1408,8 +1628,13 @@ const client = new Client({
 });
 
 client.once(Events.ClientReady, (c) => {
+  const defaultModel = DEFAULT_LLM_PROVIDER === 'gemini' ? GEMINI_MODEL
+    : DEFAULT_LLM_PROVIDER === 'openai' ? OPENAI_MODEL
+    : CLAUDE_MODEL;
   console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
-  console.log(`   Model: ${CLAUDE_MODEL}`);
+  console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
+  if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
+  if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   if (ACTIVE_CHANNELS.size > 0) {

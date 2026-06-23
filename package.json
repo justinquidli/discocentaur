@@ -10,8 +10,10 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@google/genai": "^1.0.0",
     "discord.js": "^14.15.3",
     "dotenv": "^16.4.5",
+    "openai": "^4.0.0",
     "viem": "^2.21.0"
   }
 }
