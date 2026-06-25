@@ -1273,6 +1273,36 @@ const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[
 const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
 const MAX_HISTORY = 40;
 
+// ─── Minds action handoff state ───────────────────────────────────────────────
+
+// Tracks the last Mind response per (contextId, senderId) so we can detect
+// when the user confirms a pending action and hand off execution to Claude.
+const mindsLastResponse = new Map(); // key: `${contextId}:${senderId}` → { text, isPendingAction }
+
+function mindsStateKey(contextId, senderId) {
+  return `${contextId}:${senderId}`;
+}
+
+// Minds responses often use HTML — strip to plain text before passing to Claude
+function stripHtml(text) {
+  return text.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
+}
+
+// True if the Mind's response contains a resolved wallet address and either action language or an amount
+function looksLikePendingAction(text) {
+  const hasWallet = /0x[0-9a-fA-F]{40}/i.test(text);
+  const hasActionLanguage = /\b(confirm|fire it?|proceed|approve|go ahead|ready to|shall i|execute|let me know|either path|two paths?|two options?|option \d|queued|send is|drop is)\b/i.test(text);
+  const hasAmount = /\b(usdc|usdt|wei|eth)\b/i.test(text);
+  return hasWallet && (hasActionLanguage || hasAmount);
+}
+
+// True if the user's message is a positive confirmation
+function isPositiveConfirmation(text) {
+  const t = text.trim().toLowerCase();
+  if (t.length > 120) return false;
+  return /\b(yes|yep|yup|yeah|go|do it|fire it|fire|confirm(ed)?|sure|ok(ay)?|proceed|send it|send now|execute|approved?|absolutely|👍|✅|correct|affirmative|let'?s go|go ahead|sounds good|looks good|perfect|please do|go for it|make it so|just send|send it now|do it now|go for it|just do it)\b/i.test(t);
+}
+
 function getAnthropicHistory(contextId) {
   if (!anthropicHistories.has(contextId)) anthropicHistories.set(contextId, []);
   return anthropicHistories.get(contextId);
@@ -1468,42 +1498,73 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx) {
   return accumulated;
 }
 
-async function runMindsLoop(contextId, text, editor, senderId) {
-  const creds = senderId ? getUserMindsCredentials(senderId) : null;
+// Async fire-and-forget Minds handler. Sends the message, updates Discord when the reply arrives.
+// Not awaited from handleMessage — returns immediately so Discord stays responsive.
+async function runMindsBackground(contextId, text, replyMsg, senderId, stateKey, mindName) {
+  const creds = getUserMindsCredentials(senderId);
   if (!creds) {
-    throw new Error('NO_MINDS_ALIAS');
+    await replyMsg.edit(
+      '⚠️ You need to connect your Minds agent.\n' +
+      'DM me `!minds <builder-api-key>` to connect.\n' +
+      'Get a Builder API key at https://build.hellominds.ai/console'
+    ).catch(() => {});
+    return;
   }
   const { alias, apiKey } = creds;
-
-  // Strip the system context prefix before forwarding — Minds doesn't need it
   const userText = text.replace(/^\[Current date.*?\]\n\[Sent by.*?\]\s*/s, '').trim();
-
-  editor.update('_Thinking…_');
-
   const mindsClient = createMindsClient({ builderApiKey: apiKey });
 
-  // Grab the latest fingerprint before sending so waitForReply only sees the new reply
   let afterFingerprint;
   try {
     afterFingerprint = await mindsClient.getLatestHistoryFingerprint(alias);
-  } catch { /* first message in conversation, no fingerprint yet */ }
+  } catch { /* first message */ }
 
-  await mindsClient.sendMessage({ alias, messageText: userText });
+  try {
+    await mindsClient.sendMessage({ alias, messageText: userText });
+  } catch (err) {
+    await replyMsg.edit(`⚠️ Failed to send to Minds: ${err.message.slice(0, 200)}`).catch(() => {});
+    return;
+  }
 
-  const outcome = await mindsClient.waitForReply({
-    alias,
-    timeoutMs: 120000,
-    sentMessageText: userText,
-    ...(afterFingerprint !== undefined ? { afterFingerprint } : {}),
-  });
+  await replyMsg.edit('⏳ Sent to your Mind…').catch(() => {});
 
+  try {
+    const outcome = await mindsClient.waitForReply({
+      alias,
+      timeoutMs: 300000, // 5 minutes
+      sentMessageText: userText,
+      ...(afterFingerprint !== undefined ? { afterFingerprint } : {}),
+    });
 
-  if (outcome.timedOut) throw new Error('Minds agent did not reply in time (120s).');
+    let responseText;
+    if (outcome.timedOut) {
+      responseText = '⏳ Your Mind is taking longer than expected. Check with `minds history discord` or try again.';
+    } else {
+      responseText = stripHtml(outcome.reply?.messageText || '_(no response)_');
+      // Store for action handoff detection on the user's next message
+      mindsLastResponse.set(stateKey, {
+        text: responseText,
+        isPendingAction: looksLikePendingAction(responseText),
+      });
+    }
 
-  const response = outcome.reply?.messageText || '_(no response)_';
-
-  // Minds conversation history is managed server-side, no local history needed
-  return response;
+    const finalText = responseText + `\n-# Minds (${mindName})`;
+    const chunks = chunkText(finalText);
+    await replyMsg.edit(chunks[0] ?? '…').catch(() => {});
+    for (let i = 1; i < chunks.length; i++) {
+      await replyMsg.channel.send(chunks[i]).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[minds-bg] error:', err.message);
+    if (/alias.*not found/i.test(err.message)) {
+      await replyMsg.edit(
+        '⚠️ Your Minds alias is no longer valid.\n' +
+        'DM me `!minds <builder-api-key>` to reconnect.'
+      ).catch(() => {});
+    } else {
+      await replyMsg.edit(`⚠️ Minds error: ${err.message.slice(0, 200)}`).catch(() => {});
+    }
+  }
 }
 
 // ─── Discord helpers ──────────────────────────────────────────────────────────
@@ -1693,8 +1754,27 @@ async function handleMessage(message) {
       modelLabel = OPENAI_MODEL;
     } else if (provider === 'minds') {
       const creds = getUserMindsCredentials(message.author.id);
-      accumulated = await runMindsLoop(contextId, contextualText, editor, message.author.id);
-      modelLabel = `Minds (${creds?.name ?? 'unknown'})`;
+      const mindName = creds?.name ?? 'unknown';
+      const stateKey = mindsStateKey(contextId, message.author.id);
+      const lastState = mindsLastResponse.get(stateKey);
+
+      if (lastState?.isPendingAction && isPositiveConfirmation(text)) {
+        // User confirmed a pending Mind action — hand off to Claude to execute
+        mindsLastResponse.delete(stateKey);
+        const handoffText =
+          `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n` +
+          `The user's Minds AI agent researched and prepared the following action plan. ` +
+          `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
+          `---\n${lastState.text}\n---\n\n` +
+          `User confirmed: "${text}"`;
+        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx);
+        modelLabel = `${CLAUDE_MODEL} (via Minds)`;
+      } else {
+        // Async path — fire and forget, background function edits the reply when Mind responds
+        runMindsBackground(contextId, contextualText, replyMsg, message.author.id, stateKey, mindName)
+          .catch((err) => console.error('[minds-bg] unhandled:', err.message));
+        return;
+      }
     } else {
       accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx);
       modelLabel = CLAUDE_MODEL;
@@ -1713,15 +1793,6 @@ async function handleMessage(message) {
     await editor.finalize(finalText);
 
   } catch (err) {
-    // Special case: user hasn't registered yet, or their alias is stale
-    if (err.message === 'NO_MINDS_ALIAS' || /alias.*not found/i.test(err.message)) {
-      await editor.finalize(
-        '⚠️ You need to connect your Minds agent.\n' +
-        'DM me `!minds <builder-api-key>` to connect.\n' +
-        'Get a Builder API key at https://build.hellominds.ai/console'
-      );
-      return;
-    }
     console.error(`[${provider}] error:`, err);
     // Roll back the unpaired user message so history stays consistent
     if (provider === 'gemini') {
@@ -1731,6 +1802,7 @@ async function handleMessage(message) {
       const h = getOpenAIHistory(contextId);
       if (h.at(-1)?.role === 'user') h.pop();
     } else {
+      // anthropic or minds-handoff-to-claude
       const h = getAnthropicHistory(contextId);
       if (h.at(-1)?.role === 'user') h.pop();
     }
@@ -1804,8 +1876,9 @@ async function handleDM(message) {
         selectedMind = enabledMinds[0];
       }
 
-      await client.ensureConversation('discord', selectedMind.mindId);
-      setUserMindsCredentials(message.author.id, apiKey, 'discord', selectedMind.name);
+      const userAlias = `dc${message.author.id.slice(-8)}${randomBytes(2).toString('hex')}`;
+      await client.ensureConversation(userAlias, selectedMind.mindId);
+      setUserMindsCredentials(message.author.id, apiKey, userAlias, selectedMind.name);
 
       const otherMinds = enabledMinds.filter((m) => m.mindId !== selectedMind.mindId);
       const switchHint = otherMinds.length > 0
