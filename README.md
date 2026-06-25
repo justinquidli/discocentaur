@@ -14,13 +14,13 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Cancel / reschedule** — manage pending scheduled drops and watchers
 - **Per-user API keys** — users can DM `!connect <key>` to link their own Quidli account
 - **Web search** — real-time data via Brave Search for conditional drops and factual questions
-- **Multi-LLM support** — switch between Claude, Gemini, and OpenAI per channel
+- **Multi-LLM support** — switch between Claude, Gemini, OpenAI, and Minds AI per channel
 - **Role-based access** — restrict bot usage to specific Discord roles
 
 ## How it works
 
 ```
-Discord message → LLM (Claude / Gemini / OpenAI)
+Discord message → LLM (Claude / Gemini / OpenAI / Minds AI)
                → Quidli Connect API (lookup / scores / drop)
                → edit Discord reply in real time
 ```
@@ -37,6 +37,7 @@ The LLM decides when to call tools based on natural language. No commands needed
 @DiscoCentaur send 0.01 USDC to the first person who types "gm" here today
 @DiscoCentaur switch to gemini
 @DiscoCentaur switch to claude
+@DiscoCentaur switch to minds
 ```
 
 ## Prerequisites
@@ -132,6 +133,32 @@ Switch the active LLM per channel at any time:
 ```
 
 The choice persists across bot restarts (stored in SQLite). Each provider maintains its own conversation history.
+
+### Minds AI (experimental)
+
+Minds AI is a platform by Animoca Brands that lets you deploy custom AI agents trained on your own data. DiscoCentaur can route messages to your personal Mind via Discord.
+
+**How to connect your Mind:**
+
+1. Get a Builder API key at [build.hellominds.ai/console](https://build.hellominds.ai/console) (sign in → Keys → Create)
+2. DM the bot:
+   ```
+   !minds <builder-api-key>
+   ```
+   If you have more than one Mind, specify which one:
+   ```
+   !minds <builder-api-key> <mind-name>
+   ```
+3. Switch the channel to Minds mode: `@DiscoCentaur switch to minds`
+
+**Per-user privacy:** Each user connects their own Builder API key. The bot uses it to call the Minds API on their behalf — no one else can access your Mind, and the bot owner's Mind is never shared. Keys are stored encrypted with AES-256-GCM.
+
+**Other DM commands:**
+```
+!minds-remove   — disconnect your Minds credentials
+```
+
+> **⚠️ Experimental.** The Minds API is in active development and can be intermittently unreliable — requests sometimes time out on their side with no error. If your Mind stops responding, wait a few minutes and try again. For anything critical, switch to Claude.
 
 > **Performance depends on the model.** Claude delivers the best results and is the recommended provider for all actions. It was purpose-built for agentic tool use and handles the full feature set reliably — drops, role-based sends, scheduling, conditional drops, presence filters, and multi-step lookups.
 >
