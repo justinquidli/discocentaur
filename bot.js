@@ -12,7 +12,7 @@ import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { createMindsClient } from '@animocabrands/minds-client-lib';
 import { createWalletClient, http, parseUnits, encodeFunctionData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -45,7 +45,7 @@ const {
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
-  // Minds (Animoca Brands) — relays messages to a Minds agent via CLI
+  // Minds (Animoca Brands) — relays messages to a Minds agent via API
   MINDS_BUILDER_API_KEY,
   MINDS_ALIAS = 'main',             // Conversation alias — run `minds list` to find yours
 } = process.env;
@@ -1481,21 +1481,27 @@ async function runMindsLoop(contextId, text, editor, senderId) {
 
   editor.update('_Thinking…_');
 
-  const response = await new Promise((resolve, reject) => {
-    // Using --no-json for clean plain-text stdout
-    execFile(
-      'minds',
-      ['send', alias, userText, '--wait', '--no-json', '--quiet'],
-      {
-        env: { ...process.env, MINDS_BUILDER_API_KEY },
-        timeout: 120000,
-      },
-      (err, stdout, stderr) => {
-        if (err) return reject(new Error(err.message || stderr));
-        resolve(stdout.trim());
-      }
-    );
+  const mindsClient = createMindsClient({ builderApiKey: MINDS_BUILDER_API_KEY });
+
+  // Grab the latest fingerprint before sending so waitForReply only sees the new reply
+  let afterFingerprint;
+  try {
+    afterFingerprint = await mindsClient.getLatestHistoryFingerprint(alias);
+  } catch { /* first message in conversation, no fingerprint yet */ }
+
+  await mindsClient.sendMessage({ alias, messageText: userText });
+
+  const outcome = await mindsClient.waitForReply({
+    alias,
+    timeoutMs: 120000,
+    sentMessageText: userText,
+    ...(afterFingerprint !== undefined ? { afterFingerprint } : {}),
   });
+
+
+  if (outcome.timedOut) throw new Error('Minds agent did not reply in time (120s).');
+
+  const response = outcome.reply?.messageText || '_(no response)_';
 
   // Minds conversation history is managed server-side, no local history needed
   return response;
@@ -1861,7 +1867,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
-  if (MINDS_BUILDER_API_KEY) console.log(`   Minds: alias="${MINDS_ALIAS}" ✓`);
+  if (MINDS_BUILDER_API_KEY) console.log(`   Minds: API key set, default alias="${MINDS_ALIAS}" ✓`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   if (ACTIVE_CHANNELS.size > 0) {
