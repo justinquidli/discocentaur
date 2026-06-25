@@ -12,6 +12,7 @@ import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { createWalletClient, http, parseUnits, encodeFunctionData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -39,11 +40,14 @@ const {
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
   // Multi-LLM provider support
-  DEFAULT_LLM_PROVIDER = 'anthropic', // anthropic | gemini | openai
+  DEFAULT_LLM_PROVIDER = 'anthropic', // anthropic | gemini | openai | minds
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
+  // Minds (Animoca Brands) — relays messages to a Minds agent via CLI
+  MINDS_BUILDER_API_KEY,
+  MINDS_ALIAS = 'main',             // Conversation alias — run `minds list` to find yours
 } = process.env;
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
@@ -167,10 +171,13 @@ function decrypt(stored) {
 
 const db = new DatabaseSync('./users.db');
 db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
-  discord_id TEXT PRIMARY KEY,
-  api_key    TEXT NOT NULL,
-  created_at INTEGER DEFAULT (unixepoch())
+  discord_id  TEXT PRIMARY KEY,
+  api_key     TEXT NOT NULL,
+  minds_alias TEXT,
+  created_at  INTEGER DEFAULT (unixepoch())
 )`);
+// Add minds_alias column if upgrading from older schema
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_alias TEXT`); } catch { /* already exists */ }
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
   sender_id  TEXT NOT NULL,
@@ -210,6 +217,22 @@ function setUserApiKey(discordId, apiKey) {
 
 function deleteUserApiKey(discordId) {
   db.prepare('DELETE FROM user_keys WHERE discord_id = ?').run(discordId);
+}
+
+function getUserMindsAlias(discordId) {
+  const row = db.prepare('SELECT minds_alias FROM user_keys WHERE discord_id = ?').get(discordId);
+  return row?.minds_alias ?? null;
+}
+
+function setUserMindsAlias(discordId, alias) {
+  db.prepare(`INSERT INTO user_keys (discord_id, api_key, minds_alias)
+    VALUES (?, '', ?)
+    ON CONFLICT(discord_id) DO UPDATE SET minds_alias = excluded.minds_alias`)
+    .run(discordId, alias);
+}
+
+function deleteUserMindsAlias(discordId) {
+  db.prepare('UPDATE user_keys SET minds_alias = NULL WHERE discord_id = ?').run(discordId);
 }
 
 // ─── Scheduled drops ─────────────────────────────────────────────────────────
@@ -1235,6 +1258,8 @@ function detectProviderSwitch(text) {
   if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
   if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
   if (/\bclaude\s+mode\b/.test(lower)) return 'anthropic';
+  if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
+  if (/\bminds\s+mode\b/.test(lower)) return 'minds';
   return null;
 }
 
@@ -1440,6 +1465,42 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx) {
   return accumulated;
 }
 
+async function runMindsLoop(contextId, text, editor, senderId) {
+  if (!MINDS_BUILDER_API_KEY) throw new Error('MINDS_BUILDER_API_KEY is not set in .env');
+
+  // Resolve alias: per-user only — no fallback to owner's agent for privacy
+  const alias = senderId ? getUserMindsAlias(senderId) : null;
+  if (!alias) {
+    throw new Error(
+      'NO_MINDS_ALIAS' // caught in handleMessage and shown as a friendly prompt
+    );
+  }
+
+  // Strip the system context prefix before forwarding — Minds doesn't need it
+  const userText = text.replace(/^\[Current date.*?\]\n\[Sent by.*?\]\s*/s, '').trim();
+
+  editor.update('_Thinking…_');
+
+  const response = await new Promise((resolve, reject) => {
+    // Using --no-json for clean plain-text stdout
+    execFile(
+      'minds',
+      ['send', alias, userText, '--wait', '--no-json', '--quiet'],
+      {
+        env: { ...process.env, MINDS_BUILDER_API_KEY },
+        timeout: 120000,
+      },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(err.message || stderr));
+        resolve(stdout.trim());
+      }
+    );
+  });
+
+  // Minds conversation history is managed server-side, no local history needed
+  return response;
+}
+
 // ─── Discord helpers ──────────────────────────────────────────────────────────
 
 function chunkText(text, limit = DISCORD_MSG_LIMIT) {
@@ -1568,6 +1629,10 @@ async function handleMessage(message) {
       await message.reply('⚠️ `OPENAI_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
       return;
     }
+    if (switchTarget === 'minds' && !MINDS_BUILDER_API_KEY) {
+      await message.reply('⚠️ `MINDS_BUILDER_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
+      return;
+    }
     setChannelProvider(contextId, switchTarget);
     // Clear all in-memory histories for this channel so the new provider starts fresh
     anthropicHistories.delete(contextId);
@@ -1575,6 +1640,7 @@ async function handleMessage(message) {
     openaiHistories.delete(contextId);
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
+      : switchTarget === 'minds' ? `Minds (${MINDS_ALIAS})`
       : CLAUDE_MODEL;
     await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
     return;
@@ -1624,6 +1690,10 @@ async function handleMessage(message) {
     } else if (provider === 'openai') {
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx);
       modelLabel = OPENAI_MODEL;
+    } else if (provider === 'minds') {
+      const userAlias = getUserMindsAlias(message.author.id);
+      accumulated = await runMindsLoop(contextId, contextualText, editor, message.author.id);
+      modelLabel = `Minds (${userAlias})`;
     } else {
       accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx);
       modelLabel = CLAUDE_MODEL;
@@ -1642,6 +1712,15 @@ async function handleMessage(message) {
     await editor.finalize(finalText);
 
   } catch (err) {
+    // Special case: user hasn't registered a Minds alias
+    if (err.message === 'NO_MINDS_ALIAS') {
+      await editor.finalize(
+        '⚠️ You need a personal Minds agent to use this mode.\n' +
+        'DM me `!minds <your-alias>` to register one.\n' +
+        'Get started at https://build.hellominds.ai'
+      );
+      return;
+    }
     console.error(`[${provider}] error:`, err);
     // Roll back the unpaired user message so history stays consistent
     if (provider === 'gemini') {
@@ -1687,10 +1766,29 @@ async function handleDM(message) {
     return;
   }
 
+  if (content.startsWith('!minds ')) {
+    const alias = content.slice('!minds '.length).trim();
+    if (!alias) {
+      await message.reply('Please provide your Minds alias: `!minds <your-alias>`');
+      return;
+    }
+    setUserMindsAlias(message.author.id, alias);
+    await message.reply(`✅ Minds alias set to \`${alias}\`. When the channel is on Minds mode, your messages will go to your personal Minds agent.`);
+    return;
+  }
+
+  if (content === '!minds-remove') {
+    deleteUserMindsAlias(message.author.id);
+    await message.reply('🗑️ Your Minds alias has been removed. You\'ll use the default bot agent when in Minds mode.');
+    return;
+  }
+
   await message.reply(
     'Available commands:\n' +
     '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
-    '`!revoke` — remove your stored API key\n\n' +
+    '`!revoke` — remove your stored API key\n' +
+    '`!minds <alias>` — set your personal Minds agent alias for Minds mode\n' +
+    '`!minds-remove` — remove your Minds alias\n\n' +
     'Get a Quidli API key at https://connect.quid.li'
   );
 }
@@ -1763,6 +1861,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
+  if (MINDS_BUILDER_API_KEY) console.log(`   Minds: alias="${MINDS_ALIAS}" ✓`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   if (ACTIVE_CHANNELS.size > 0) {

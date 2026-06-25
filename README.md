@@ -158,6 +158,27 @@ Scheduled drops survive bot restarts. Conditional drops use Brave Search to eval
 @DiscoCentaur cancel watcher <id>
 ```
 
+## Role management
+
+Access to DiscoCentaur is controlled by `DISCORD_ALLOWED_ROLES` in `.env`. Only members with those roles can interact with the bot or switch providers.
+
+**Granting access:**
+Assign the allowed role to a user in Discord (Server Settings → Roles, or right-click the user). There is no bot command for this — it's managed through Discord's native role system.
+
+**Notifying new members:**
+Discord doesn't proactively notify users when they receive a role. Options:
+- **Manual** — tell the user directly that they now have access and can use `@DiscoCentaur`
+- **Automated** — a future version of DiscoCentaur can listen to the `GuildMemberUpdate` event and automatically DM new members when they receive an allowed role, with onboarding instructions. This is not yet built in but is a planned improvement.
+
+**Changing allowed roles:**
+Edit `DISCORD_ALLOWED_ROLES` in `.env` and restart the bot (`pm2 restart claudetaur`). Multiple roles are comma-separated:
+```
+DISCORD_ALLOWED_ROLES=Team Quidli,Admins,Moderators
+```
+
+**If a user tries to access without permission:**
+The bot replies in-channel telling them which role is required. They won't be able to switch providers or trigger any actions until the role is granted.
+
 ## Troubleshooting
 
 **Bot doesn't respond:** Check that Message Content Intent, Server Members Intent, and Presence Intent are all enabled in the Discord Developer Portal.
