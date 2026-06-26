@@ -104,8 +104,19 @@ Only after exhausting all available identifiers, tell the user the person isn't 
 
 The same multi-identity fallback applies to quidli_drop and quidli_score — always try the most specific identifier first, then fall back through others.
 
+## Looking up linked accounts (quidli_exposed)
+Use quidli_exposed when someone asks what accounts a person has linked, or when you only have a username and need a numeric ID. Returns all platforms linked to that identity (email, wallet, smart_wallet, telegram, discord, etc.).
+- If you have a Discord username but no numeric ID, call quidli_exposed with { type: "discord", username: "<handle>" } to get their numeric ID, then use that for drops.
+
+## Identity summary ("tell me about myself", "who am I?")
+When someone asks about themselves — "tell me about myself", "who am I?", "what do you know about me?", "summarize my profile", "based on my socials" — do ALL of the following:
+1. Call quidli_exposed with their Discord ID (from the message context) to get all linked accounts
+2. Call quidli_score with their Discord ID to get their web3 reputation scores
+3. For each professional/social platform in the exposed results (GitHub, LinkedIn, Twitter, Farcaster), call web_search to look up their public profile — find their employer, job title, notable projects, bio, or anything publicly known about them
+Then synthesize everything into a warm, conversational paragraph: who they are professionally, what they build or work on, their on-chain presence and wallet addresses, and their reputation standing. Make it feel like a smart introduction, not a data dump. If LinkedIn or GitHub is linked, lean into those for professional context.
+
 ## Resolving Discord mentions
-Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names.
+Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names. If only a username is available, use quidli_exposed to resolve it first.
 
 ## Checking reputation (quidli_score)
 Use quidli_score when asked about trust, reputation, or scores. Pass the most specific identity available.
@@ -740,6 +751,13 @@ async function quidliScore({ users, filter }) {
   return res.json();
 }
 
+// ─── Quidli exposed ───────────────────────────────────────────────────────────
+
+async function quidliExposed(recipient) {
+  const res = await quidliFetch('/lookup/exposed', { method: 'POST', body: JSON.stringify({ recipient }) });
+  return res.json();
+}
+
 // ─── Claude tools ─────────────────────────────────────────────────────────────
 
 const RECIPIENT_SCHEMA = {
@@ -959,6 +977,28 @@ const tools = [
         watcherId: { type: 'string', description: 'The watcher ID to cancel.' },
       },
       required: ['watcherId'],
+    },
+  },
+  {
+    name: 'quidli_exposed',
+    description: "Look up all linked social accounts and wallets for a person. Use when someone asks 'what accounts does X have?', 'what's linked to this email/handle?', or when you need to resolve a username to a numeric ID before sending. Returns all platforms linked to that identity (email, wallet, smart_wallet, discord, telegram, etc.).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        recipient: {
+          type: 'object',
+          properties: {
+            type: {
+              type: 'string',
+              enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin'],
+            },
+            id: { type: 'string', description: 'Numeric ID or email. Use EITHER id OR username.' },
+            username: { type: 'string', description: 'Handle/username. Use EITHER id OR username.' },
+          },
+          required: ['type'],
+        },
+      },
+      required: ['recipient'],
     },
   },
   {
@@ -1183,6 +1223,9 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
   if (name === 'quidli_score') {
     const result = await quidliScore(input);
     return JSON.stringify(result, null, 2);
+  }
+  if (name === 'quidli_exposed') {
+    return JSON.stringify(await quidliExposed(input.recipient), null, 2);
   }
   throw new Error(`Unknown tool: ${name}`);
 }
