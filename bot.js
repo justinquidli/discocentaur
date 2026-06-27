@@ -45,8 +45,11 @@ const {
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
+  REQUIRE_USER_LLM_KEY = 'false', // Set to 'true' to require users to bring their own LLM key
   // Minds (Animoca Brands) — per-user credentials registered via DM: !minds <key> [mind-name]
 } = process.env;
+
+const REQUIRE_USER_LLM = REQUIRE_USER_LLM_KEY === 'true';
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is required');
@@ -191,6 +194,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_alias TEXT`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_api_key TEXT`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_name TEXT`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_provider TEXT`); } catch { /* already exists */ }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { /* already exists */ }
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
   sender_id  TEXT NOT NULL,
@@ -230,6 +235,23 @@ function setUserApiKey(discordId, apiKey) {
 
 function deleteUserApiKey(discordId) {
   db.prepare('DELETE FROM user_keys WHERE discord_id = ?').run(discordId);
+}
+
+function getUserLlmKey(discordId) {
+  const row = db.prepare('SELECT llm_provider, llm_api_key FROM user_keys WHERE discord_id = ?').get(discordId);
+  if (!row?.llm_provider || !row?.llm_api_key) return null;
+  return { provider: row.llm_provider, apiKey: decrypt(row.llm_api_key) };
+}
+
+function setUserLlmKey(discordId, provider, apiKey) {
+  db.prepare(`INSERT INTO user_keys (discord_id, llm_provider, llm_api_key)
+    VALUES (?, ?, ?)
+    ON CONFLICT(discord_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key`)
+    .run(discordId, provider, encrypt(apiKey));
+}
+
+function deleteUserLlmKey(discordId) {
+  db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL WHERE discord_id = ?').run(discordId);
 }
 
 function getUserMindsCredentials(discordId) {
@@ -1234,24 +1256,23 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-// Lazy Gemini client
-let _geminiClient = null;
-async function getGeminiClient() {
-  if (_geminiClient) return _geminiClient;
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set in .env');
-  const { GoogleGenAI } = await import('@google/genai');
-  _geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  return _geminiClient;
+function getAnthropicClient(userApiKey) {
+  if (userApiKey) return new Anthropic({ apiKey: userApiKey });
+  return anthropic;
 }
 
-// Lazy OpenAI client
-let _openaiClient = null;
-async function getOpenAIClient() {
-  if (_openaiClient) return _openaiClient;
-  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not set in .env');
+async function getGeminiClient(userApiKey) {
+  const key = userApiKey || GEMINI_API_KEY;
+  if (!key) throw new Error('No Gemini API key available. DM me `!llm gemini <key>` to connect your own.');
+  const { GoogleGenAI } = await import('@google/genai');
+  return new GoogleGenAI({ apiKey: key });
+}
+
+async function getOpenAIClient(userApiKey) {
+  const key = userApiKey || OPENAI_API_KEY;
+  if (!key) throw new Error('No OpenAI API key available. DM me `!llm openai <key>` to connect your own.');
   const { default: OpenAI } = await import('openai');
-  _openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
-  return _openaiClient;
+  return new OpenAI({ apiKey: key });
 }
 
 // ─── Tool format converters ───────────────────────────────────────────────────
@@ -1380,16 +1401,17 @@ function friendlyProviderError(provider, err) {
 
 // ─── Provider agentic loops ───────────────────────────────────────────────────
 
-async function runAnthropicLoop(contextId, contextualText, editor, toolCtx) {
+async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, userLlmKey) {
   const history = getAnthropicHistory(contextId);
   history.push({ role: 'user', content: contextualText });
+  const client = getAnthropicClient(userLlmKey);
 
   // Work on a snapshot so intermediate tool-call turns don't pollute history
   let messages = [...history];
   let accumulated = '';
 
   while (true) {
-    const response = await anthropic.messages.create({
+    const response = await client.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
@@ -1431,8 +1453,8 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx) {
   return accumulated;
 }
 
-async function runGeminiLoop(contextId, contextualText, editor, toolCtx) {
-  const ai = await getGeminiClient();
+async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlmKey) {
+  const ai = await getGeminiClient(userLlmKey);
   const history = getGeminiHistory(contextId);
   history.push({ role: 'user', parts: [{ text: contextualText }] });
 
@@ -1485,8 +1507,8 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx) {
   return accumulated;
 }
 
-async function runOpenAILoop(contextId, contextualText, editor, toolCtx) {
-  const openai = await getOpenAIClient();
+async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey) {
+  const openai = await getOpenAIClient(userLlmKey);
   const history = getOpenAIHistory(contextId);
   history.push({ role: 'user', content: contextualText });
 
@@ -1699,6 +1721,18 @@ async function handleMessage(message) {
     }
   }
 
+  // BYOLLM enforcement — if host requires users to bring their own key
+  if (REQUIRE_USER_LLM && !getUserLlmKey(message.author.id)) {
+    await message.reply(
+      'This bot requires you to connect your own AI API key.\n\n' +
+      'DM me to set it up:\n' +
+      '`!llm anthropic <key>` — from console.anthropic.com\n' +
+      '`!llm gemini <key>` — from aistudio.google.com/apikey\n' +
+      '`!llm openai <key>` — from platform.openai.com'
+    ).catch(() => {});
+    return;
+  }
+
   // Replace @user mentions with "username (Discord ID: 123456)"
   // Replace @role mentions with "roleName (Role ID: 123456)"
   // Strip the bot's own mention
@@ -1764,6 +1798,7 @@ async function handleMessage(message) {
   // Prefix with sender identity so the LLM knows who "me/I/my" refers to
   const senderName = message.member?.displayName ?? message.author.username;
   const senderApiKey = getUserApiKey(message.author.id);
+  const userLlmKey = getUserLlmKey(message.author.id);
   const isOwner = BOT_OWNER_ID && message.author.id === BOT_OWNER_ID;
   const walletNote = senderApiKey
     ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
@@ -1788,14 +1823,18 @@ async function handleMessage(message) {
   // Clear any leftover basescan URLs from a previous turn
   _pendingBasescanUrls.length = 0;
 
+  // User's own LLM key overrides the chat's provider setting
+  const effectiveProvider = userLlmKey ? userLlmKey.provider : provider;
+  const effectiveLlmKey = userLlmKey?.apiKey ?? null;
+
   try {
-    if (provider === 'gemini') {
-      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx);
+    if (effectiveProvider === 'gemini') {
+      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
       modelLabel = GEMINI_MODEL;
-    } else if (provider === 'openai') {
-      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx);
+    } else if (effectiveProvider === 'openai') {
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
       modelLabel = OPENAI_MODEL;
-    } else if (provider === 'minds') {
+    } else if (effectiveProvider === 'minds') {
       const creds = getUserMindsCredentials(message.author.id);
       const mindName = creds?.name ?? 'unknown';
       const stateKey = mindsStateKey(contextId, message.author.id);
@@ -1810,7 +1849,7 @@ async function handleMessage(message) {
           `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
           `---\n${lastState.text}\n---\n\n` +
           `User confirmed: "${text}"`;
-        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx);
+        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, effectiveLlmKey);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
         // Async path — fire and forget, background function edits the reply when Mind responds
@@ -1819,7 +1858,7 @@ async function handleMessage(message) {
         return;
       }
     } else {
-      accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx);
+      accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
       modelLabel = CLAUDE_MODEL;
     }
 
@@ -1941,10 +1980,49 @@ async function handleDM(message) {
     return;
   }
 
+  if (content.startsWith('!llm ')) {
+    const parts = content.slice('!llm '.length).trim().split(/\s+/);
+    const provider = parts[0]?.toLowerCase();
+    const apiKey = parts[1];
+
+    if (!provider || !apiKey) {
+      await message.reply(
+        'Usage: `!llm <provider> <api-key>`\n\n' +
+        'Providers:\n' +
+        '  `anthropic` — from console.anthropic.com\n' +
+        '  `gemini` — from aistudio.google.com/apikey\n' +
+        '  `openai` — from platform.openai.com\n\n' +
+        'Example: `!llm anthropic sk-ant-...`\n\n' +
+        'Your key is stored encrypted and used instead of the host key. DM `!llm-remove` to disconnect.'
+      );
+      return;
+    }
+
+    if (!['anthropic', 'gemini', 'openai'].includes(provider)) {
+      await message.reply('Unknown provider. Use: `anthropic`, `gemini`, or `openai`');
+      return;
+    }
+
+    setUserLlmKey(message.author.id, provider, apiKey);
+    await message.reply(
+      `✅ Connected your ${provider} key. Your messages will now use your own ${provider} credits.\n\n` +
+      '⚠️ Your key is stored encrypted. DM `!llm-remove` anytime to disconnect.'
+    );
+    return;
+  }
+
+  if (content === '!llm-remove') {
+    deleteUserLlmKey(message.author.id);
+    await message.reply('🗑️ Your LLM key has been removed. The bot will use the host key going forward.');
+    return;
+  }
+
   await message.reply(
     'Available commands:\n' +
     '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
     '`!revoke` — remove your stored API key\n' +
+    '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, or openai)\n' +
+    '`!llm-remove` — remove your LLM key\n' +
     '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
     '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
     '`!minds-remove` — remove your Minds credentials\n\n' +
