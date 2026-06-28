@@ -12,7 +12,7 @@ import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { createMindsClient } from '@animocabrands/minds-client-lib';
+import { createMindsClient, isReplyHistoryRow } from '@animocabrands/minds-client-lib';
 import { createWalletClient, http, parseUnits, encodeFunctionData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -246,7 +246,9 @@ function getUserApiKey(discordId) {
 }
 
 function setUserApiKey(discordId, apiKey) {
-  db.prepare('INSERT OR REPLACE INTO user_keys (discord_id, api_key) VALUES (?, ?)').run(discordId, encrypt(apiKey));
+  db.prepare(`INSERT INTO user_keys (discord_id, api_key) VALUES (?, ?)
+    ON CONFLICT(discord_id) DO UPDATE SET api_key = excluded.api_key`)
+    .run(discordId, encrypt(apiKey));
 }
 
 function deleteUserApiKey(discordId) {
@@ -831,7 +833,7 @@ const tools = [
       'Schedule a token drop that only executes if a real-world condition is true at a future check time (e.g. "if France wins tonight", "if BTC is above $100k tomorrow morning"). ' +
       'IMPORTANT: Only use this if the condition can be verified as a clear YES or NO via a web search. ' +
       'If the condition is ambiguous or cannot be verified objectively, refuse and ask the user to rephrase. ' +
-      'ALWAYS use web_search before calling this tool to find the scheduled time of the event, then set checkInMinutes to 30 minutes after the event is expected to end. Never guess or assume a check time.',
+      'ALWAYS use web_search first to find the event\'s scheduled end time in UTC. Pass that time as checkAt (ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z") with a 30-minute buffer after the expected end. Never guess — search for the exact UTC time.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1357,16 +1359,6 @@ const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[
 const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
 const MAX_HISTORY = 40;
 
-// ─── Minds action handoff state ───────────────────────────────────────────────
-
-// Tracks the last Mind response per (contextId, senderId) so we can detect
-// when the user confirms a pending action and hand off execution to Claude.
-const mindsLastResponse = new Map(); // key: `${contextId}:${senderId}` → { text, isPendingAction }
-
-function mindsStateKey(contextId, senderId) {
-  return `${contextId}:${senderId}`;
-}
-
 // Minds responses often use HTML — strip to plain text before passing to Claude
 function stripHtml(text) {
   return text.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
@@ -1585,7 +1577,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
 
 // Async fire-and-forget Minds handler. Sends the message, updates Discord when the reply arrives.
 // Not awaited from handleMessage — returns immediately so Discord stays responsive.
-async function runMindsBackground(contextId, text, replyMsg, senderId, stateKey, mindName) {
+async function runMindsBackground(contextId, text, replyMsg, senderId, mindName) {
   const creds = getUserMindsCredentials(senderId);
   if (!creds) {
     await replyMsg.edit(
@@ -1626,11 +1618,6 @@ async function runMindsBackground(contextId, text, replyMsg, senderId, stateKey,
       responseText = '⏳ Your Mind is taking longer than expected. Check with `minds history discord` or try again.';
     } else {
       responseText = stripHtml(outcome.reply?.messageText || '_(no response)_');
-      // Store for action handoff detection on the user's next message
-      mindsLastResponse.set(stateKey, {
-        text: responseText,
-        isPendingAction: looksLikePendingAction(responseText),
-      });
     }
 
     const finalText = responseText + `\n-# Minds (${mindName})`;
@@ -1845,8 +1832,8 @@ async function handleMessage(message) {
   // Clear any leftover basescan URLs from a previous turn
   _pendingBasescanUrls.length = 0;
 
-  // User's own LLM key overrides the chat's provider setting
-  const effectiveProvider = userLlmKey ? userLlmKey.provider : provider;
+  // User's own LLM key overrides the chat's provider setting, but not a Minds switch
+  const effectiveProvider = (provider !== 'minds' && userLlmKey) ? userLlmKey.provider : provider;
   const effectiveLlmKey = userLlmKey?.apiKey ?? null;
 
   try {
@@ -1859,23 +1846,40 @@ async function handleMessage(message) {
     } else if (effectiveProvider === 'minds') {
       const creds = getUserMindsCredentials(message.author.id);
       const mindName = creds?.name ?? 'unknown';
-      const stateKey = mindsStateKey(contextId, message.author.id);
-      const lastState = mindsLastResponse.get(stateKey);
 
-      if (lastState?.isPendingAction && isPositiveConfirmation(text)) {
-        // User confirmed a pending Mind action — hand off to Claude to execute
-        mindsLastResponse.delete(stateKey);
-        const handoffText =
-          `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n` +
-          `The user's Minds AI agent researched and prepared the following action plan. ` +
-          `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
-          `---\n${lastState.text}\n---\n\n` +
-          `User confirmed: "${text}"`;
+      // If this looks like a confirmation, re-fetch Minds history to check for a pending action.
+      // Using getHistory instead of in-memory state so handoffs survive bot restarts.
+      let handoffText = null;
+      if (creds && isPositiveConfirmation(text)) {
+        try {
+          const mindsClient = createMindsClient({ builderApiKey: creds.apiKey });
+          const history = await mindsClient.getHistory(creds.alias, { limit: 10 });
+          const lastMindReply = history.findLast((row) => isReplyHistoryRow(row));
+          if (lastMindReply) {
+            const age = Date.now() - new Date(lastMindReply.createdAt).getTime();
+            const pendingText = stripHtml(lastMindReply.messageText ?? '');
+            if (age < 60 * 60 * 1000 && looksLikePendingAction(pendingText)) {
+              handoffText =
+                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n` +
+                `The user's Minds AI agent researched and prepared the following action plan. ` +
+                `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
+                `---\n${pendingText}\n---\n\n` +
+                `User confirmed: "${text}"`;
+            }
+          }
+        } catch (err) {
+          console.error('[minds-history] error:', err.message);
+          await replyMsg.edit('⚠️ Could not verify pending action — please try again.').catch(() => {});
+          return;
+        }
+      }
+
+      if (handoffText) {
         accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, effectiveLlmKey);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
         // Async path — fire and forget, background function edits the reply when Mind responds
-        runMindsBackground(contextId, contextualText, replyMsg, message.author.id, stateKey, mindName)
+        runMindsBackground(contextId, contextualText, replyMsg, message.author.id, mindName)
           .catch((err) => console.error('[minds-bg] unhandled:', err.message));
         return;
       }
