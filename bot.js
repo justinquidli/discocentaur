@@ -127,12 +127,19 @@ Use quidli_score when asked about trust, reputation, or scores. Pass the most sp
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
 
+## Tool honesty — CRITICAL
+NEVER claim a drop, conditional drop, watcher, or any action was completed unless you have an actual tool result in your context confirming it. This means:
+- Do NOT write "Done!", "That's set!", or report a jobId unless you received it from a real tool response.
+- Do NOT fabricate jobIds, transaction hashes, wallet addresses, or any other IDs.
+- If you described doing something but have no tool result to back it up, say so immediately and call the tool for real.
+- After any scheduling action, always quote the actual jobId from the tool response in your confirmation.
+
 ## Scheduling drops (schedule_drop)
 Use schedule_drop when asked to send tokens at a future time. Store presenceFilter instead of recipients if the drop should target online users at execution time, not now.
 
 ## Conditional drops (conditional_drop)
 Use conditional_drop when a drop depends on a real-world outcome ("if X wins", "if BTC hits $100k").
-ALWAYS use web_search first to find the event's scheduled end time. Set checkInMinutes to 30 minutes after the expected end. Never guess — look it up.
+ALWAYS use web_search first to find the event's scheduled end time in UTC. Pass that time as checkAt (ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z") with a 30-minute buffer after the expected end. Never guess — search for the exact UTC time.
 
 ## Channel watchers (create_watcher)
 Use create_watcher when asked to send tokens to whoever types a specific phrase. The watcher fires automatically when triggered.
@@ -173,10 +180,17 @@ function encrypt(plaintext) {
 
 function decrypt(stored) {
   if (!encKey) return stored;
-  const [ivHex, tagHex, dataHex] = stored.split(':');
-  const decipher = createDecipheriv('aes-256-gcm', encKey, Buffer.from(ivHex, 'hex'));
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  return decipher.update(Buffer.from(dataHex, 'hex')) + decipher.final('utf8');
+  // If not in iv:tag:data format, it was stored before encryption was enabled — return as-is
+  const parts = stored.split(':');
+  if (parts.length !== 3) return stored;
+  try {
+    const [ivHex, tagHex, dataHex] = parts;
+    const decipher = createDecipheriv('aes-256-gcm', encKey, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return decipher.update(Buffer.from(dataHex, 'hex')) + decipher.final('utf8');
+  } catch {
+    return stored;
+  }
 }
 
 // ─── Per-user key store ───────────────────────────────────────────────────────
@@ -199,11 +213,13 @@ try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { /*
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
   sender_id  TEXT NOT NULL,
+  channel_id TEXT,
   drop_input TEXT NOT NULL,
   execute_at INTEGER NOT NULL,
   created_at INTEGER DEFAULT (unixepoch()),
   executed   INTEGER DEFAULT 0
 )`);
+try { db.exec(`ALTER TABLE scheduled_drops ADD COLUMN channel_id TEXT`); } catch { }
 db.exec(`CREATE TABLE IF NOT EXISTS watchers (
   id            TEXT PRIMARY KEY,
   sender_id     TEXT NOT NULL,
@@ -244,8 +260,8 @@ function getUserLlmKey(discordId) {
 }
 
 function setUserLlmKey(discordId, provider, apiKey) {
-  db.prepare(`INSERT INTO user_keys (discord_id, llm_provider, llm_api_key)
-    VALUES (?, ?, ?)
+  db.prepare(`INSERT INTO user_keys (discord_id, api_key, llm_provider, llm_api_key)
+    VALUES (?, '', ?, ?)
     ON CONFLICT(discord_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key`)
     .run(discordId, provider, encrypt(apiKey));
 }
@@ -404,7 +420,7 @@ async function executeConditionalDrop(jobId) {
     const evalMessages = [
       {
         role: 'user',
-        content: `You are evaluating whether a condition is true or false so a token drop can be executed or cancelled.\n\nCurrent date and time: ${evalNow.toUTCString()}\n\nCondition: "${condition}"\n\nSearch the web to find the answer. Use the current year (${evalNow.getFullYear()}) in your searches. Then respond with ONLY a JSON object: {"result": true} or {"result": false}. Do not include anything else.`,
+        content: `You are a condition evaluator. Determine if the following condition is currently true or false.\n\nCurrent date/time: ${evalNow.toUTCString()}\nCondition: "${condition}"\n\nInstructions:\n1. Search the web using specific, targeted queries. Include the current year (${evalNow.getFullYear()}) in queries about events.\n2. After gathering evidence, output ONLY a raw JSON object on a single line — no markdown, no explanation:\n{"result": true} or {"result": false}`,
       },
     ];
 
@@ -424,7 +440,7 @@ async function executeConditionalDrop(jobId) {
     for (let i = 0; i < 5; i++) {
       const evalRes = await anthropic.messages.create({
         model: CLAUDE_MODEL,
-        max_tokens: 512,
+        max_tokens: 1024,
         tools: evalTools,
         messages: evalMessages2,
       });
@@ -820,7 +836,7 @@ const tools = [
       type: 'object',
       properties: {
         condition: { type: 'string', description: 'The condition to evaluate, stated as a clear yes/no question. E.g. "Did France win their FIFA World Cup match today?"' },
-        checkInMinutes: { type: 'number', description: 'How many minutes from now to check the condition and potentially execute the drop.' },
+        checkAt: { type: 'string', description: 'ISO 8601 UTC timestamp for when to evaluate the condition, e.g. "2026-06-27T22:30:00Z". Use web_search to find the event\'s scheduled end time in UTC, then add a 30-minute buffer.' },
         recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Explicit list of recipients. Use this OR presenceFilter, not both.' },
         presenceFilter: {
           type: 'object',
@@ -836,7 +852,7 @@ const tools = [
         tokenContract: { type: 'string' },
         chainId: { type: 'number' },
       },
-      required: ['condition', 'checkInMinutes', 'amountInWeiPerRecipient', 'tokenContract'],
+      required: ['condition', 'checkAt', 'amountInWeiPerRecipient', 'tokenContract'],
     },
   },
   {
@@ -1078,19 +1094,21 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
       }
       return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
     }
-    const { condition, checkInMinutes, ...dropParams } = input;
-    const executeAt = Math.floor((Date.now() + checkInMinutes * 60 * 1000) / 1000);
+    const { condition, checkAt, ...dropParams } = input;
+    const checkAtMs = new Date(checkAt).getTime();
+    if (isNaN(checkAtMs)) return JSON.stringify({ error: 'Invalid checkAt timestamp. Provide an ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z".' });
+    const executeAt = Math.floor(checkAtMs / 1000);
     const jobId = crypto.randomUUID();
     // Store type=conditional so the executor knows to evaluate the condition first
     db.prepare('INSERT INTO scheduled_drops (id, sender_id, drop_input, execute_at) VALUES (?, ?, ?, ?)')
       .run(jobId, senderId, JSON.stringify({ type: 'conditional', condition, dropParams }), executeAt);
-    setTimeout(() => executeConditionalDrop(jobId), Math.max(0, checkInMinutes * 60 * 1000));
+    setTimeout(() => executeConditionalDrop(jobId), Math.max(0, checkAtMs - Date.now()));
     return JSON.stringify({
       success: true,
       jobId,
       condition,
       checkAt: new Date(executeAt * 1000).toISOString(),
-      message: `Conditional drop set. I'll check "${condition}" in ${checkInMinutes} minutes and DM you the outcome.`,
+      message: `Conditional drop set. I'll check "${condition}" at ${new Date(executeAt * 1000).toUTCString()} and DM you the outcome.`,
     });
   }
   if (name === 'create_watcher') {
@@ -1721,8 +1739,11 @@ async function handleMessage(message) {
     }
   }
 
-  // BYOLLM enforcement — if host requires users to bring their own key
-  if (REQUIRE_USER_LLM && !getUserLlmKey(message.author.id)) {
+  // Owner check — used for BYOLLM exemption and wallet note below
+  const isOwner = BOT_OWNER_ID && message.author.id === BOT_OWNER_ID;
+
+  // BYOLLM enforcement — if host requires users to bring their own key (owner is always exempt)
+  if (REQUIRE_USER_LLM && !isOwner && !getUserLlmKey(message.author.id)) {
     await message.reply(
       'This bot requires you to connect your own AI API key.\n\n' +
       'DM me to set it up:\n' +
@@ -1799,7 +1820,6 @@ async function handleMessage(message) {
   const senderName = message.member?.displayName ?? message.author.username;
   const senderApiKey = getUserApiKey(message.author.id);
   const userLlmKey = getUserLlmKey(message.author.id);
-  const isOwner = BOT_OWNER_ID && message.author.id === BOT_OWNER_ID;
   const walletNote = senderApiKey
     ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
     : isOwner
