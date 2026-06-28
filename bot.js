@@ -250,7 +250,7 @@ function setUserApiKey(discordId, apiKey) {
 }
 
 function deleteUserApiKey(discordId) {
-  db.prepare('DELETE FROM user_keys WHERE discord_id = ?').run(discordId);
+  db.prepare("UPDATE user_keys SET api_key = '' WHERE discord_id = ?").run(discordId);
 }
 
 function getUserLlmKey(discordId) {
@@ -962,15 +962,15 @@ const tools = [
     name: 'reschedule_drop',
     description:
       'Update the check time of a pending scheduled or conditional drop. Use when someone says "push it back", "change the time", or "recheck the time". ' +
-      'If they ask to recheck the event time, use web_search first to find when the event ends, then call this with the correct newCheckInMinutes. ' +
+      'ALWAYS use web_search first to find the event\'s scheduled end time in UTC. Pass that time as newCheckAt (ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z") with a 30-minute buffer after the expected end. Never guess — search for the exact UTC time. ' +
       'Get the job ID from list_scheduled_drops if needed.',
     input_schema: {
       type: 'object',
       properties: {
         jobId: { type: 'string', description: 'The job ID to reschedule.' },
-        newCheckInMinutes: { type: 'number', description: 'New delay in minutes from NOW to check/execute.' },
+        newCheckAt: { type: 'string', description: 'New absolute UTC time to check/execute, as an ISO 8601 string e.g. "2026-06-27T22:30:00Z".' },
       },
-      required: ['jobId', 'newCheckInMinutes'],
+      required: ['jobId', 'newCheckAt'],
     },
   },
   {
@@ -1163,12 +1163,14 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     const job = db.prepare('SELECT id, sender_id, drop_input FROM scheduled_drops WHERE id = ? AND executed = 0').get(input.jobId);
     if (!job) return JSON.stringify({ error: 'No pending drop found with that ID.' });
     if (job.sender_id !== senderId) return JSON.stringify({ error: 'You can only reschedule your own drops.' });
-    const newExecuteAt = Math.floor((Date.now() + input.newCheckInMinutes * 60 * 1000) / 1000);
+    const checkAtMs = new Date(input.newCheckAt).getTime();
+    if (isNaN(checkAtMs)) return JSON.stringify({ error: 'Invalid newCheckAt timestamp. Provide an ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z".' });
+    const newExecuteAt = Math.floor(checkAtMs / 1000);
     db.prepare('UPDATE scheduled_drops SET execute_at = ? WHERE id = ?').run(newExecuteAt, input.jobId);
     // Re-queue with new time
     const stored = JSON.parse(job.drop_input);
     const isConditional = stored.type === 'conditional';
-    const delay = Math.max(0, input.newCheckInMinutes * 60 * 1000);
+    const delay = Math.max(0, checkAtMs - Date.now());
     if (isConditional) {
       setTimeout(() => executeConditionalDrop(input.jobId), delay);
     } else {
@@ -1177,7 +1179,7 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     return JSON.stringify({
       success: true,
       newCheckAt: new Date(newExecuteAt * 1000).toISOString(),
-      message: `Rescheduled — will check in ${input.newCheckInMinutes} minutes.`,
+      message: `Rescheduled — will check at ${new Date(newExecuteAt * 1000).toISOString()}.`,
     });
   }
   if (name === 'cancel_scheduled_drop') {
