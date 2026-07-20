@@ -213,6 +213,19 @@ try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_alias_created_at INTEGER`)
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_provider TEXT`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_model TEXT`); } catch { /* already exists */ }
+
+// Per-provider LLM keys — a user can store anthropic, gemini, openai, and openrouter keys side by side
+db.exec(`CREATE TABLE IF NOT EXISTS user_llm_keys (
+  user_id  TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  api_key  TEXT NOT NULL,
+  model    TEXT,
+  PRIMARY KEY (user_id, provider)
+)`);
+// One-time migration from the legacy single-key columns (idempotent)
+db.exec(`INSERT OR IGNORE INTO user_llm_keys (user_id, provider, api_key, model)
+  SELECT discord_id, llm_provider, llm_api_key, llm_model FROM user_keys
+  WHERE llm_provider IS NOT NULL AND llm_api_key IS NOT NULL`);
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
   sender_id  TEXT NOT NULL,
@@ -258,20 +271,34 @@ function deleteUserApiKey(discordId) {
   db.prepare("UPDATE user_keys SET api_key = '' WHERE discord_id = ?").run(discordId);
 }
 
-function getUserLlmKey(discordId) {
-  const row = db.prepare('SELECT llm_provider, llm_api_key, llm_model FROM user_keys WHERE discord_id = ?').get(discordId);
-  if (!row?.llm_provider || !row?.llm_api_key) return null;
-  return { provider: row.llm_provider, apiKey: decrypt(row.llm_api_key), model: row.llm_model ?? null };
+function getUserLlmKeyFor(discordId, provider) {
+  const row = db.prepare('SELECT api_key, model FROM user_llm_keys WHERE user_id = ? AND provider = ?').get(discordId, provider);
+  if (!row?.api_key) return null;
+  return { provider, apiKey: decrypt(row.api_key), model: row.model ?? null };
+}
+
+function hasAnyUserLlmKey(discordId) {
+  return !!db.prepare('SELECT 1 FROM user_llm_keys WHERE user_id = ? LIMIT 1').get(discordId);
 }
 
 function setUserLlmKey(discordId, provider, apiKey, model) {
-  db.prepare(`INSERT INTO user_keys (discord_id, api_key, llm_provider, llm_api_key, llm_model)
-    VALUES (?, '', ?, ?, ?)
-    ON CONFLICT(discord_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key, llm_model = excluded.llm_model`)
+  db.prepare(`INSERT INTO user_llm_keys (user_id, provider, api_key, model)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, provider) DO UPDATE SET api_key = excluded.api_key, model = COALESCE(excluded.model, user_llm_keys.model)`)
     .run(discordId, provider, encrypt(apiKey), model ?? null);
 }
 
-function deleteUserLlmKey(discordId) {
+function setUserLlmModel(discordId, provider, model) {
+  db.prepare('UPDATE user_llm_keys SET model = ? WHERE user_id = ? AND provider = ?').run(model, discordId, provider);
+}
+
+function deleteUserLlmKey(discordId, provider) {
+  if (provider) {
+    db.prepare('DELETE FROM user_llm_keys WHERE user_id = ? AND provider = ?').run(discordId, provider);
+  } else {
+    db.prepare('DELETE FROM user_llm_keys WHERE user_id = ?').run(discordId);
+  }
+  // Clear legacy columns so the migration doesn't resurrect removed keys
   db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL, llm_model = NULL WHERE discord_id = ?').run(discordId);
 }
 
@@ -1377,6 +1404,9 @@ const OPENROUTER_MODEL_ALIASES = {
   mistral: 'mistralai/mistral-large',
 };
 
+// Claude via OpenRouter for BYOLLM users who only have an OpenRouter key
+const OPENROUTER_CLAUDE_SLUG = 'anthropic/claude-sonnet-4.6';
+
 function detectOpenRouterModel(text) {
   const lower = text.toLowerCase();
   for (const [alias, slug] of Object.entries(OPENROUTER_MODEL_ALIASES)) {
@@ -1791,7 +1821,7 @@ async function handleMessage(message) {
 
   // BYOLLM enforcement — if host requires users to bring their own key (owner is always exempt)
   // Minds users bypass this — they authenticate via Minds credentials, not LLM keys
-  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !getUserLlmKey(message.author.id)) {
+  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !hasAnyUserLlmKey(message.author.id)) {
     await message.reply(
       'This bot requires you to connect your own AI API key.\n\n' +
       'DM me to set it up:\n' +
@@ -1847,8 +1877,8 @@ async function handleMessage(message) {
 
     let orModel = null;
     if (switchTarget === 'openrouter') {
-      const orKey = getUserLlmKey(message.author.id);
-      if (orKey?.provider !== 'openrouter') {
+      const orKey = getUserLlmKeyFor(message.author.id, 'openrouter');
+      if (!orKey) {
         await message.reply(
           '⚠️ You need an OpenRouter key for that model.\n' +
           'DM me `!llm openrouter <key>` to set up. Get one at openrouter.ai/keys'
@@ -1858,7 +1888,7 @@ async function handleMessage(message) {
       // If a specific model was named (e.g. "switch to kimi"), update the stored model
       const namedModel = detectOpenRouterModel(text);
       if (namedModel) {
-        setUserLlmKey(message.author.id, 'openrouter', orKey.apiKey, namedModel);
+        setUserLlmModel(message.author.id, 'openrouter', namedModel);
         orModel = namedModel;
       } else {
         orModel = orKey.model || 'openai/gpt-4o';
@@ -1875,12 +1905,7 @@ async function handleMessage(message) {
       : switchTarget === 'minds' ? 'Minds'
       : switchTarget === 'openrouter' ? orModel
       : CLAUDE_MODEL;
-    // Warn if the user's personal key will override this switch
-    const ukAfterSwitch = getUserLlmKey(message.author.id);
-    const overrideNote = (switchTarget !== 'minds' && switchTarget !== 'openrouter' && ukAfterSwitch && ukAfterSwitch.provider !== switchTarget)
-      ? `\n\n⚠️ Note: your personal ${ukAfterSwitch.provider} key overrides this for your messages. DM \`!llm-remove\` to use the channel's provider, or \`!llm ${switchTarget} <key>\` to connect a matching key.`
-      : '';
-    await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.${overrideNote}`).catch(() => {});
+    await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
     return;
   }
 
@@ -1897,7 +1922,6 @@ async function handleMessage(message) {
   // Prefix with sender identity so the LLM knows who "me/I/my" refers to
   const senderName = message.member?.displayName ?? message.author.username;
   const senderApiKey = getUserApiKey(message.author.id);
-  const userLlmKey = getUserLlmKey(message.author.id);
   const walletNote = senderApiKey
     ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
     : isOwner
@@ -1921,28 +1945,29 @@ async function handleMessage(message) {
   // Clear any leftover basescan URLs from a previous turn
   _pendingBasescanUrls.length = 0;
 
-  // User's own LLM key overrides the chat's provider setting, but not a Minds switch
-  const effectiveProvider = (provider !== 'minds' && userLlmKey) ? userLlmKey.provider : provider;
-  const effectiveLlmKey = userLlmKey?.apiKey ?? null;
-  const effectiveModel = userLlmKey?.model ?? null;
+  // The channel's switched provider decides what runs. Each user's messages use
+  // their own key for that provider if they have one, else the host key.
+  const effectiveProvider = provider;
+  const anthKey = getUserLlmKeyFor(message.author.id, 'anthropic');
+  const orKey = getUserLlmKeyFor(message.author.id, 'openrouter');
 
   try {
     if (effectiveProvider === 'gemini') {
-      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
+      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(message.author.id, 'gemini')?.apiKey ?? null);
       modelLabel = GEMINI_MODEL;
     } else if (effectiveProvider === 'openai') {
-      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(message.author.id, 'openai')?.apiKey ?? null);
       modelLabel = OPENAI_MODEL;
     } else if (effectiveProvider === 'openrouter') {
-      if (!userLlmKey || userLlmKey.provider !== 'openrouter') {
+      if (!orKey) {
         await editor.finalize(
           '⚠️ This channel is in OpenRouter mode, but you don\'t have an OpenRouter key connected.\n' +
           'DM me `!llm openrouter <key>` to set up (openrouter.ai/keys), or say "switch to claude" to change modes.'
         );
         return;
       }
-      const orModel = effectiveModel || 'openai/gpt-4o';
-      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey, {
+      const orModel = orKey.model || 'openai/gpt-4o';
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, orKey.apiKey, {
         baseURL: 'https://openrouter.ai/api/v1',
         model: orModel,
       });
@@ -1979,7 +2004,7 @@ async function handleMessage(message) {
       }
 
       if (handoffText) {
-        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, effectiveLlmKey);
+        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, anthKey?.apiKey ?? null);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
         // Async path — fire and forget, background function edits the reply when Mind responds
@@ -1988,8 +2013,18 @@ async function handleMessage(message) {
         return;
       }
     } else {
-      accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
-      modelLabel = CLAUDE_MODEL;
+      // anthropic (default). BYOLLM users without an Anthropic key but with an
+      // OpenRouter key get Claude routed through OpenRouter on their own credits.
+      if (REQUIRE_USER_LLM && !isOwner && !anthKey && orKey) {
+        accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, orKey.apiKey, {
+          baseURL: 'https://openrouter.ai/api/v1',
+          model: OPENROUTER_CLAUDE_SLUG,
+        });
+        modelLabel = `${OPENROUTER_CLAUDE_SLUG} (via OpenRouter)`;
+      } else {
+        accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, anthKey?.apiKey ?? null);
+        modelLabel = CLAUDE_MODEL;
+      }
     }
 
     // Append any basescan URLs the LLM forgot to include
@@ -2147,9 +2182,12 @@ async function handleDM(message) {
     return;
   }
 
-  if (content === '!llm-remove') {
-    deleteUserLlmKey(message.author.id);
-    await message.reply('🗑️ Your LLM key has been removed. The bot will use the host key going forward.');
+  if (content === '!llm-remove' || content.startsWith('!llm-remove ')) {
+    const prov = content.slice('!llm-remove'.length).trim().toLowerCase() || null;
+    deleteUserLlmKey(message.author.id, prov);
+    await message.reply(prov
+      ? `🗑️ Your ${prov} key has been removed.`
+      : '🗑️ All your LLM keys have been removed. The bot will use host keys going forward.');
     return;
   }
 
