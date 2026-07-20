@@ -252,8 +252,11 @@ db.exec(`CREATE TABLE IF NOT EXISTS watchers (
 db.exec(`CREATE TABLE IF NOT EXISTS channel_settings (
   context_id TEXT PRIMARY KEY,
   provider   TEXT NOT NULL DEFAULT 'anthropic',
+  model      TEXT,
   updated_at INTEGER DEFAULT (unixepoch())
 )`);
+// Channel-level model override (e.g. "switch to fable" / "switch to kimi") — for upgrades
+try { db.exec(`ALTER TABLE channel_settings ADD COLUMN model TEXT`); } catch { /* already exists */ }
 
 function getUserApiKey(discordId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE discord_id = ?').get(discordId);
@@ -1371,11 +1374,17 @@ function getChannelProvider(contextId) {
   return row?.provider ?? DEFAULT_LLM_PROVIDER;
 }
 
-function setChannelProvider(contextId, provider) {
-  db.prepare(`INSERT INTO channel_settings (context_id, provider, updated_at)
-    VALUES (?, ?, unixepoch())
-    ON CONFLICT(context_id) DO UPDATE SET provider = excluded.provider, updated_at = unixepoch()`)
-    .run(contextId, provider);
+function getChannelModel(contextId) {
+  const row = db.prepare('SELECT model FROM channel_settings WHERE context_id = ?').get(contextId);
+  return row?.model ?? null;
+}
+
+// Switching providers always resets the model (null unless a specific model was named)
+function setChannelProvider(contextId, provider, model = null) {
+  db.prepare(`INSERT INTO channel_settings (context_id, provider, model, updated_at)
+    VALUES (?, ?, ?, unixepoch())
+    ON CONFLICT(context_id) DO UPDATE SET provider = excluded.provider, model = excluded.model, updated_at = unixepoch()`)
+    .run(contextId, provider, model);
 }
 
 function detectProviderSwitch(text) {
@@ -1383,12 +1392,12 @@ function detectProviderSwitch(text) {
   // Match "switch to X", "use X", "change to X", "switch X on", etc.
   if (/(switch|change|use|swap)\s+(to\s+)?(gemini|google)/.test(lower)) return 'gemini';
   if (/(switch|change|use|swap)\s+(to\s+)?(openai|gpt|chatgpt|open\s*ai)/.test(lower)) return 'openai';
-  if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic)/.test(lower)) return 'anthropic';
+  if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic|fable|opus|haiku|sonnet)/.test(lower)) return 'anthropic';
   if (/(switch|change|use|swap)\s+(to\s+)?(openrouter|open\s*router|kimi|llama|mistral|deepseek)/.test(lower)) return 'openrouter';
   // Also match "gemini mode", "claude mode"
   if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
   if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
-  if (/\bclaude\s+mode\b/.test(lower)) return 'anthropic';
+  if (/\b(claude|fable|opus|haiku|sonnet)\s+mode\b/.test(lower)) return 'anthropic';
   if (/\b(openrouter|kimi|llama|mistral|deepseek)\s+mode\b/.test(lower)) return 'openrouter';
   if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
   if (/\bminds\s+mode\b/.test(lower)) return 'minds';
@@ -1407,9 +1416,25 @@ const OPENROUTER_MODEL_ALIASES = {
 // Claude via OpenRouter for BYOLLM users who only have an OpenRouter key
 const OPENROUTER_CLAUDE_SLUG = 'anthropic/claude-sonnet-4.6';
 
+// Named Claude models for "switch to fable" etc.
+const ANTHROPIC_MODEL_ALIASES = {
+  fable: 'claude-fable-5',
+  opus: 'claude-opus-4-8',
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-4-6',
+};
+
 function detectOpenRouterModel(text) {
   const lower = text.toLowerCase();
   for (const [alias, slug] of Object.entries(OPENROUTER_MODEL_ALIASES)) {
+    if (lower.includes(alias)) return slug;
+  }
+  return null;
+}
+
+function detectAnthropicModel(text) {
+  const lower = text.toLowerCase();
+  for (const [alias, slug] of Object.entries(ANTHROPIC_MODEL_ALIASES)) {
     if (lower.includes(alias)) return slug;
   }
   return null;
@@ -1476,7 +1501,7 @@ function friendlyProviderError(provider, err) {
 
 // ─── Provider agentic loops ───────────────────────────────────────────────────
 
-async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, userLlmKey) {
+async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, userLlmKey, modelOverride) {
   const history = getAnthropicHistory(contextId);
   history.push({ role: 'user', content: contextualText });
   const client = getAnthropicClient(userLlmKey);
@@ -1487,7 +1512,7 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
 
   while (true) {
     const response = await client.messages.create({
-      model: CLAUDE_MODEL,
+      model: modelOverride || CLAUDE_MODEL,
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       tools,
@@ -1875,7 +1900,7 @@ async function handleMessage(message) {
       return;
     }
 
-    let orModel = null;
+    let namedModel = null;
     if (switchTarget === 'openrouter') {
       const orKey = getUserLlmKeyFor(message.author.id, 'openrouter');
       if (!orKey) {
@@ -1885,17 +1910,14 @@ async function handleMessage(message) {
         ).catch(() => {});
         return;
       }
-      // If a specific model was named (e.g. "switch to kimi"), update the stored model
-      const namedModel = detectOpenRouterModel(text);
-      if (namedModel) {
-        setUserLlmModel(message.author.id, 'openrouter', namedModel);
-        orModel = namedModel;
-      } else {
-        orModel = orKey.model || 'openai/gpt-4o';
-      }
+      // "switch to kimi" names a model; plain "switch to openrouter" keeps the user's stored default
+      namedModel = detectOpenRouterModel(text) || orKey.model || 'openai/gpt-4o';
+    } else if (switchTarget === 'anthropic') {
+      // "switch to fable/opus/haiku/sonnet" names a model; plain "switch to claude" uses the default
+      namedModel = detectAnthropicModel(text);
     }
 
-    setChannelProvider(contextId, switchTarget);
+    setChannelProvider(contextId, switchTarget, namedModel);
     // Clear all in-memory histories for this channel so the new provider starts fresh
     anthropicHistories.delete(contextId);
     geminiHistories.delete(contextId);
@@ -1903,8 +1925,7 @@ async function handleMessage(message) {
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'minds' ? 'Minds'
-      : switchTarget === 'openrouter' ? orModel
-      : CLAUDE_MODEL;
+      : (namedModel || CLAUDE_MODEL);
     await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
     return;
   }
@@ -1948,6 +1969,7 @@ async function handleMessage(message) {
   // The channel's switched provider decides what runs. Each user's messages use
   // their own key for that provider if they have one, else the host key.
   const effectiveProvider = provider;
+  const chModel = getChannelModel(contextId); // channel-level model override, set by e.g. "switch to fable"
   const anthKey = getUserLlmKeyFor(message.author.id, 'anthropic');
   const orKey = getUserLlmKeyFor(message.author.id, 'openrouter');
 
@@ -1966,7 +1988,7 @@ async function handleMessage(message) {
         );
         return;
       }
-      const orModel = orKey.model || 'openai/gpt-4o';
+      const orModel = chModel || orKey.model || 'openai/gpt-4o';
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, orKey.apiKey, {
         baseURL: 'https://openrouter.ai/api/v1',
         model: orModel,
@@ -2022,8 +2044,8 @@ async function handleMessage(message) {
         });
         modelLabel = `${OPENROUTER_CLAUDE_SLUG} (via OpenRouter)`;
       } else {
-        accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, anthKey?.apiKey ?? null);
-        modelLabel = CLAUDE_MODEL;
+        accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, anthKey?.apiKey ?? null, chModel);
+        modelLabel = chModel || CLAUDE_MODEL;
       }
     }
 
