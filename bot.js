@@ -1357,12 +1357,31 @@ function detectProviderSwitch(text) {
   if (/(switch|change|use|swap)\s+(to\s+)?(gemini|google)/.test(lower)) return 'gemini';
   if (/(switch|change|use|swap)\s+(to\s+)?(openai|gpt|chatgpt|open\s*ai)/.test(lower)) return 'openai';
   if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic)/.test(lower)) return 'anthropic';
+  if (/(switch|change|use|swap)\s+(to\s+)?(openrouter|open\s*router|kimi|llama|mistral|deepseek)/.test(lower)) return 'openrouter';
   // Also match "gemini mode", "claude mode"
   if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
   if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
   if (/\bclaude\s+mode\b/.test(lower)) return 'anthropic';
+  if (/\b(openrouter|kimi|llama|mistral|deepseek)\s+mode\b/.test(lower)) return 'openrouter';
   if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
   if (/\bminds\s+mode\b/.test(lower)) return 'minds';
+  return null;
+}
+
+// Map friendly model names to OpenRouter slugs. Named model in a switch phrase
+// (e.g. "switch to kimi") sets the user's OpenRouter model too.
+const OPENROUTER_MODEL_ALIASES = {
+  kimi: 'moonshotai/kimi-k2.6',
+  llama: 'meta-llama/llama-3.3-70b-instruct',
+  deepseek: 'deepseek/deepseek-chat',
+  mistral: 'mistralai/mistral-large',
+};
+
+function detectOpenRouterModel(text) {
+  const lower = text.toLowerCase();
+  for (const [alias, slug] of Object.entries(OPENROUTER_MODEL_ALIASES)) {
+    if (lower.includes(alias)) return slug;
+  }
   return null;
 }
 
@@ -1778,7 +1797,8 @@ async function handleMessage(message) {
       'DM me to set it up:\n' +
       '`!llm anthropic <key>` — from console.anthropic.com\n' +
       '`!llm gemini <key>` — from aistudio.google.com/apikey\n' +
-      '`!llm openai <key>` — from platform.openai.com\n\n' +
+      '`!llm openai <key>` — from platform.openai.com\n' +
+      '`!llm openrouter <key>` — from openrouter.ai (100+ models)\n\n' +
       'Or use Minds — connect your Minds AI agent:\n' +
       '`!minds <alias> <builderApiKey>`'
     ).catch(() => {});
@@ -1824,6 +1844,27 @@ async function handleMessage(message) {
       await message.reply('⚠️ `OPENAI_API_KEY` is not set in `.env`. Add it and restart the bot.').catch(() => {});
       return;
     }
+
+    let orModel = null;
+    if (switchTarget === 'openrouter') {
+      const orKey = getUserLlmKey(message.author.id);
+      if (orKey?.provider !== 'openrouter') {
+        await message.reply(
+          '⚠️ You need an OpenRouter key for that model.\n' +
+          'DM me `!llm openrouter <key>` to set up. Get one at openrouter.ai/keys'
+        ).catch(() => {});
+        return;
+      }
+      // If a specific model was named (e.g. "switch to kimi"), update the stored model
+      const namedModel = detectOpenRouterModel(text);
+      if (namedModel) {
+        setUserLlmKey(message.author.id, 'openrouter', orKey.apiKey, namedModel);
+        orModel = namedModel;
+      } else {
+        orModel = orKey.model || 'openai/gpt-4o';
+      }
+    }
+
     setChannelProvider(contextId, switchTarget);
     // Clear all in-memory histories for this channel so the new provider starts fresh
     anthropicHistories.delete(contextId);
@@ -1832,8 +1873,14 @@ async function handleMessage(message) {
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'minds' ? 'Minds'
+      : switchTarget === 'openrouter' ? orModel
       : CLAUDE_MODEL;
-    await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
+    // Warn if the user's personal key will override this switch
+    const ukAfterSwitch = getUserLlmKey(message.author.id);
+    const overrideNote = (switchTarget !== 'minds' && switchTarget !== 'openrouter' && ukAfterSwitch && ukAfterSwitch.provider !== switchTarget)
+      ? `\n\n⚠️ Note: your personal ${ukAfterSwitch.provider} key overrides this for your messages. DM \`!llm-remove\` to use the channel's provider, or \`!llm ${switchTarget} <key>\` to connect a matching key.`
+      : '';
+    await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.${overrideNote}`).catch(() => {});
     return;
   }
 
@@ -1887,6 +1934,13 @@ async function handleMessage(message) {
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
       modelLabel = OPENAI_MODEL;
     } else if (effectiveProvider === 'openrouter') {
+      if (!userLlmKey || userLlmKey.provider !== 'openrouter') {
+        await editor.finalize(
+          '⚠️ This channel is in OpenRouter mode, but you don\'t have an OpenRouter key connected.\n' +
+          'DM me `!llm openrouter <key>` to set up (openrouter.ai/keys), or say "switch to claude" to change modes.'
+        );
+        return;
+      }
       const orModel = effectiveModel || 'openai/gpt-4o';
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey, {
         baseURL: 'https://openrouter.ai/api/v1',
@@ -2103,7 +2157,7 @@ async function handleDM(message) {
     'Available commands:\n' +
     '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
     '`!revoke` — remove your stored API key\n' +
-    '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, or openai)\n' +
+    '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, openai, or openrouter for 100+ models)\n' +
     '`!llm-remove` — remove your LLM key\n' +
     '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
     '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
