@@ -1817,17 +1817,19 @@ function createThrottledEditor(replyMessage) {
 async function handleMessage(message) {
   if (message.author.bot) return;
 
+  const isDM = !message.guild;
   const isMentioned = message.mentions.has(message.client.user);
   const isActiveChannel = ACTIVE_CHANNELS.has(message.channelId);
 
-  if (!isMentioned && !isActiveChannel) return;
+  // DMs are always engaged; in servers, require a mention or an active channel
+  if (!isDM && !isMentioned && !isActiveChannel) return;
 
   if (ALLOWED_USERS.size > 0 && !ALLOWED_USERS.has(message.author.id)) {
     await message.reply('You are not authorized to use this bot.').catch(() => {});
     return;
   }
 
-  if (ALLOWED_ROLES.size > 0) {
+  if (!isDM && ALLOWED_ROLES.size > 0) {
     const memberRoles = message.member?.roles.cache.map((r) => r.name) ?? [];
     const hasRole = memberRoles.some((r) => ALLOWED_ROLES.has(r));
     if (!hasRole) {
@@ -2213,17 +2215,23 @@ async function handleDM(message) {
     return;
   }
 
-  await message.reply(
-    'Available commands:\n' +
-    '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
-    '`!revoke` — remove your stored API key\n' +
-    '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, openai, or openrouter for 100+ models)\n' +
-    '`!llm-remove` — remove your LLM key\n' +
-    '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
-    '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
-    '`!minds-remove` — remove your Minds credentials\n\n' +
-    'Get a Quidli API key at https://connect.quid.li'
-  );
+  if (content === '!help' || content === '!commands') {
+    await message.reply(
+      'Available commands:\n' +
+      '`!connect <your-api-key>` — link your Quidli account so drops use your own Smart Send wallet\n' +
+      '`!revoke` — remove your stored API key\n' +
+      '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, openai, or openrouter for 100+ models)\n' +
+      '`!llm-remove` — remove your LLM key\n' +
+      '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
+      '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
+      '`!minds-remove` — remove your Minds credentials\n\n' +
+      'Get a Quidli API key at https://connect.quid.li'
+    );
+    return;
+  }
+
+  // Anything else in a DM: full agent conversation, same as in a server channel
+  await handleMessage(message);
 }
 
 // ─── Channel watchers ─────────────────────────────────────────────────────────
