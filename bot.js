@@ -83,15 +83,17 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Be concise. One sentence for success, one sentence for failure.
 
 ## Sending tokens (quidli_drop)
-- ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop. quidli_lookup auto-generates a wallet for recipients who aren't in the Quidli registry yet — it may take a few seconds while it processes, but it will resolve them. Only after quidli_lookup succeeds for a recipient should you call quidli_drop for them.
+- ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
+- Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
+- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via quidli_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - Always generate a fresh UUID for idempotencyKey.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
-- If quidli_drop still returns an error like "Some recipients could not be resolved" even after a successful quidli_lookup, tell the user exactly that and point them to https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
+- If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
 ## Looking up wallets (quidli_lookup)
-Call quidli_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above) — it resolves identities and auto-generates wallets for people not yet in the registry.
+Call quidli_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
@@ -664,28 +666,35 @@ async function quidliLookup(recipients) {
   const data = await res.json();
 
   if (data.status === 'completed') {
+    console.log('[quidli_lookup] completed response:', JSON.stringify(data));
     return data.results;
   }
 
-  if (data.status === 'processing' && data.pendingRequestId) {
-    // Poll follow-up until completed (max 10 attempts, 2s apart)
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const followUp = await quidliFetch(`/lookup/follow-up/${data.pendingRequestId}`);
-      const followData = await followUp.json();
-      if (followData.status === 'completed') {
-        // Re-run the original lookup to get addresses
-        const retry = await quidliFetch('/lookup', {
-          method: 'POST',
-          body: JSON.stringify({ recipients }),
-        });
-        const retryData = await retry.json();
-        return retryData.results ?? [];
+  const pendingId = data.pendingRequestId ?? data.requestId ?? data.id ?? data.jobId ?? null;
+  if (data.status === 'processing') {
+    if (!pendingId) {
+      console.error('[quidli_lookup] processing status but no recognizable pending-id field. Raw response:', JSON.stringify(data));
+    } else {
+      // Poll follow-up until completed (max 10 attempts, 2s apart)
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const followUp = await quidliFetch(`/lookup/follow-up/${pendingId}`);
+        const followData = await followUp.json();
+        if (followData.status === 'completed') {
+          // Re-run the original lookup to get addresses
+          const retry = await quidliFetch('/lookup', {
+            method: 'POST',
+            body: JSON.stringify({ recipients }),
+          });
+          const retryData = await retry.json();
+          return retryData.results ?? [];
+        }
       }
+      throw new Error('Lookup timed out after processing');
     }
-    throw new Error('Lookup timed out after processing');
   }
 
+  console.error('[quidli_lookup] unexpected response:', JSON.stringify(data));
   throw new Error(`Unexpected lookup status: ${data.status}`);
 }
 
