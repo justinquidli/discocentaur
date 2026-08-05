@@ -45,8 +45,15 @@ const {
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
-  NOUS_API_KEY,                  // Nous Portal API key — from portal.nousresearch.com (API keys)
-  NOUS_MODEL = 'Hermes-4-405B',  // or Hermes-4-70B — see portal.nousresearch.com/info for the full catalog
+  NOUS_API_KEY,             // Nous Portal API key — from portal.nousresearch.com (API keys)
+  // Host default model. Portal is an OpenRouter-compatible proxy, so slugs are
+  // vendor-prefixed and free variants carry a ':free' suffix. Free-tier models that
+  // support tool calling (verified via /v1/models): tencent/hy3:free,
+  // inclusionai/ling-3.0-flash:free, poolside/laguna-s-2.1:free,
+  // poolside/laguna-xs-2.1:free, stepfun/step-3.7-flash:free.
+  // Paid tiers can use any of the 200+ slugs (anthropic/claude-sonnet-4.6, etc).
+  // Users can override per-channel with: !llm hermes <key> <model>
+  NOUS_MODEL = 'tencent/hy3:free',
   REQUIRE_USER_LLM_KEY = 'false', // Set to 'true' to require users to bring their own LLM key
   // Minds (Animoca Brands) — per-user credentials registered via DM: !minds <key> [mind-name]
 } = process.env;
@@ -2026,8 +2033,8 @@ async function handleMessage(message) {
       });
       modelLabel = orModel;
     } else if (effectiveProvider === 'hermes') {
-      const hermesUserKey = getUserLlmKeyFor(message.author.id, 'hermes')?.apiKey ?? null;
-      const hermesKey = hermesUserKey || NOUS_API_KEY;
+      const hermesRow = getUserLlmKeyFor(message.author.id, 'hermes');
+      const hermesKey = hermesRow?.apiKey || NOUS_API_KEY;
       if (!hermesKey) {
         await editor.finalize(
           '⚠️ This channel is in Hermes mode, but no `NOUS_API_KEY` is set in `.env` and you don\'t have a personal Hermes key connected.\n' +
@@ -2035,7 +2042,8 @@ async function handleMessage(message) {
         );
         return;
       }
-      const hermesModel = chModel || NOUS_MODEL;
+      // Same precedence as OpenRouter: channel-level override > user's stored model > host default
+      const hermesModel = chModel || hermesRow?.model || NOUS_MODEL;
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, hermesKey, {
         baseURL: NOUS_API_BASE_URL,
         model: hermesModel,
@@ -2218,7 +2226,7 @@ async function handleDM(message) {
     const parts = content.slice('!llm '.length).trim().split(/\s+/);
     const provider = parts[0]?.toLowerCase();
     const apiKey = parts[1];
-    const model = parts[2] || null; // optional, only used for openrouter
+    const model = parts[2] || null; // optional, used for openrouter and hermes
 
     if (!provider || !apiKey) {
       await message.reply(
@@ -2229,10 +2237,13 @@ async function handleDM(message) {
         '  `openai`     — from platform.openai.com\n' +
         '  `openrouter` — from openrouter.ai (access 100+ models)\n' +
         '  `hermes`     — from portal.nousresearch.com (API keys)\n\n' +
-        'For OpenRouter, you can optionally specify a model:\n' +
+        'For OpenRouter and Hermes, you can optionally specify a model:\n' +
         '  `!llm openrouter <key> [model]`\n' +
         '  Example: `!llm openrouter sk-or-... meta-llama/llama-3-70b-instruct`\n' +
-        '  Default model: openai/gpt-4o\n\n' +
+        '  Default model: openai/gpt-4o\n' +
+        '  `!llm hermes <key> [model]`\n' +
+        '  Example: `!llm hermes sk-... tencent/hy3:free`  (free tier)\n' +
+        '  Nous Portal proxies 200+ models — see portal.nousresearch.com/info\n\n' +
         'Your key is stored encrypted and used instead of the host key. DM `!llm-remove` to disconnect.'
       );
       return;
@@ -2244,7 +2255,9 @@ async function handleDM(message) {
     }
 
     setUserLlmKey(message.author.id, provider, apiKey, model);
-    const modelNote = provider === 'openrouter' ? ` (model: ${model || 'openai/gpt-4o'})` : '';
+    const modelNote = provider === 'openrouter' ? ` (model: ${model || 'openai/gpt-4o'})`
+      : provider === 'hermes' ? ` (model: ${model || NOUS_MODEL})`
+      : '';
     await message.reply(
       `✅ Connected your ${provider} key${modelNote}. Your messages will now use your own ${provider} credits.\n\n` +
       '⚠️ Your key is stored encrypted. DM `!llm-remove` anytime to disconnect.'
@@ -2348,7 +2361,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
-  if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — not tuned for tool-calling, per Nous's own guidance)`);
+  if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);
   console.log(`   Minds: per-user keys (DM !minds <key> to register)`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
