@@ -90,6 +90,8 @@ cp .env.example .env
 | `OPENAI_MODEL` | — | Defaults to `gpt-4o` |
 | `NOUS_API_KEY` | — | From [portal.nousresearch.com](https://portal.nousresearch.com) — one key, 200+ models |
 | `NOUS_MODEL` | — | Defaults to `tencent/hy3:free` (free tier, supports tool calling) |
+| `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
+| `HOST_KEY_ALLOWED_ROLES` | — | Discord role names allowed to spend the host's LLM keys |
 | `DISCORD_ACTIVE_CHANNELS` | — | Comma-separated channel IDs where the bot responds to all messages (not just @mentions) |
 | `DISCORD_ALLOWED_ROLES` | — | Comma-separated Discord role names allowed to use the bot. Empty = everyone |
 | `DISCORD_ALLOWED_USERS` | — | Comma-separated Discord user IDs allowed to use the bot. Empty = everyone |
@@ -142,6 +144,17 @@ Naming a model in the phrase selects it too — `switch to fable`, `switch to op
 `switch to kimi`, `switch to llama`, `switch to deepseek`, `switch to mistral`.
 
 The choice persists across bot restarts (stored in SQLite). Each provider maintains its own conversation history.
+
+### Who can use the host's keys
+
+The host's Anthropic / Gemini / OpenAI / Nous keys are spendable **only** by
+`BOT_OWNER_ID`, anyone in `HOST_KEY_ALLOWED_USERS`, and members of any role in
+`HOST_KEY_ALLOWED_ROLES`. Everybody else must connect their own key *for the provider
+currently in use* — a Gemini key does not unlock the host's Nous key. Unauthorized
+users get told to either connect a key or ask the owner for access, and they can't
+switch the channel's provider either.
+
+OpenRouter and Minds are per-user by design and never touch host credentials.
 
 ### Bring your own key
 
