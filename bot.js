@@ -1473,6 +1473,13 @@ const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[
 const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
 const MAX_HISTORY = 40;
 
+// Hard bound on tool round-trips per user message. Without this the provider loops
+// are `while (true)` and a model that keeps emitting tool calls never terminates —
+// which matters because the MODEL mints each quidli_drop idempotencyKey (see system
+// prompt), so a runaway loop would issue repeated *distinct* transfers, not retries.
+// Longest legitimate chain is ~15 (resolve lookup retries → drop), so 25 leaves headroom.
+const MAX_TOOL_ROUNDS = 25;
+
 // Minds responses often use HTML — strip to plain text before passing to Claude
 function stripHtml(text) {
   return text.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
@@ -1538,7 +1545,13 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
   let messages = [...history];
   let accumulated = '';
 
+  let rounds = 0;
   while (true) {
+    if (++rounds > MAX_TOOL_ROUNDS) {
+      console.warn(`[anthropic] hit MAX_TOOL_ROUNDS (${MAX_TOOL_ROUNDS}) in ${contextId} — stopping`);
+      accumulated += `\n\n⚠️ Stopped after ${MAX_TOOL_ROUNDS} tool steps without finishing. Nothing further was run — try a simpler request.`;
+      break;
+    }
     const response = await client.messages.create({
       model: modelUsed,
       max_tokens: 4096,
@@ -1589,7 +1602,13 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
   let contents = [...history];
   let accumulated = '';
 
+  let rounds = 0;
   while (true) {
+    if (++rounds > MAX_TOOL_ROUNDS) {
+      console.warn(`[gemini] hit MAX_TOOL_ROUNDS (${MAX_TOOL_ROUNDS}) in ${contextId} — stopping`);
+      accumulated += `\n\n⚠️ Stopped after ${MAX_TOOL_ROUNDS} tool steps without finishing. Nothing further was run — try a simpler request.`;
+      break;
+    }
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
       systemInstruction: SYSTEM_PROMPT,
@@ -1649,7 +1668,13 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
   ];
   let accumulated = '';
 
+  let rounds = 0;
   while (true) {
+    if (++rounds > MAX_TOOL_ROUNDS) {
+      console.warn(`[openai-compatible] hit MAX_TOOL_ROUNDS (${MAX_TOOL_ROUNDS}) in ${contextId} — stopping`);
+      accumulated += `\n\n⚠️ Stopped after ${MAX_TOOL_ROUNDS} tool steps without finishing. Nothing further was run — try a simpler request.`;
+      break;
+    }
     const response = await openai.chat.completions.create({
       model: modelToUse,
       messages,
@@ -1665,15 +1690,33 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
       editor.update(accumulated || '_Thinking…_');
     }
 
-    if (choice.finish_reason !== 'tool_calls' || !msg.tool_calls?.length) break;
+    // Act on tool calls whenever they're present, regardless of finish_reason — some
+    // OpenAI-compatible providers return tool_calls labelled 'stop', and requiring
+    // 'tool_calls' would silently skip execution (bot replies, tool never runs).
+    // Exception: 'length' means the response was cut off by the token limit, so the
+    // arguments JSON may be half-written — never execute a truncated tool call.
+    if (!msg.tool_calls?.length) break;
+    if (choice.finish_reason === 'length') {
+      console.warn(`[openai-compatible] truncated response with tool_calls in ${contextId} — not executing`);
+      accumulated += '\n\n⚠️ The model\'s response was cut off mid-request, so nothing was run. Please try again.';
+      break;
+    }
 
     messages = [...messages, msg];
 
     editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
     const toolResults = await Promise.all(
       msg.tool_calls.map(async (tc) => {
+        // A parse failure must NOT fall through to runTool with {} — an argument-less
+        // quidli_drop is a call we never want to make. Report it back as a tool error
+        // so the model can retry with well-formed arguments.
         let args;
-        try { args = JSON.parse(tc.function.arguments); } catch { args = {}; }
+        try {
+          args = JSON.parse(tc.function.arguments);
+        } catch {
+          console.error(`[tool/openai] malformed arguments for ${tc.function.name}: ${String(tc.function.arguments).slice(0, 200)}`);
+          return { role: 'tool', tool_call_id: tc.id, content: 'Error: arguments were not valid JSON. Re-issue the call with well-formed JSON arguments.' };
+        }
         console.log(`[tool/openai] ${tc.function.name}`, JSON.stringify(args).slice(0, 120));
         try {
           const result = await runTool(tc.function.name, args, toolCtx);
