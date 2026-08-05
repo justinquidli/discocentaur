@@ -265,7 +265,27 @@ DISCORD_ALLOWED_ROLES=Team Quidli,Admins,Moderators
 **If a user tries to access without permission:**
 The bot replies in-channel telling them which role is required. They won't be able to switch providers or trigger any actions until the role is granted.
 
+## Tool-loop safety
+
+Every user message is capped at **25 tool round-trips** (`MAX_TOOL_ROUNDS`) across all
+providers. A drop typically uses 3–15 (resolve → lookup retries → drop), so the cap only
+trips on a model that's looping. This matters because the model mints each
+`quidli_drop` idempotency key, so an unbounded loop would issue repeated *distinct*
+transfers rather than harmless retries. On hitting the cap the bot stops and says so.
+
+Two related guards on the OpenAI-compatible path (OpenAI, OpenRouter, Hermes):
+
+- Tool calls are executed whenever present, regardless of `finish_reason` — some providers
+  label them `stop`, and requiring `tool_calls` would silently skip execution
+- Except when `finish_reason` is `length`: a response cut off by the token limit may carry
+  half-written JSON arguments, so it's rejected rather than run
+- Arguments that fail to parse return an error to the model instead of calling the tool
+  with `{}`
+
 ## Troubleshooting
+
+**"Stopped after 25 tool steps":** The model looped without finishing. Retry with a simpler
+request, or switch providers — nothing after the cap was executed.
 
 **Bot doesn't respond:** Check that Message Content Intent, Server Members Intent, and Presence Intent are all enabled in the Discord Developer Portal.
 
