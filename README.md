@@ -7,6 +7,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Send tokens** — drop USDC or other tokens to individuals or entire Discord roles via Quidli Smart Send
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Presence-based drops** — target only online/idle/dnd members at execution time, not when scheduled
 - **Conditional drops** — "if BTC is above $100k, send everyone 1 USDC" — evaluated automatically using real-time web search
@@ -22,7 +23,9 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 
 ```
 Discord message → LLM (Claude / Gemini / OpenAI / OpenRouter / Hermes / Minds AI)
-               → Quidli Connect API (lookup / scores / drop)
+               → Quidli Connect, over two paths:
+                   • MCP  — lookup / scores / balance (discovered at runtime)
+                   • REST — drop / exposed / scheduling
                → edit Discord reply in real time
 ```
 
@@ -33,6 +36,7 @@ The LLM decides when to call tools based on natural language. No commands needed
 @DiscoCentaur send 1 USDC to @Guillaume
 @DiscoCentaur send 0.01 USDC to everyone in @Dev
 @DiscoCentaur what's the wallet for ahn.eth on Farcaster?
+@DiscoCentaur what's my balance on base?
 @DiscoCentaur schedule a drop of 5 USDC to @team in 2 hours
 @DiscoCentaur if the USA wins tonight, send everyone 1 USDC
 @DiscoCentaur send 0.01 USDC to the first person who types "gm" here today
@@ -95,7 +99,7 @@ cp .env.example .env
 | `DISCORD_ACTIVE_CHANNELS` | — | Comma-separated channel IDs where the bot responds to all messages (not just @mentions) |
 | `DISCORD_ALLOWED_ROLES` | — | Comma-separated Discord role names allowed to use the bot. Empty = everyone |
 | `DISCORD_ALLOWED_USERS` | — | Comma-separated Discord user IDs allowed to use the bot. Empty = everyone |
-| `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request on `/lookup` |
+| `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request. Note: lookup, scores and balance now go over MCP, which authenticates by API key only — so x402 no longer covers them |
 | `SYSTEM_PROMPT` | — | Override the default system prompt |
 
 ### 3. Enable Smart Send (for token drops)
@@ -127,6 +131,48 @@ DM @DiscoCentaur: !revoke
 ```
 
 Get a key at [connect.quid.li](https://connect.quid.li). Keys are stored encrypted with AES-256-GCM.
+
+**Note:** wallet lookup, reputation scores and balance run on the *asker's* key (see below), so
+users who haven't run `!connect` will be prompted to. Drops already required a key, so this
+makes the whole Connect surface consistent rather than adding a new gate.
+
+## Quidli Connect over MCP
+
+Connect exposes itself as an MCP server, and the bot consumes part of its surface that way
+rather than hand-writing REST calls. Three tools are discovered at startup:
+
+| Tool | Replaces |
+|---|---|
+| `connect_lookup` | the old hand-written `quidli_lookup` |
+| `connect_scores_batch` | the old hand-written `quidli_score` |
+| `connect_drop_balance` | nothing — new capability |
+
+How it works:
+
+- `MCP_TOOL_ALLOWLIST` in `bot.js` controls which discovered tools are offered. It's deliberately
+  narrow: Connect also exposes `connect_drop`, which would duplicate the hardcoded `quidli_drop`
+  and leave the model choosing between two tools that do the same thing.
+- Discovery happens once at startup via plain JSON-RPC over POST. The server is stateless and
+  reads `x-api-key` per request, so there's no initialize handshake and no MCP SDK dependency.
+- Each call uses the **sender's** key. The host key is used only for the bot owner, the same rule
+  the REST tools follow.
+- If Connect is unreachable at startup the bot runs normally on the hardcoded tools. If an
+  allowlisted tool is missing from discovery, startup logs a loud warning — some of these
+  *replace* hardcoded tools, so a silent miss would quietly delete a capability.
+
+Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
+
+To add another Connect tool: add its name to `MCP_TOOL_ALLOWLIST`, delete the hardcoded
+equivalent if there is one, and update the system prompt to reference the new tool name.
+Check the live names first:
+
+```bash
+curl -s -X POST https://mcp.connect.quid.li/ \
+  -H "x-api-key: $QUIDLI_API_KEY" \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -o '"name":"[a-z_]*"'
+```
 
 ## Multi-LLM switching
 
