@@ -132,8 +132,8 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
 ## Sending tokens (quidli_drop)
-- ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
-- Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
+- ALWAYS call connect_lookup for every recipient FIRST, before calling quidli_drop.
+- Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via quidli_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - Always generate a fresh UUID for idempotencyKey.
@@ -141,8 +141,8 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
-## Looking up wallets (quidli_lookup)
-Call quidli_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
+## Looking up wallets (connect_lookup)
+Call connect_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
@@ -706,47 +706,6 @@ async function quidliFetch(path, options = {}, apiKey = QUIDLI_API_KEY) {
  * Lookup wallet addresses for Discord users by username or ID.
  * Handles async processing (polls follow-up if needed).
  */
-async function quidliLookup(recipients) {
-  const res = await quidliFetch('/lookup', {
-    method: 'POST',
-    body: JSON.stringify({ recipients }),
-  });
-
-  const data = await res.json();
-
-  if (data.status === 'completed') {
-    console.log('[quidli_lookup] completed response:', JSON.stringify(data));
-    return data.results;
-  }
-
-  const pendingId = data.pendingRequestId ?? data.requestId ?? data.id ?? data.jobId ?? null;
-  if (data.status === 'processing') {
-    if (!pendingId) {
-      console.error('[quidli_lookup] processing status but no recognizable pending-id field. Raw response:', JSON.stringify(data));
-    } else {
-      // Poll follow-up until completed (max 10 attempts, 2s apart)
-      for (let i = 0; i < 10; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const followUp = await quidliFetch(`/lookup/follow-up/${pendingId}`);
-        const followData = await followUp.json();
-        if (followData.status === 'completed') {
-          // Re-run the original lookup to get addresses
-          const retry = await quidliFetch('/lookup', {
-            method: 'POST',
-            body: JSON.stringify({ recipients }),
-          });
-          const retryData = await retry.json();
-          return retryData.results ?? [];
-        }
-      }
-      throw new Error('Lookup timed out after processing');
-    }
-  }
-
-  console.error('[quidli_lookup] unexpected response:', JSON.stringify(data));
-  throw new Error(`Unexpected lookup status: ${data.status}`);
-}
-
 // ─── Discord role lookup ──────────────────────────────────────────────────────
 
 // guild is set once the client is ready
@@ -916,7 +875,7 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch']);
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup']);
 const mcpToolNames = new Set();
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
@@ -1023,18 +982,8 @@ const tools = [
       required: ['condition', 'checkAt', 'amountInWeiPerRecipient', 'tokenContract'],
     },
   },
-  {
-    name: 'quidli_lookup',
-    description:
-      'Look up the Ethereum and Solana wallet addresses for one or more people by their social identity (Discord, email, Farcaster, GitHub, Telegram, LinkedIn, Twitter, phone). Use whenever someone asks for a wallet address.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'List of social identities to look up' },
-      },
-      required: ['recipients'],
-    },
-  },
+  // NOTE: wallet lookup is no longer defined here — it comes from Connect's
+  // MCP server as connect_lookup, discovered at startup. See MCP_TOOL_ALLOWLIST.
   {
     name: 'discord_get_role_members',
     description:
@@ -1368,10 +1317,6 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     const alwaysExclude = [senderId, botId].filter(Boolean);
     const excludeIds = [...new Set([...(input.excludeIds ?? []), ...alwaysExclude])];
     const results = await searchDiscordMessages({ ...input, excludeIds, currentChannelId });
-    return JSON.stringify(results, null, 2);
-  }
-  if (name === 'quidli_lookup') {
-    const results = await quidliLookup(input.recipients);
     return JSON.stringify(results, null, 2);
   }
   if (name === 'quidli_drop') {
