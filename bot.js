@@ -125,6 +125,12 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Only ask the user for more info after you've exhausted all tool options.
 - Be concise. One sentence for success, one sentence for failure.
 
+## Checking balance (connect_drop_balance)
+- Use connect_drop_balance to answer "what's my balance", "how much do I have", "can I afford X". It takes a chainId (8453 = Base) and returns native and ERC-20 balances for the sender's Smart Send wallet.
+- Balances come back as balanceInWei with a decimals field — divide before showing a human number, and use the symbol from the response.
+- Before a drop that looks large, or after a drop fails for funding reasons, check the balance and say plainly what's short — the token or the gas.
+- Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
+
 ## Sending tokens (quidli_drop)
 - ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
 - Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
@@ -910,6 +916,75 @@ const RECIPIENT_SCHEMA = {
   required: ['type'],
 };
 
+// ─── Connect MCP ──────────────────────────────────────────────────────────────
+// Quidli Connect exposes its own MCP server, so balance is consumed over that
+// rather than hand-written against the REST API. The allowlist is deliberate:
+// connect_lookup / connect_drop / connect_scores_* duplicate the hardcoded
+// quidli_* tools below, and offering both would leave the model choosing
+// between two tools that do the same thing.
+//
+// The server is stateless and reads x-api-key per request, so each call is made
+// with the *sender's* key — same per-user model as the REST path.
+const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance']);
+const mcpToolNames = new Set();
+
+// Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
+// it builds a fresh transport per request and needs no initialize handshake, so
+// tools/list and tools/call work as one-shot POSTs. The SDK's Streamable HTTP
+// client hangs against it (it negotiates a session this server never issues),
+// and skipping it also avoids 85 dependencies for four lines of protocol.
+async function mcpRpc(method, params, apiKey, timeoutMs = 20000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(MCP_URL, {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params: params ?? {} }),
+      signal: ac.signal,
+    });
+    if (!res.ok) throw new Error(`MCP ${method} HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.message || `MCP ${method} error`);
+    return json.result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function mcpCallTool(name, args, apiKey) {
+  const res = await mcpRpc('tools/call', { name, arguments: args ?? {} }, apiKey);
+  const text = (res?.content ?? [])
+    .filter((c) => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n');
+  if (res?.isError) throw new Error(text || 'MCP tool error');
+  return text || JSON.stringify(res?.structuredContent ?? {});
+}
+
+// Discovered once at startup using the host key — reads schemas only, no side
+// effects. If Connect's MCP is unreachable the bot starts normally with the
+// hardcoded tools; these are additive, so nothing existing depends on them.
+async function registerMcpTools() {
+  if (!QUIDLI_API_KEY) return;
+  try {
+    const discovered = await mcpRpc('tools/list', {}, QUIDLI_API_KEY);
+    for (const t of discovered?.tools ?? []) {
+      if (!MCP_TOOL_ALLOWLIST.has(t.name)) continue;
+      tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
+      mcpToolNames.add(t.name);
+    }
+    console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no allowlisted tools found'}`);
+  } catch (err) {
+    console.error('[mcp] tool discovery failed, continuing without it:', err.message);
+  }
+}
+
 const tools = [
   {
     name: 'web_search',
@@ -1176,6 +1251,16 @@ const _pendingBasescanUrls = [];
 
 async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+  // Tools discovered from Connect's MCP server. Called with the sender's own key
+  // — the host key is only used for the owner, same rule as the REST tools.
+  if (mcpToolNames.has(name)) {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      return 'Error: you need to connect your own Quidli account first — DM me `!connect <your-api-key>` (get one at connect.quid.li).';
+    }
+    return await mcpCallTool(name, input, keyToUse);
+  }
   if (name === 'web_search') {
     const results = await braveSearch(input.query);
     return JSON.stringify(results, null, 2);
@@ -2473,6 +2558,8 @@ client.once(Events.ClientReady, (c) => {
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
+  // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
+  registerMcpTools();
 });
 
 client.on(Events.MessageCreate, (message) => {
