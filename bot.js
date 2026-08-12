@@ -136,7 +136,6 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via quidli_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
-- Always generate a fresh UUID for idempotencyKey.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
 - If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
@@ -1495,9 +1494,11 @@ const MAX_HISTORY = 40;
 
 // Hard bound on tool round-trips per user message. Without this the provider loops
 // are `while (true)` and a model that keeps emitting tool calls never terminates —
-// which matters because the MODEL mints each quidli_drop idempotencyKey (see system
-// prompt), so a runaway loop would issue repeated *distinct* transfers, not retries.
-// Longest legitimate chain is ~15 (resolve lookup retries → drop), so 25 leaves headroom.
+// which matters because quidliDrop() mints a fresh crypto.randomUUID() idempotencyKey
+// on every call, so a runaway loop would issue repeated *distinct* transfers rather
+// than idempotent retries. (The model does not supply the key — it isn't in the
+// quidli_drop schema — but that makes the hazard worse, not better: nothing dedupes.)
+// Longest legitimate chain is ~10 (lookup retries → drop), so 25 leaves headroom.
 const MAX_TOOL_ROUNDS = 25;
 
 // Minds responses often use HTML — strip to plain text before passing to Claude
