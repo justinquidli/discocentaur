@@ -134,7 +134,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 ## Sending tokens (quidli_drop)
 - ALWAYS call connect_lookup for every recipient FIRST, before calling quidli_drop.
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
-- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via quidli_exposed), use that instead of their username — it resolves reliably.
+- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
 - If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
@@ -157,19 +157,21 @@ Only after exhausting all available identifiers, tell the user the person isn't 
 
 The same multi-identity fallback applies to quidli_drop and connect_scores_batch — always try the most specific identifier first, then fall back through others.
 
-## Looking up linked accounts (quidli_exposed)
-Use quidli_exposed when someone asks what accounts a person has linked, or when you only have a username and need a numeric ID. Returns all platforms linked to that identity (email, wallet, smart_wallet, telegram, discord, etc.).
-- If you have a Discord username but no numeric ID, call quidli_exposed with { type: "discord", username: "<handle>" } to get their numeric ID, then use that for drops.
+## Looking up linked accounts (connect_lookup_exposed)
+Use connect_lookup_exposed when someone asks what accounts a person has linked, or when you only have a username and need a numeric ID. Returns all platforms linked to that identity (email, wallet, smart_wallet, telegram, discord, etc.).
+- If you have a Discord username but no numeric ID, call connect_lookup_exposed with { type: "discord", username: "<handle>" } to get their numeric ID, then use that for drops.
+
+## Who the user is (connect_me)
+connect_me returns the profile, scores and linked accounts of whoever's key is being used — so it answers "who am I" and "which account am I acting for". It needs the asker's own Connect key. Only accounts the user has chosen to make public are returned; never speculate about ones that aren't there.
 
 ## Identity summary ("tell me about myself", "who am I?")
 When someone asks about themselves — "tell me about myself", "who am I?", "what do you know about me?", "summarize my profile", "based on my socials" — do ALL of the following:
-1. Call quidli_exposed with their Discord ID (from the message context) to get all linked accounts
-2. Call connect_scores_batch with their Discord ID to get their web3 reputation scores
-3. For each professional/social platform in the exposed results (GitHub, LinkedIn, Twitter, Farcaster), call web_search to look up their public profile — find their employer, job title, notable projects, bio, or anything publicly known about them
+1. Call connect_me — one call returns their Connect profile, reputation scores and linked accounts. It only works if they've connected their own key; if it errors, fall back to connect_lookup_exposed plus connect_scores_batch with their Discord ID.
+2. For each professional/social platform in the results (GitHub, LinkedIn, Twitter, Farcaster), call web_search to look up their public profile — find their employer, job title, notable projects, bio, or anything publicly known about them
 Then synthesize everything into a warm, conversational paragraph: who they are professionally, what they build or work on, their on-chain presence and wallet addresses, and their reputation standing. Make it feel like a smart introduction, not a data dump. If LinkedIn or GitHub is linked, lean into those for professional context.
 
 ## Resolving Discord mentions
-Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names. If only a username is available, use quidli_exposed to resolve it first.
+Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names. If only a username is available, use connect_lookup_exposed to resolve it first.
 
 ## Checking reputation (connect_scores_batch)
 Use connect_scores_batch when asked about trust, reputation, or scores. Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
@@ -843,11 +845,6 @@ async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453,
 
 // ─── Quidli exposed ───────────────────────────────────────────────────────────
 
-async function quidliExposed(recipient) {
-  const res = await quidliFetch('/lookup/exposed', { method: 'POST', body: JSON.stringify({ recipient }) });
-  return res.json();
-}
-
 // ─── Claude tools ─────────────────────────────────────────────────────────────
 
 const RECIPIENT_SCHEMA = {
@@ -874,7 +871,7 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup']);
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup', 'connect_lookup_exposed', 'connect_me']);
 const mcpToolNames = new Set();
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
@@ -902,6 +899,23 @@ async function mcpRpc(method, params, apiKey, timeoutMs = 20000) {
     return json.result;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// connect_me returns the *caller's own* full profile — including accounts they
+// marked private (exposed: false), their phone number and their email. In a group
+// chat the model would happily read those out. Only pass on what the user chose to
+// expose. Fails closed: if the shape changes, withhold rather than leak.
+function redactConnectMe(text) {
+  try {
+    const data = JSON.parse(text);
+    if (Array.isArray(data?.accounts)) {
+      data.accounts = data.accounts.filter((a) => a?.exposed === true);
+    }
+    return JSON.stringify(data, null, 2);
+  } catch {
+    console.warn('[mcp] connect_me response was not parseable JSON — withheld rather than passed through');
+    return 'Error: the profile response could not be checked for private fields, so it was withheld. Tell the user to try again.';
   }
 }
 
@@ -1133,28 +1147,8 @@ const tools = [
       required: ['watcherId'],
     },
   },
-  {
-    name: 'quidli_exposed',
-    description: "Look up all linked social accounts and wallets for a person. Use when someone asks 'what accounts does X have?', 'what's linked to this email/handle?', or when you need to resolve a username to a numeric ID before sending. Returns all platforms linked to that identity (email, wallet, smart_wallet, discord, telegram, etc.).",
-    input_schema: {
-      type: 'object',
-      properties: {
-        recipient: {
-          type: 'object',
-          properties: {
-            type: {
-              type: 'string',
-              enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin'],
-            },
-            id: { type: 'string', description: 'Numeric ID or email. Use EITHER id OR username.' },
-            username: { type: 'string', description: 'Handle/username. Use EITHER id OR username.' },
-          },
-          required: ['type'],
-        },
-      },
-      required: ['recipient'],
-    },
-  },
+  // NOTE: exposed-account lookup is no longer defined here — it comes from
+  // Connect's MCP server as connect_lookup_exposed. See MCP_TOOL_ALLOWLIST.
   // NOTE: reputation scores are no longer defined here — they come from Connect's
   // MCP server as connect_scores_batch, discovered at startup. See MCP_TOOL_ALLOWLIST.
 ];
@@ -1173,7 +1167,8 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     if (!keyToUse) {
       return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Takes a minute, and it only has to be done once.';
     }
-    return await mcpCallTool(name, input, keyToUse);
+    const mcpOut = await mcpCallTool(name, input, keyToUse);
+    return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
   }
   if (name === 'web_search') {
     const results = await braveSearch(input.query);
@@ -1354,9 +1349,6 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
       }
     }
     return JSON.stringify(result, null, 2);
-  }
-  if (name === 'quidli_exposed') {
-    return JSON.stringify(await quidliExposed(input.recipient), null, 2);
   }
   throw new Error(`Unknown tool: ${name}`);
 }
