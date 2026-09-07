@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node bot.js",
-    "dev": "node --watch bot.js"
+    "dev": "node --watch bot.js",
+    "test": "node --test",
+    "check": "node --check bot.js && node --test"
   },
   "dependencies": {
     "@animocabrands/minds-client-lib": "^0.1.0",

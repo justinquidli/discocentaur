@@ -136,6 +136,9 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
+- connect_get_chains lists every chain Connect supports and which features work on each (drop is true only for Smart Send chains). Use it to answer "what chains do you support" accurately instead of guessing.
+- Drops and balance checks here stay on Base (8453). Every explorer link this bot produces is a basescan.org link, so a transfer on another chain would be reported with a link that does not resolve. If someone asks to send on a different chain, tell them plainly that this bot sends on Base — do not attempt it.
+- Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
 - If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
@@ -852,7 +855,7 @@ const RECIPIENT_SCHEMA = {
   properties: {
     type: {
       type: 'string',
-      enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin'],
+      enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin', 'slack'],
       description: 'The social platform type',
     },
     id: { type: 'string', description: 'Numeric user ID on that platform. Use EITHER id OR username, never both.' },
@@ -871,7 +874,16 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup', 'connect_lookup_exposed', 'connect_me']);
+// Tools are gated by the server's own readOnlyHint annotation rather than by a
+// name list here, so a new read-only Connect tool appears after a restart with
+// no code change. This fails CLOSED: a tool with no readOnlyHint is not offered
+// to the model at all, so a future spend-shaped tool cannot arrive by surprise.
+//
+// MCP_LEGACY_ALLOWLIST is the fallback for a Connect MCP older than the
+// annotations. If the server annotates nothing we cannot tell a read from a
+// spend, so we offer exactly the five tools we always have rather than guessing
+// from the name.
+const MCP_LEGACY_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup', 'connect_lookup_exposed', 'connect_me']);
 const mcpToolNames = new Set();
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
@@ -886,7 +898,10 @@ async function mcpRpc(method, params, apiKey, timeoutMs = 20000) {
     const res = await fetch(MCP_URL, {
       method: 'POST',
       headers: {
-        'x-api-key': apiKey,
+        // Omit the header entirely when there is no key. The server serves the
+        // public tools anonymously, but any x-api-key it cannot verify — the
+        // string "undefined" included — is a 401. No header beats a bad one.
+        ...(apiKey ? { 'x-api-key': apiKey } : {}),
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
       },
@@ -919,6 +934,21 @@ function redactConnectMe(text) {
   }
 }
 
+// Which Connect tools need a key is the server's call, not a list here:
+// connect_get_chains and connect_get_price are served anonymously and the rest
+// 401 without one. A second name list in the bot is exactly the drift the
+// annotation-driven registration above removes, so we try the call and read the
+// failure instead of predicting it.
+const MCP_AUTH_ERROR_RE = /HTTP 401|HTTP 403|unauthori[sz]ed|invalid api key/i;
+const MCP_QUOTA_ERROR_RE = /HTTP 429|rate.?limit|quota/i;
+
+function mcpFailureReason(err) {
+  const msg = err?.message ?? '';
+  if (MCP_AUTH_ERROR_RE.test(msg)) return 'auth';
+  if (MCP_QUOTA_ERROR_RE.test(msg)) return 'quota';
+  return null;
+}
+
 async function mcpCallTool(name, args, apiKey) {
   const res = await mcpRpc('tools/call', { name, arguments: args ?? {} }, apiKey);
   const text = (res?.content ?? [])
@@ -929,6 +959,29 @@ async function mcpCallTool(name, args, apiKey) {
   return text || JSON.stringify(res?.structuredContent ?? {});
 }
 
+// Decides which discovered tools the model may see. Pure and exported for tests:
+// this is the gate that keeps the money path away from the model, so it is the
+// one piece of MCP wiring that must never be changed without a test.
+//
+// A server that annotates ANY tool is treated as annotation-capable, so an
+// unannotated tool from that server is withheld — fail closed. A server that
+// annotates nothing at all predates the feature; there we fall back to the
+// legacy names rather than inferring intent from a tool's name.
+function selectMcpTools(offered) {
+  const list = Array.isArray(offered) ? offered : [];
+  const annotated = list.some((t) => typeof t?.annotations?.readOnlyHint === 'boolean');
+  const register = [];
+  const skipped = [];
+  for (const t of list) {
+    if (!t?.name) continue;
+    const allow = annotated
+      ? t.annotations?.readOnlyHint === true
+      : MCP_LEGACY_ALLOWLIST.has(t.name);
+    (allow ? register : skipped).push(t);
+  }
+  return { register, skipped: skipped.map((t) => t.name), annotated };
+}
+
 // Discovered once at startup using the host key — reads schemas only, no side
 // effects. If Connect's MCP is unreachable the bot starts normally with the
 // hardcoded tools; these are additive, so nothing existing depends on them.
@@ -936,17 +989,21 @@ async function registerMcpTools() {
   if (!QUIDLI_API_KEY) return;
   try {
     const discovered = await mcpRpc('tools/list', {}, QUIDLI_API_KEY);
-    for (const t of discovered?.tools ?? []) {
-      if (!MCP_TOOL_ALLOWLIST.has(t.name)) continue;
+    const { register, skipped, annotated } = selectMcpTools(discovered?.tools ?? []);
+    if (!annotated) {
+      console.error('[mcp] ⚠️  server sent no readOnlyHint annotations — falling back to the legacy allowlist. Upgrade Connect MCP to auto-register new tools.');
+    }
+    for (const t of register) {
       tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
       mcpToolNames.add(t.name);
     }
-    // An allowlisted tool that doesn't come back means Connect renamed or pulled
-    // it. Some of these replace hardcoded tools, so a silent miss is a capability
-    // that just disappears — say so loudly.
-    const missing = [...MCP_TOOL_ALLOWLIST].filter((n) => !mcpToolNames.has(n));
-    if (missing.length) console.error(`[mcp] ⚠️  allowlisted but NOT offered by the server: ${missing.join(', ')}`);
-    console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no allowlisted tools found'}`);
+    // A tool we have always offered that no longer arrives means Connect renamed
+    // it, pulled it, or stopped marking it read-only. Some of these replace
+    // hardcoded tools, so a silent miss is a capability that just disappears.
+    const missing = [...MCP_LEGACY_ALLOWLIST].filter((n) => !mcpToolNames.has(n));
+    if (missing.length) console.error(`[mcp] ⚠️  expected but NOT registered: ${missing.join(', ')}`);
+    if (skipped.length) console.log(`   Connect MCP: withheld (${annotated ? 'not read-only' : 'not in the legacy allowlist'}): ${skipped.join(', ')}`);
+    console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no tools registered'}`);
   } catch (err) {
     console.error('[mcp] tool discovery failed, continuing without it:', err.message);
   }
@@ -996,7 +1053,7 @@ const tools = [
     },
   },
   // NOTE: wallet lookup is no longer defined here — it comes from Connect's
-  // MCP server as connect_lookup, discovered at startup. See MCP_TOOL_ALLOWLIST.
+  // MCP server as connect_lookup, discovered at startup. See registerMcpTools().
   {
     name: 'discord_get_role_members',
     description:
@@ -1148,9 +1205,9 @@ const tools = [
     },
   },
   // NOTE: exposed-account lookup is no longer defined here — it comes from
-  // Connect's MCP server as connect_lookup_exposed. See MCP_TOOL_ALLOWLIST.
+  // Connect's MCP server as connect_lookup_exposed. See registerMcpTools().
   // NOTE: reputation scores are no longer defined here — they come from Connect's
-  // MCP server as connect_scores_batch, discovered at startup. See MCP_TOOL_ALLOWLIST.
+  // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
 ];
 
 // Tracks basescan URLs produced during a single handleMessage turn so they can
@@ -1160,15 +1217,23 @@ const _pendingBasescanUrls = [];
 async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   // Tools discovered from Connect's MCP server. Called with the sender's own key
-  // — the host key is only used for the owner, same rule as the REST tools.
+  // — the host key is only used for the owner, same rule as the REST tools. A
+  // sender with no key still gets a call: the public tools answer anonymously
+  // and the rest 401, which is the server telling us a key is needed rather
+  // than a name list here guessing.
   if (mcpToolNames.has(name)) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
-    if (!keyToUse) {
-      return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Takes a minute, and it only has to be done once.';
+    try {
+      const mcpOut = await mcpCallTool(name, input, keyToUse);
+      return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
+    } catch (err) {
+      if (keyToUse) throw err;
+      const reason = mcpFailureReason(err);
+      if (reason === 'auth') return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Takes a minute, and it only has to be done once.';
+      if (reason === 'quota') return 'Error: Connect is rate-limiting anonymous requests right now. Tell the user, in your own words: linking their own Quidli key gives them their own quota and avoids this.';
+      throw err;
     }
-    const mcpOut = await mcpCallTool(name, input, keyToUse);
-    return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
   }
   if (name === 'web_search') {
     const results = await braveSearch(input.query);
