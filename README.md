@@ -5,7 +5,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to individuals or entire Discord roles via Quidli Smart Send
-- **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, Telegram, or phone number to their ETH/SOL wallet address
+- **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
 - **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
@@ -121,6 +121,21 @@ pm2 start bot.js --name claudetaur
 pm2 save
 ```
 
+Note the name mismatch: the repo is `discocentaur`, the pm2 process and the deploy directory on
+the box are both `claudetaur`.
+
+### 5. Before you push
+
+```bash
+npm run check     # syntax check + tests
+```
+
+7 tests, covering the MCP tool gate (read-only registration, fail-closed on unannotated tools,
+the legacy fallback, the keyless header) and the drop recipient enum, which has silently drifted
+from the server's once already. `bot.js` connects to Discord on import, so the tests extract the
+functions under test from its source rather than importing it — a stopgap until it's split into
+modules.
+
 ## Per-user API keys
 
 Users can link their own Quidli account so drops use their Smart Send wallet:
@@ -134,44 +149,77 @@ Get a key at [connect.quid.li](https://connect.quid.li). Keys are stored encrypt
 
 **Note:** wallet lookup, reputation scores and balance run on the *asker's* key (see below), so
 users who haven't run `!connect` will be prompted to. Drops already required a key, so this
-makes the whole Connect surface consistent rather than adding a new gate.
+makes the whole Connect surface consistent rather than adding a new gate. The two public tools
+(`connect_get_chains`, `connect_get_price`) answer without a key.
 
 ## Quidli Connect over MCP
 
 Connect exposes itself as an MCP server, and the bot consumes part of its surface that way
-rather than hand-writing REST calls. Three tools are discovered at startup:
+rather than hand-writing REST calls. **Which tools are offered is decided by the server, not by
+a list in `bot.js`.**
 
-| Tool | Replaces |
+Connect annotates every tool with the MCP `readOnlyHint`. At startup the bot discovers the tool
+list and registers everything marked read-only. As of Connect MCP 0.5.8 that is nine tools:
+
+| Tool | Notes |
 |---|---|
-| `connect_lookup` | the old hand-written `quidli_lookup` |
-| `connect_scores_batch` | the old hand-written `quidli_score` |
-| `connect_drop_balance` | nothing — new capability |
+| `connect_lookup` | replaced the hand-written `quidli_lookup` |
+| `connect_lookup_exposed` | replaced the hand-written `quidli_exposed` |
+| `connect_scores_batch` | replaced the hand-written `quidli_score` |
+| `connect_scores_by_account` | single account |
+| `connect_scores_by_username` | single Connect username |
+| `connect_me` | the key owner's own profile — output is redacted, see below |
+| `connect_drop_balance` | Smart Send balances |
+| `connect_get_chains` | which chains support which features |
+| `connect_get_price` | x402 list prices |
+
+`connect_drop` is the tenth tool and is **never** offered to the model. It is annotated
+non-read-only, so the gate withholds it; drops go through the hardcoded `quidli_drop`.
 
 How it works:
 
-- `MCP_TOOL_ALLOWLIST` in `bot.js` controls which discovered tools are offered. It's deliberately
-  narrow: Connect also exposes `connect_drop`, which would duplicate the hardcoded `quidli_drop`
-  and leave the model choosing between two tools that do the same thing.
+- `selectMcpTools()` in `bot.js` is the gate. It is a pure function precisely so it can be tested,
+  and it **fails closed**: a tool with no `readOnlyHint` is withheld. That is the case a
+  name-pattern rule gets wrong — a future `connect_payout` matches `/pay/`, a `connect_execute`
+  matches nothing at all. Absence of an annotation is unambiguous; a name is not.
+- A new read-only Connect tool therefore needs **no code change here** — it appears on the next
+  restart. This is the whole point; do not reintroduce a name list.
+- `MCP_LEGACY_ALLOWLIST` is the fallback for a Connect MCP older than the annotations (< 0.5.8).
+  If the server annotates nothing, the bot cannot tell a read from a spend, so it offers exactly
+  the five tools it always did and logs a loud warning. Without this, pointing at an old server
+  would register zero tools.
 - Discovery happens once at startup via plain JSON-RPC over POST. The server is stateless and
   reads `x-api-key` per request, so there's no initialize handshake and no MCP SDK dependency.
-- Each call uses the **sender's** key. The host key is used only for the bot owner, the same rule
-  the REST tools follow.
-- If Connect is unreachable at startup the bot runs normally on the hardcoded tools. If an
-  allowlisted tool is missing from discovery, startup logs a loud warning — some of these
-  *replace* hardcoded tools, so a silent miss would quietly delete a capability.
+- Each call uses the **sender's** key; the host key is used only for the bot owner. A sender with
+  no key still gets a call: `connect_get_chains` and `connect_get_price` are served anonymously,
+  and the rest return 401, which is the server saying a key is needed rather than a list here
+  guessing. The `x-api-key` header is omitted entirely when there is no key — a header the server
+  cannot verify (including the `"undefined"` a missing value stringifies to) is a 401.
+- Only auth and quota failures become user-facing advice. Anything else still throws, so a 500
+  does not send someone chasing a key they already have.
+- `connect_me` returns the caller's *full* profile including accounts they marked private.
+  `redactConnectMe()` strips anything not `exposed: true` before the model sees it, and fails
+  closed if the response shape changes.
+- If Connect is unreachable at startup the bot runs normally on the hardcoded tools. If a tool the
+  bot has always offered stops arriving, startup logs a loud warning — some of these *replace*
+  hardcoded tools, so a silent miss would quietly delete a capability.
 
 Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
 
-To add another Connect tool: add its name to `MCP_TOOL_ALLOWLIST`, delete the hardcoded
-equivalent if there is one, and update the system prompt to reference the new tool name.
-Check the live names first:
+Note on chains: `connect_get_chains` is offered so the model can answer chain questions from the
+server rather than guessing, but **drops stay on Base (8453)**. Every explorer link the bot builds
+is hardcoded to `basescan.org`, so a transfer on another chain would be reported with a link that
+does not resolve. Chain-aware explorer URLs are a prerequisite for chain selection on drops.
+
+To see what the server currently offers and how it is annotated:
 
 ```bash
 curl -s -X POST https://mcp.connect.quid.li/ \
   -H "x-api-key: $QUIDLI_API_KEY" \
   -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -o '"name":"[a-z_]*"'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | python3 -c 'import sys,json;[print("%-28s readOnly=%s" % (t["name"], (t.get("annotations") or {}).get("readOnlyHint"))) for t in json.load(sys.stdin)["result"]["tools"]]'
 ```
 
 ## Multi-LLM switching
