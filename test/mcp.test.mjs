@@ -128,3 +128,25 @@ test('only auth and quota failures are turned into user-facing advice', () => {
   assert.equal(mcpFailureReason(new Error('The operation was aborted')), null);
   assert.equal(mcpFailureReason(undefined), null);
 });
+
+// ── multi-chain explorer links ────────────────────────────────────────────────
+// The bot was confined to Base because every link it produced was a basescan
+// link, so a transfer on another chain would be reported with a URL that does
+// not resolve. quidliDrop now attaches the right link for the chain it used.
+test('explorer links follow the chain the drop was sent on', () => {
+  const map = SRC.match(/^const CHAIN_EXPLORERS = \{[\s\S]*?\n\};/m);
+  assert.ok(map, 'CHAIN_EXPLORERS not found in bot.js');
+  const url = new Function(`${map[0]}; ${grab('explorerTxUrl')}; return explorerTxUrl;`)();
+
+  assert.equal(url(8453, '0xabc'), 'https://basescan.org/tx/0xabc');
+  assert.equal(url(1399811149, '5xTr'), 'https://solscan.io/tx/5xTr');
+  assert.equal(url('8453', '0xabc'), 'https://basescan.org/tx/0xabc', 'chainId may arrive as a string');
+  assert.equal(url(999999, '0xabc'), null, 'unknown chains get no link rather than a wrong one');
+  assert.equal(url(8453, undefined), null, 'no hash, no link');
+});
+
+test('quidli_drop no longer requires tokenContract, so native sends are expressible', () => {
+  const m = SRC.match(/name: 'quidli_drop'[\s\S]*?required: \[([^\]]*)\]/);
+  assert.ok(m, 'could not find quidli_drop required list');
+  assert.ok(!m[1].includes('tokenContract'), 'tokenContract must be optional — native SOL and native ETH omit it');
+});

@@ -137,9 +137,12 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - connect_get_chains lists every chain Connect supports and which features work on each (drop is true only for Smart Send chains). Use it to answer "what chains do you support" accurately instead of guessing.
-- Drops and balance checks here stay on Base (8453). Every explorer link this bot produces is a basescan.org link, so a transfer on another chain would be reported with a link that does not resolve. If someone asks to send on a different chain, tell them plainly that this bot sends on Base — do not attempt it.
+- Base (8453) is the default. Use it unless the user names another chain. Smart Send also supports Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161), Avalanche (43114) and Solana (1399811149) — call connect_get_chains if you need to confirm what is currently available.
+- Omit tokenContract (or set it to null) to send a chain's native token. Pass an ERC-20 contract or an SPL mint to send a token. Never use the zero address.
+- Solana (chainId 1399811149): amounts are in lamports for native SOL (9 decimals). USDC on Solana is the SPL mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (6 decimals). Social recipients are paid at their solWalletAddress, never their ethWalletAddress. Sending native SOL to an empty wallet needs at least 890880 lamports or the transaction fails, and the sender pays roughly 2039280 lamports of rent per new SPL destination account — so an "insufficient funds" error on an SPL send is often missing SOL, not missing tokens.
+- Always check the balance on the chain you are about to send on before sending.
 - Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
-- After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
+- After success, show the explorer link the drop tool returns (explorerUrl). Do not construct one yourself — it differs per chain, and a link you invent will be stripped before the user sees it.
 - If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
@@ -212,7 +215,7 @@ If a tool call returns an error or empty result:
 3. Only report failure to the user after at least 2 attempts.
 
 ## Response format
-- Success: state what you did + basescan URL if applicable. One or two sentences max.
+- Success: state what you did + the explorer link if applicable. One or two sentences max.
 - Failure: state what you tried and what the user can do next. No raw JSON, no stack traces.
 - Never show internal error messages verbatim to the user.
 `.trim();
@@ -419,7 +422,6 @@ async function executeScheduledDrop(jobId) {
     }
 
     const result = await quidliDrop(dropInput, keyToUse);
-    if (result.transferHash) result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
 
     // DM the sender
     const user = await client.users.fetch(job.sender_id).catch(() => null);
@@ -428,7 +430,7 @@ async function executeScheduledDrop(jobId) {
       await user.send(
         `✅ Your scheduled drop executed!\n` +
         `Sent to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
-        (result.basescanUrl ? `Transaction: ${result.basescanUrl}` : '')
+        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '')
       ).catch(() => {});
     }
     // DM each Discord recipient
@@ -439,7 +441,7 @@ async function executeScheduledDrop(jobId) {
         if (recipientUser) {
           recipientUser.send(
             `🎉 You just received tokens!\n` +
-            `Transaction: https://basescan.org/tx/${result.transferHash}`
+            `Transaction: ${result.explorerUrl}`
           ).catch(() => {});
         }
       }
@@ -586,14 +588,13 @@ async function executeConditionalDrop(jobId) {
     }
 
     const result = await quidliDrop(resolvedDrop, keyToUse);
-    if (result.transferHash) result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
 
     if (senderUser) {
       const recipientCount = resolvedDrop.recipients?.length ?? 1;
       await senderUser.send(
         `✅ Condition met: "${condition}"\n` +
         `Drop executed to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
-        (result.basescanUrl ? `Transaction: ${result.basescanUrl}` : '')
+        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '')
       ).catch(() => {});
     }
 
@@ -601,7 +602,7 @@ async function executeConditionalDrop(jobId) {
     if (result.transferHash) {
       for (const r of (resolvedDrop.recipients ?? []).filter((r) => r.type === 'discord' && r.id)) {
         const u = await client.users.fetch(r.id).catch(() => null);
-        if (u) u.send(`🎉 You received tokens!\nTransaction: https://basescan.org/tx/${result.transferHash}`).catch(() => {});
+        if (u) u.send(`🎉 You received tokens!\nTransaction: ${result.explorerUrl}`).catch(() => {});
       }
     }
 
@@ -826,6 +827,24 @@ async function getMembersByStatus(statuses, roleId, excludeIds = []) {
 
 // ─── Quidli drop ─────────────────────────────────────────────────────────────
 
+// One place that knows how to turn a transferHash into an explorer link. Chains
+// absent from this map yield null and callers omit the link rather than printing
+// one that doesn't resolve — which is what confined this bot to Base before.
+const CHAIN_EXPLORERS = {
+  1: 'https://etherscan.io/tx/',
+  10: 'https://optimistic.etherscan.io/tx/',
+  137: 'https://polygonscan.com/tx/',
+  8453: 'https://basescan.org/tx/',
+  42161: 'https://arbiscan.io/tx/',
+  43114: 'https://snowtrace.io/tx/',
+  1399811149: 'https://solscan.io/tx/',
+};
+function explorerTxUrl(chainId, hash) {
+  if (!hash) return null;
+  const base = CHAIN_EXPLORERS[Number(chainId)];
+  return base ? `${base}${hash}` : null;
+}
+
 async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
   // Quidli requires exactly one of id or username per recipient — prefer id if both are set
   recipients = recipients.map(({ type, id, username }) => {
@@ -841,7 +860,9 @@ async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453,
     method: 'POST',
     body: JSON.stringify({ idempotencyKey, chainId, tokenContract, amountInWeiPerRecipient, recipients }),
   }, apiKey);
-  return res.json();
+  const body = await res.json();
+  // Attach the link here so no caller has to know which chain it was.
+  return { ...body, explorerUrl: explorerTxUrl(chainId, body?.transferHash) };
 }
 
 // ─── Quidli score ─────────────────────────────────────────────────────────────
@@ -1079,7 +1100,7 @@ const tools = [
         tokenContract: { type: 'string', description: 'Token contract address. USDC on Base: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
         chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
       },
-      required: ['recipients', 'amountInWeiPerRecipient', 'tokenContract'],
+      required: ['recipients', 'amountInWeiPerRecipient'],
     },
   },
   {
@@ -1210,9 +1231,9 @@ const tools = [
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
 ];
 
-// Tracks basescan URLs produced during a single handleMessage turn so they can
+// Tracks explorer URLs produced during a single handleMessage turn so they can
 // always be shown — even if the LLM forgets to include them in its response.
-const _pendingBasescanUrls = [];
+const _pendingExplorerUrls = [];
 
 async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
@@ -1396,8 +1417,7 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
     }
     const result = await quidliDrop(input, keyToUse);
     if (result.transferHash) {
-      result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
-      _pendingBasescanUrls.push(result.basescanUrl);
+      if (result.explorerUrl) _pendingExplorerUrls.push(result.explorerUrl);
     }
     console.log('[drop] result:', JSON.stringify(result, null, 2));
     // DM each Discord recipient to let them know they received tokens
@@ -1408,7 +1428,7 @@ async function runTool(name, input, { senderId, botId, senderApiKey, senderUser,
         if (recipientUser) {
           recipientUser.send(
             `🎉 You just received tokens from someone in your server!\n` +
-            `Transaction: https://basescan.org/tx/${result.transferHash}`
+            `Transaction: ${result.explorerUrl}`
           ).catch(() => {});
         }
       }
@@ -2138,8 +2158,8 @@ async function handleMessage(message) {
   let accumulated = '';
   let modelLabel = CLAUDE_MODEL;
 
-  // Clear any leftover basescan URLs from a previous turn
-  _pendingBasescanUrls.length = 0;
+  // Clear any leftover explorer URLs from a previous turn
+  _pendingExplorerUrls.length = 0;
 
   // The channel's switched provider decides what runs. Each user's messages use
   // their own key for that provider if they have one, else the host key.
@@ -2250,14 +2270,14 @@ async function handleMessage(message) {
       }
     }
 
-    // Append any basescan URLs the LLM forgot to include
+    // Append any explorer URLs the LLM forgot to include
     let finalText = accumulated || '_(no response)_';
-    for (const url of _pendingBasescanUrls) {
+    for (const url of _pendingExplorerUrls) {
       if (!finalText.includes(url)) {
         finalText += `\n🔗 ${url}`;
       }
     }
-    _pendingBasescanUrls.length = 0;
+    _pendingExplorerUrls.length = 0;
 
     finalText += `\n-# ${modelLabel}`;
     await editor.finalize(finalText);
@@ -2475,7 +2495,7 @@ async function checkWatchers(message) {
       };
       const result = await quidliDrop(dropInput, keyToUse);
       if (result.transferHash) {
-        const url = `https://basescan.org/tx/${result.transferHash}`;
+        const url = result.explorerUrl;
         message.author.send(`🎉 You triggered the drop by typing "${watcher.trigger_phrase}"! Tokens are on the way.\nTransaction: ${url}`).catch(() => {});
         const sender = await client.users.fetch(watcher.sender_id).catch(() => null);
         if (sender) sender.send(`✅ Watcher triggered! ${message.author.username} typed "${watcher.trigger_phrase}".\nTransaction: ${url}`).catch(() => {});
