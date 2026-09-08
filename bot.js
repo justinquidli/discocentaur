@@ -1235,6 +1235,26 @@ const tools = [
 // always be shown — even if the LLM forgets to include them in its response.
 const _pendingExplorerUrls = [];
 
+// Some models (observed: Kimi K2.6 via OpenRouter) will occasionally narrate a
+// fake "transaction sent" message with an invented tx hash instead of actually
+// calling quidli_drop. Since this bot moves real money, never trust a model's
+// own claim of an explorer link — only ever show one that came from a real
+// quidliDrop() result this turn. Anything else gets stripped and flagged.
+const EXPLORER_TX_RE = /https?:\/\/(?:optimistic\.etherscan\.io|etherscan\.io|polygonscan\.com|basescan\.org|arbiscan\.io|snowtrace\.io|solscan\.io)\/tx\/([A-Za-z0-9]+)/g;
+function sanitizeUnverifiedTxClaims(text, realUrls) {
+  // EVM hashes are case-insensitive hex. Solana signatures are case-SENSITIVE
+  // base58 — lowercasing one would never match, so compare exactly first and
+  // only fall back to a case-insensitive match for EVM-shaped hashes.
+  const real = new Set(realUrls.map((u) => u.split('/tx/')[1]).filter(Boolean));
+  const realLower = new Set([...real].map((h) => h.toLowerCase()));
+  return text.replace(EXPLORER_TX_RE, (fullMatch, hash) => {
+    const evmShaped = /^0x[a-fA-F0-9]{64}$/.test(hash);
+    if (real.has(hash) || (evmShaped && realLower.has(hash.toLowerCase()))) return fullMatch;
+    console.warn(`[safety] stripped unverified/fabricated tx link from model output: ${fullMatch}`);
+    return '⚠️ [unverified transaction link removed — no matching transfer was actually recorded, this may not have really happened]';
+  });
+}
+
 async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   // Tools discovered from Connect's MCP server. Called with the sender's own key
@@ -2272,6 +2292,7 @@ async function handleMessage(message) {
 
     // Append any explorer URLs the LLM forgot to include
     let finalText = accumulated || '_(no response)_';
+    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingExplorerUrls);
     for (const url of _pendingExplorerUrls) {
       if (!finalText.includes(url)) {
         finalText += `\n🔗 ${url}`;

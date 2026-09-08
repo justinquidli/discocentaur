@@ -150,3 +150,29 @@ test('quidli_drop no longer requires tokenContract, so native sends are expressi
   assert.ok(m, 'could not find quidli_drop required list');
   assert.ok(!m[1].includes('tokenContract'), 'tokenContract must be optional — native SOL and native ETH omit it');
 });
+
+// ── fabricated transaction links ──────────────────────────────────────────────
+// Kimi K2.6 was observed narrating a "transaction sent" message with an invented
+// hash instead of calling the drop tool. TeleCentaur has stripped those since;
+// DiscoCentaur runs the same model and had no such guard until now.
+test('invented transaction links are stripped, real ones survive', () => {
+  const reLine = SRC.match(/^const EXPLORER_TX_RE = .*$/m);
+  assert.ok(reLine, 'EXPLORER_TX_RE not found in bot.js');
+  const sanitize = new Function(`${reLine[0]}; ${grab('sanitizeUnverifiedTxClaims')}; return sanitizeUnverifiedTxClaims;`)();
+
+  const realEvm = `https://basescan.org/tx/0x${'a'.repeat(64)}`;
+  assert.ok(sanitize(`done ${realEvm}`, [realEvm]).includes(realEvm), 'a real link must survive');
+
+  const invented = `https://basescan.org/tx/0x${'b'.repeat(64)}`;
+  const out = sanitize(`sent it! ${invented}`, [realEvm]);
+  assert.ok(!out.includes(invented), 'an invented link must be stripped');
+  assert.match(out, /unverified transaction link removed/);
+
+  // nothing sent this turn means nothing may be claimed
+  assert.ok(!sanitize(`sent it! ${realEvm}`, []).includes(realEvm));
+
+  // Solana signatures are case-sensitive base58, not hex
+  const realSol = 'https://solscan.io/tx/4KmXsPqRt9vBnW2gYzLc';
+  assert.ok(sanitize(`done ${realSol}`, [realSol]).includes(realSol), 'real Solana links survive');
+  assert.ok(!sanitize('done https://solscan.io/tx/9zzFAKE11', [realSol]).includes('9zzFAKE11'));
+});
