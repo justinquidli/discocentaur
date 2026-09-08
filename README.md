@@ -5,6 +5,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to individuals or entire Discord roles via Quidli Smart Send
+- **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
 - **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
@@ -24,8 +25,8 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 ```
 Discord message → LLM (Claude / Gemini / OpenAI / OpenRouter / Hermes / Minds AI)
                → Quidli Connect, over two paths:
-                   • MCP  — lookup / scores / balance (discovered at runtime)
-                   • REST — drop / exposed / scheduling
+                   • MCP  — lookup / exposed / scores / balance / profile (discovered at runtime)
+                   • REST — drop (the only hand-written Connect call left)
                → edit Discord reply in real time
 ```
 
@@ -40,6 +41,7 @@ The LLM decides when to call tools based on natural language. No commands needed
 @DiscoCentaur schedule a drop of 5 USDC to @team in 2 hours
 @DiscoCentaur if the USA wins tonight, send everyone 1 USDC
 @DiscoCentaur send 0.01 USDC to the first person who types "gm" here today
+@DiscoCentaur send 0.5 USDC to @Guillaume on Solana
 @DiscoCentaur switch to gemini
 @DiscoCentaur switch to claude
 @DiscoCentaur switch to minds
@@ -130,9 +132,9 @@ the box are both `claudetaur`.
 npm run check     # syntax check + tests
 ```
 
-7 tests, covering the MCP tool gate (read-only registration, fail-closed on unannotated tools,
-the legacy fallback, the keyless header) and the drop recipient enum, which has silently drifted
-from the server's once already. `bot.js` connects to Discord on import, so the tests extract the
+10 tests, covering the MCP tool gate (read-only registration, fail-closed on unannotated tools,
+the legacy fallback, the keyless header), the drop recipient enum, which has silently drifted from
+the server's once already, per-chain explorer links, and the fabricated-transaction-link guard. `bot.js` connects to Discord on import, so the tests extract the
 functions under test from its source rather than importing it — a stopgap until it's split into
 modules.
 
@@ -206,10 +208,20 @@ How it works:
 
 Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
 
-Note on chains: `connect_get_chains` is offered so the model can answer chain questions from the
-server rather than guessing, but **drops stay on Base (8453)**. Every explorer link the bot builds
-is hardcoded to `basescan.org`, so a transfer on another chain would be reported with a link that
-does not resolve. Chain-aware explorer URLs are a prerequisite for chain selection on drops.
+Note on chains: drops are **multi-chain**. Base (8453) is the default and what the model uses
+unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161),
+Avalanche (43114) and Solana (1399811149) all work. `connect_get_chains` lets the model answer
+chain questions from the server rather than guessing.
+
+Explorer links follow the chain. `CHAIN_EXPLORERS` maps a chainId to its explorer and `quidliDrop()`
+attaches the right link to its own result, so no caller has to know which chain was used. A chain
+absent from that map yields no link rather than a wrong one — which is safer than the previous
+behaviour, where every link was hardcoded to `basescan.org`.
+
+Solana specifics the model is told about: amounts are lamports for native SOL (9 decimals), USDC is
+the SPL mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (6 decimals), social recipients are paid
+at their `solWalletAddress`, and a native send to an empty wallet needs at least 890880 lamports.
+Omit `tokenContract` (or set it null) to send a chain's native token.
 
 To see what the server currently offers and how it is annotated:
 
