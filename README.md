@@ -95,7 +95,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
 | `OPENAI_MODEL` | — | Defaults to `gpt-4o` |
 | `NOUS_API_KEY` | — | From [portal.nousresearch.com](https://portal.nousresearch.com) — one key, 200+ models |
-| `NOUS_MODEL` | — | Defaults to `tencent/hy3:free` (free tier, supports tool calling) |
+| `NOUS_MODEL` | — | Defaults to `poolside/laguna-s-2.1:free` (free tier, supports tool calling) |
 | `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
 | `HOST_KEY_ALLOWED_ROLES` | — | Discord role names allowed to spend the host's LLM keys |
 | `DISCORD_ACTIVE_CHANNELS` | — | Comma-separated channel IDs where the bot responds to all messages (not just @mentions) |
@@ -280,13 +280,13 @@ encrypted (set `MASTER_ENCRYPTION_KEY`) and used instead of the host's:
 
 `switch to hermes` routes the channel through [Nous Portal](https://portal.nousresearch.com), an
 OpenAI-compatible gateway to 200+ models under one key. Set `NOUS_API_KEY` to give everyone the
-host default (`NOUS_MODEL`, defaults to `tencent/hy3:free` — free tier and supports tool calling).
+host default (`NOUS_MODEL`, defaults to `poolside/laguna-s-2.1:free` — free tier and supports tool calling).
 
 Users can bring their own key and pick any model:
 
 ```
 !llm hermes <your-nous-key> anthropic/claude-sonnet-4.6
-!llm hermes <your-nous-key> tencent/hy3:free
+!llm hermes <your-nous-key> poolside/laguna-s-2.1:free
 ```
 
 Model slugs are vendor-prefixed; free variants end in `:free`. Note that Nous's own docs advise

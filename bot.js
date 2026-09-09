@@ -47,13 +47,20 @@ const {
   OPENAI_MODEL = 'gpt-4o',
   NOUS_API_KEY,             // Nous Portal API key — from portal.nousresearch.com (API keys)
   // Host default model. Portal is an OpenRouter-compatible proxy, so slugs are
-  // vendor-prefixed and free variants carry a ':free' suffix. Free-tier models that
-  // support tool calling (verified via /v1/models): tencent/hy3:free,
-  // inclusionai/ling-3.0-flash:free, poolside/laguna-s-2.1:free,
-  // poolside/laguna-xs-2.1:free, stepfun/step-3.7-flash:free.
+  // vendor-prefixed and free variants carry a ':free' suffix.
+  //
+  // Do NOT keep a list of "known good" free models here. Nous retires them without
+  // notice — a hardcoded roster is exactly what took both bots down when
+  // tencent/hy3:free disappeared and every request started returning a bare 404.
+  // Check what is actually live before changing this:
+  //   curl -s https://inference-api.nousresearch.com/v1/models \
+  //     -H "Authorization: Bearer $NOUS_API_KEY" | grep -o '"id":"[^"]*"' | grep free
+  // Then confirm the candidate calls tools, since a chat-only model leaves the bot
+  // looking healthy while every drop and lookup silently fails.
+  //
   // Paid tiers can use any of the 200+ slugs (anthropic/claude-sonnet-4.6, etc).
   // Users can override per-channel with: !llm hermes <key> <model>
-  NOUS_MODEL = 'tencent/hy3:free',
+  NOUS_MODEL = 'poolside/laguna-s-2.1:free',
   REQUIRE_USER_LLM_KEY = 'false', // Legacy — host keys are now owner/allowlist-only regardless
   // Who may spend the HOST's LLM keys. The owner always can. Everyone else must
   // either be listed here (handle or numeric ID), hold a role in
@@ -2429,7 +2436,7 @@ async function handleDM(message) {
         '  Example: `!llm openrouter sk-or-... meta-llama/llama-3-70b-instruct`\n' +
         '  Default model: openai/gpt-4o\n' +
         '  `!llm hermes <key> [model]`\n' +
-        '  Example: `!llm hermes sk-... tencent/hy3:free`  (free tier)\n' +
+        '  Example: `!llm hermes sk-... poolside/laguna-s-2.1:free`  (free tier)\n' +
         '  Nous Portal proxies 200+ models — see portal.nousresearch.com/info\n\n' +
         'Your key is stored encrypted and used instead of the host key. DM `!llm-remove` to disconnect.'
       );
