@@ -106,123 +106,249 @@ test('bankr_agent is a held money tool and its confirmation shows the exact prom
   assert.match(rec, /Bankr agent request “x  y”/);
 });
 
-import { bankrSwapAndDrop, formatUnits, connectBalanceOf } from '../bankr.js';
+import { bankrSwapAndDrop, formatUnits, parseUnits, connectBalanceOf, bankrBalanceOf } from '../bankr.js';
 
-const HOME = '0xb9a1e52f3ed678b01ff5e256fde43f26f9c01ba3';
 const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+const HOME = '0xb9a1e52f3ed678b01ff5e256fde43f26f9c01ba3';
 const CONNECT = '0x02d592CC297ae3b3945F7dCDb0BeD447F0F87d17';
-const bal = (raw) => ({ walletAddress: CONNECT, assets: [{ type: 'erc20', tokenContract: HOME, balanceInWei: raw }] });
-const quoteOk = () => ({ body: { from: { symbol: 'USDC' }, to: { symbol: 'HOME', decimals: 18 }, minBuyAmount: '40000', quoteId: 'q1' } });
-const input = { sellToken: USDC, buyToken: HOME, sellAmount: '1', recipients: [{ type: 'telegram', id: '1' }, { type: 'telegram', id: '2' }, { type: 'telegram', id: '3' }] };
+const BANKR = '0x64a59e25a1104cdb60926f29e5bdbcfcbd156256';
+const W1 = '0x503a04D04E00d9b0C0898e2D7A16B857BE6cdAF0';
+const W2 = '0x6a48ADE3bE3F9f0b8B4c9af61Bb654A219311699';
+const RECEIVED = 4612046650000000000000n; // 4612.04665 HOME
 
-function harness({ swap, transfer, balances, dropResult }) {
-  let i = 0;
-  const drops = [];
-  const f = fakeFetch([
-    [/swap-quote$/, quoteOk],
-    [/\/wallet\/swap$/, swap ?? (() => ({ body: { success: true, hash: '0xs', amountReceivedRaw: '46120466500000000000000' } }))],
-    [/\/wallet\/transfer$/, transfer ?? (() => ({ body: { success: true, txHash: '0xt' } }))],
-  ]);
-  const deps = {
-    bankrKey: 'k', uuid: () => 'u',
-    getConnectBalance: async () => bal(balances[Math.min(i++, balances.length - 1)]),
-    drop: async (a) => { drops.push(a); return dropResult ?? { transferHash: '0xd', explorerUrl: 'https://basescan.org/tx/0xd' }; },
-    explorerUrl: (c, h) => `https://basescan.org/tx/${h}`,
+// A tiny two-wallet world. Balances only change when the fake APIs "execute",
+// so every wait-for-arrival loop is tested against real state, not a script.
+function world(o = {}) {
+  const w = {
+    connect: { usdc: 5_968_974n, eth: 1_521_837_516_182_189n, home: 0n, ...(o.connect ?? {}) },
+    bankr: { usdc: '0', eth: '0.0003', home: '0', ...(o.bankr ?? {}) },
+    calls: [], drops: [],
   };
-  return { f, deps, drops };
+  const lagBankr = o.lagBankr ?? 0; // portfolio reads that still show the old balance
+  let bankrReads = 0;
+  const fetchImpl = async (url, opts = {}) => {
+    w.calls.push({ url, opts });
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    const reply = (status, json) => ({ ok: status < 400, status, json: async () => json });
+    if (/\/wallet\/portfolio/.test(url)) {
+      bankrReads++;
+      const b = (o.freezeBankr || bankrReads <= lagBankr) ? w.bankrStart ?? w.bankr : w.bankr;
+      return reply(200, { evmAddress: BANKR, balances: { base: { nativeBalance: b.eth, tokenBalances: [
+        { token: { balance: b.usdc, baseToken: { address: USDC, symbol: 'USDC' } } },
+        { token: { balance: b.home, baseToken: { address: HOME, symbol: 'HOME' } } },
+      ] } } });
+    }
+    if (/swap-quote$/.test(url)) return reply(200, { from: { symbol: 'USDC', decimals: 6 }, to: { symbol: 'HOME', decimals: 18 }, minBuyAmount: '4000', quoteId: 'q1' });
+    if (/\/wallet\/swap$/.test(url)) {
+      if (o.swap) return reply(...o.swap);
+      w.bankr.usdc = formatUnits(parseUnits(w.bankr.usdc, 6) - parseUnits(body.amount, 6), 6);
+      w.bankr.home = formatUnits(parseUnits(w.bankr.home, 18) + RECEIVED, 18);
+      return reply(200, { success: true, hash: '0xswap', amountReceivedRaw: RECEIVED.toString() });
+    }
+    if (/\/wallet\/transfer$/.test(url)) {
+      if (o.transfer) return reply(...o.transfer);
+      w.bankr.home = formatUnits(parseUnits(w.bankr.home, 18) - parseUnits(body.amount, 18), 18);
+      if (!o.freezeConnect) w.connect.home += parseUnits(body.amount, 18);
+      return reply(200, { success: true, txHash: '0xback' });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+  w.bankrStart = { ...w.bankr };
+  const deps = {
+    bankrKey: 'k', uuid: () => 'uuid-1',
+    explorerUrl: (c, h) => `https://basescan.org/tx/${h}`,
+    resolveRecipients: o.resolveRecipients ?? (async (list) => ({ recipients: list.map((_, i) => ({ type: 'wallet', id: [W1, W2][i] })) })),
+    getConnectBalance: async () => ({ walletAddress: CONNECT, assets: [
+      { type: 'native', tokenContract: null, symbol: 'ETH', decimals: 18, balanceInWei: w.connect.eth.toString() },
+      { type: 'erc20', tokenContract: USDC, symbol: 'USDC', decimals: 6, balanceInWei: w.connect.usdc.toString() },
+      ...(w.connect.home ? [{ type: 'erc20', tokenContract: HOME, symbol: 'HOME', decimals: 18, balanceInWei: w.connect.home.toString() }] : []),
+    ] }),
+    drop: async (a) => {
+      w.drops.push(a);
+      const toBankr = a.recipients.length === 1 && a.recipients[0].id === BANKR;
+      if (toBankr && o.fundDrop) return o.fundDrop();
+      if (!toBankr && o.payDrop) return o.payDrop();
+      const amt = BigInt(a.amountInWeiPerRecipient) * BigInt(a.recipients.length);
+      if (toBankr) {
+        w.connect.usdc -= amt;
+        if (!o.freezeBankr) w.bankr.usdc = formatUnits(parseUnits(w.bankr.usdc, 6) + amt, 6);
+        return { transferHash: '0xfund', explorerUrl: 'https://basescan.org/tx/0xfund' };
+      }
+      w.connect.home -= amt;
+      return { transferHash: '0xpay', explorerUrl: 'https://basescan.org/tx/0xpay' };
+    },
+  };
+  const run = (input, opts = {}) => bankrSwapAndDrop(
+    { sellToken: USDC, buyToken: HOME, sellAmount: '1', ...input }, deps,
+    { fetchImpl, wait: async () => {}, ...opts });
+  const hit = (re) => w.calls.filter((c) => re.test(c.url));
+  return { w, deps, run, hit };
 }
+const TWO = [{ type: 'telegram', username: 'a' }, { type: 'discord', id: '2' }];
+const clock = () => { let t = 0; return () => (t += 10_000); };
 
-test('swap → transfer → wait → drop splits exactly what was received', async () => {
-  const h = harness({ balances: ['100', '100', '46120466500000000000100'] });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
+test('Connect → Bankr → swap → Connect → recipients, amounts read back at each step', async () => {
+  const { w, run, hit } = world({ lagBankr: 2 });
+  const r = await run({ recipients: TWO });
   assert.equal(r.status, 'completed', r.message);
-  const xfer = JSON.parse(h.f.calls.find((c) => /transfer$/.test(c.url)).opts.body);
-  assert.equal(xfer.amount, '46120.4665');
-  assert.equal(xfer.recipientAddress, CONNECT);
-  const sw = JSON.parse(h.f.calls.find((c) => /\/wallet\/swap$/.test(c.url)).opts.body);
-  assert.equal(sw.minBuyAmount, '40000');
-  assert.equal(sw.idempotencyKey, 'u');
-  assert.equal(h.drops.length, 1);
-  assert.equal(h.drops[0].amountInWeiPerRecipient, (46120466500000000000000n / 3n).toString());
-  assert.equal(h.drops[0].tokenContract, HOME);
-  assert.deepEqual(r.explorerUrls, ['https://basescan.org/tx/0xs', 'https://basescan.org/tx/0xt', 'https://basescan.org/tx/0xd']);
+  assert.equal(w.drops.length, 2);
+  assert.deepEqual(w.drops[0], { recipients: [{ type: 'wallet', id: BANKR }], amountInWeiPerRecipient: '1000000', chainId: 8453, tokenContract: USDC });
+  assert.equal(JSON.parse(hit(/\/wallet\/swap$/)[0].opts.body).idempotencyKey, 'uuid-1');
+  const back = JSON.parse(hit(/transfer$/)[0].opts.body);
+  assert.deepEqual([back.recipientAddress, back.amount], [CONNECT, '4612.04665']);
+  assert.deepEqual(w.drops[1].recipients, [{ type: 'wallet', id: W1 }, { type: 'wallet', id: W2 }]);
+  assert.equal(w.drops[1].amountInWeiPerRecipient, (RECEIVED / 2n).toString());
+  assert.equal(w.connect.usdc, 4_968_974n);
+  assert.equal(w.connect.home, 0n);
+  assert.deepEqual(r.explorerUrls, ['https://basescan.org/tx/0xfund', 'https://basescan.org/tx/0xswap', 'https://basescan.org/tx/0xback', 'https://basescan.org/tx/0xpay']);
+  assert.ok(hit(/portfolio/).every((c) => /showLowValueTokens=true/.test(c.url)));
 });
 
-test('reverted swap stops before transfer', async () => {
-  const h = harness({ balances: ['0'], swap: () => ({ body: { success: false, hash: '0xr' } }) });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
-  assert.equal(r.status, 'failed');
-  assert.ok(!h.f.calls.some((c) => /transfer$/.test(c.url)));
-  assert.equal(h.drops.length, 0);
+test('no recipients: swap lands back in Connect and waits there', async () => {
+  const { w, run } = world();
+  const r = await run({});
+  assert.equal(r.status, 'completed', r.message);
+  assert.match(r.message, /ready to send/);
+  assert.equal(w.drops.length, 1, 'only the funding drop');
+  assert.equal(w.connect.home, RECEIVED);
 });
 
-test('504 on swap is unknown and never retried', async () => {
-  const h = harness({ balances: ['0'], swap: () => ({ status: 504, body: { error: 'slow' } }) });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
+test('no gas in Bankr: stops before anything moves and says how much to add, and where', async () => {
+  const { w, run, hit } = world({ bankr: { eth: '0' } });
+  const r = await run({ recipients: TWO });
+  assert.equal(r.status, 'refused');
+  assert.equal(r.stage, 'gas');
+  assert.match(r.message, /Add at least 0\.00005 ETH on base to 0x64a59e25/);
+  assert.match(r.message, /Nothing was moved/);
+  assert.equal(w.drops.length, 0);
+  assert.equal(hit(/swap|transfer/).length, 0);
+});
+
+test('source=bankr also requires gas', async () => {
+  const { w, run } = world({ bankr: { eth: '0.00001', usdc: '5' } });
+  const r = await run({ source: 'bankr' });
+  assert.equal(r.stage, 'gas');
+  assert.equal(w.drops.length, 0);
+});
+
+test('not enough in Connect: refused, nothing moved', async () => {
+  const { w, run, hit } = world();
+  const r = await run({ sellAmount: '10' });
+  assert.equal(r.status, 'refused');
+  assert.match(r.message, /5\.968974 USDC, less than 10/);
+  assert.equal(w.drops.length + hit(/swap|transfer/).length, 0);
+});
+
+test('no ETH in Connect for the funding drop: refused', async () => {
+  const { w, run } = world({ connect: { eth: 0n } });
+  const r = await run({});
+  assert.equal(r.status, 'refused');
+  assert.equal(w.drops.length, 0);
+});
+
+test('funding drop throws → unknown, never swaps', async () => {
+  const { run, hit } = world({ fundDrop: () => { throw new Error('timeout'); } });
+  const r = await run({});
   assert.equal(r.status, 'unknown');
-  assert.equal(h.f.calls.filter((c) => /\/wallet\/swap$/.test(c.url)).length, 1);
-  assert.ok(!h.f.calls.some((c) => /transfer$/.test(c.url)));
+  assert.match(r.message, /may still land/);
+  assert.equal(hit(/swap/).length, 0);
 });
 
-test('failed transfer leaves funds in Bankr and does not drop', async () => {
-  const h = harness({ balances: ['0'], transfer: () => ({ status: 403, body: { error: 'read only' } }) });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
+test('funding drop without a hash → failed, funds still in Connect', async () => {
+  const { run, hit } = world({ fundDrop: () => ({ error: 'insufficient' }) });
+  const r = await run({});
+  assert.equal(r.status, 'failed');
+  assert.match(r.message, /still be in Connect/);
+  assert.equal(hit(/swap/).length, 0);
+});
+
+test('funds never show up in Bankr → partial, never swaps', async () => {
+  const { run, hit } = world({ freezeBankr: true });
+  const r = await run({}, { now: clock(), arrivalTimeoutMs: 30_000 });
   assert.equal(r.status, 'partial');
-  assert.match(r.message, /Bankr wallet/);
-  assert.equal(h.drops.length, 0);
+  assert.equal(r.stage, 'bankr_arrival');
+  assert.equal(hit(/swap/).length, 0);
 });
 
-test('funds not arriving in Connect → no drop', async () => {
-  let t = 0;
-  const h = harness({ balances: ['0'] });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait, now: () => (t += 10_000), arrivalTimeoutMs: 30_000 });
+test('swap reverts after funding → partial, says the funds are in Bankr unswapped', async () => {
+  const { run, hit } = world({ swap: [200, { success: false, hash: '0xrev' }] });
+  const r = await run({ recipients: TWO });
   assert.equal(r.status, 'partial');
-  assert.equal(r.stage, 'arrival');
-  assert.equal(h.drops.length, 0);
+  assert.match(r.message, /in your Bankr wallet \(not swapped\)/);
+  assert.equal(hit(/transfer/).length, 0);
 });
 
-test('bad inputs are refused before any request', async () => {
-  const h = harness({ balances: ['0'] });
-  for (const bad of [{ buyToken: 'HOME' }, { sellAmount: '-1' }, { recipients: [] }, { chain: 'solana' }]) {
-    const r = await bankrSwapAndDrop({ ...input, ...bad }, h.deps, { fetchImpl: h.f, wait: noWait });
+test('swap 504 → unknown, one attempt only', async () => {
+  const { run, hit } = world({ swap: [504, { error: 'slow' }] });
+  const r = await run({});
+  assert.equal(r.status, 'unknown');
+  assert.equal(hit(/\/wallet\/swap$/).length, 1);
+  assert.equal(hit(/transfer/).length, 0);
+});
+
+test('transfer back fails → partial, swapped tokens in Bankr, no send', async () => {
+  const { w, run } = world({ transfer: [403, { error: 'recipient not allowed' }] });
+  const r = await run({ recipients: TWO });
+  assert.equal(r.status, 'partial');
+  assert.match(r.message, /recipient not allowed.*in your Bankr wallet/);
+  assert.equal(w.drops.length, 1);
+});
+
+test('Connect never shows the swapped tokens → partial, no send', async () => {
+  const { w, run } = world({ freezeConnect: true });
+  const r = await run({ recipients: TWO }, { now: clock(), arrivalTimeoutMs: 30_000 });
+  assert.equal(r.status, 'partial');
+  assert.equal(r.stage, 'connect_arrival');
+  assert.equal(w.drops.length, 1);
+});
+
+test('final send throws → unknown', async () => {
+  const { run } = world({ payDrop: () => { throw new Error('timeout'); } });
+  const r = await run({ recipients: TWO });
+  assert.equal(r.status, 'unknown');
+  assert.match(r.message, /check your Connect wallet/);
+});
+
+test('unresolvable recipient → refused before any call', async () => {
+  const { w, run } = world({ resolveRecipients: async () => ({ error: 'Could not resolve a wallet for: telegram:a.', failed: ['telegram:a'] }) });
+  const r = await run({ recipients: TWO });
+  assert.equal(r.status, 'refused');
+  assert.equal(w.calls.length + w.drops.length, 0);
+});
+
+test('source=bankr swaps what is already there, no funding drop', async () => {
+  const { w, run } = world({ bankr: { usdc: '3' } });
+  const r = await run({ source: 'bankr', recipients: TWO });
+  assert.equal(r.status, 'completed', r.message);
+  assert.equal(w.drops.length, 1);
+  assert.notEqual(w.drops[0].recipients[0].id, BANKR);
+});
+
+test('source=bankr with too little in Bankr → refused before the swap', async () => {
+  const { run, hit } = world({ bankr: { usdc: '0.5' } });
+  const r = await run({ source: 'bankr' });
+  assert.equal(r.status, 'refused');
+  assert.equal(hit(/\/wallet\/swap$/).length, 0);
+});
+
+test('bad inputs refused before any call', async () => {
+  const { w, run } = world();
+  for (const bad of [{ buyToken: 'HOME' }, { sellAmount: '-1' }, { chain: 'solana' }, { buyToken: USDC }, { source: 'wallet' }]) {
+    const r = await run(bad);
     assert.equal(r.status, 'refused', JSON.stringify(bad));
   }
-  assert.equal(h.f.calls.length, 0);
+  assert.equal(w.calls.length + w.drops.length, 0);
 });
 
-test('unresolvable recipient stops before any Bankr call', async () => {
-  const h = harness({ balances: ['0'] });
-  h.deps.resolveRecipients = async () => ({ error: 'Could not resolve a wallet for: telegram:3.', failed: ['telegram:3'] });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
-  assert.equal(r.status, 'refused');
-  assert.equal(h.f.calls.length, 0);
-  assert.equal(h.drops.length, 0);
-});
-
-test('drop receives the resolved wallets, not the social handles', async () => {
-  const W = '0x503a04D04E00d9b0C0898e2D7A16B857BE6cdAF0';
-  const h = harness({ balances: ['0', '46120466500000000000000'] });
-  h.deps.resolveRecipients = async (list) => ({ recipients: list.map(() => ({ type: 'wallet', id: W })) });
-  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
-  assert.equal(r.status, 'completed', r.message);
-  assert.deepEqual(h.drops[0].recipients[0], { type: 'wallet', id: W });
-});
-
-test('native buy uses the sentinel for Bankr and null for Connect', async () => {
-  const h = harness({ balances: ['0', '5'], swap: () => ({ body: { success: true, hash: '0xs', amountReceivedRaw: '6' } }) });
-  h.deps.getConnectBalance = (() => { let n = 0; return async () => ({ walletAddress: CONNECT, assets: n++ ? [{ type: 'native', balanceInWei: '6' }] : [] }); })();
-  const r = await bankrSwapAndDrop({ ...input, buyToken: 'native', recipients: input.recipients.slice(0, 2) }, h.deps, { fetchImpl: h.f, wait: noWait });
-  assert.equal(r.status, 'completed', r.message);
-  assert.equal(JSON.parse(h.f.calls[0].opts.body).toToken, '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
-  assert.equal(JSON.parse(h.f.calls.find((c) => /transfer$/.test(c.url)).opts.body).isNativeToken, true);
-  assert.equal(h.drops[0].tokenContract, null);
-  assert.equal(h.drops[0].amountInWeiPerRecipient, '3');
-});
-
-test('formatUnits / connectBalanceOf', () => {
+test('helpers', () => {
   assert.equal(formatUnits(1500000n, 6), '1.5');
-  assert.equal(formatUnits(5n, 6), '0.000005');
   assert.equal(formatUnits(0n, 6), '0');
-  assert.equal(connectBalanceOf(bal('7'), HOME.toUpperCase().replace('0X', '0x')), 7n);
-  assert.equal(connectBalanceOf(bal('7'), USDC), 0n);
+  assert.equal(parseUnits('0.1', 6), 100000n);
+  assert.equal(parseUnits('1.1234567', 6), 1123456n, 'truncates, never rounds up');
+  assert.equal(parseUnits('5', 18), 5n * 10n ** 18n);
+  assert.equal(connectBalanceOf({ assets: [{ type: 'erc20', tokenContract: HOME, balanceInWei: '7' }] }, HOME.toUpperCase().replace('0X', '0x')), 7n);
+  const port = { balances: { base: { nativeBalance: '0.1', tokenBalances: [{ token: { balance: '2.5', baseToken: { address: USDC.toUpperCase().replace('0X', '0x') } } }] } } };
+  assert.equal(bankrBalanceOf(port, 'base', USDC), '2.5');
+  assert.equal(bankrBalanceOf(port, 'base', 'native'), '0.1');
+  assert.equal(bankrBalanceOf(port, 'polygon', USDC), '0');
 });

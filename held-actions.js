@@ -145,9 +145,14 @@ export function describeHeldAction({ code, tool, input }) {
     : null;
 
   if (tool === 'bankr_swap_and_drop') {
-    lines.push(`**Swap in Bankr, then send with Connect** on ${input.chain ?? 'base'}:`);
-    lines.push(`Sell ${input.sellAmount} of ${input.sellToken} for ${input.buyToken}, move all of it to your Connect wallet, and split it evenly between ${recipients.length} recipient${recipients.length === 1 ? '' : 's'}`);
-    lines.push(`→ ${shownRecipients || '(none)'}`);
+    const fromBankr = String(input.source ?? 'connect').toLowerCase() === 'bankr';
+    lines.push(`**Swap via Bankr** on ${input.chain ?? 'base'}: sell ${input.sellAmount} of ${input.sellToken} for ${input.buyToken}`);
+    lines.push(fromBankr
+      ? 'Uses funds already in your Bankr wallet; the result is sent to your Connect wallet.'
+      : 'Moves the sell amount from your Connect wallet to your Bankr wallet, swaps, and sends the result back to Connect.');
+    lines.push(recipients.length
+      ? `Then splits it evenly between ${recipients.length} recipient${recipients.length === 1 ? '' : 's'} → ${shownRecipients}`
+      : 'No recipients — the tokens stay in your Connect wallet.');
   } else if (tool === 'bankr_agent') {
     lines.push(`**Bankr agent** request (runs against your Bankr wallet — it may trade or transfer):`);
     lines.push(`“${String(input.prompt ?? '').slice(0, 500)}”`);
@@ -213,7 +218,7 @@ export function neutraliseBotRecords(text) {
 }
 
 function summarise({ tool, input }) {
-  if (tool === 'bankr_swap_and_drop') return `Bankr swap of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} then Connect drop to ${Array.isArray(input.recipients) ? input.recipients.length : 0} recipients`;
+  if (tool === 'bankr_swap_and_drop') return `swap via Bankr of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} (source ${input.source ?? 'connect'}), then ${Array.isArray(input.recipients) && input.recipients.length ? `split to ${input.recipients.length} recipients` : 'kept in Connect'}`;
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;

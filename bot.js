@@ -203,19 +203,21 @@ Use connect_scores_batch when asked about trust, reputation, or scores. Pass the
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
 
-## Swap then send (bankr_swap_and_drop)
-When the user wants to swap or buy a token and send the result to people ("swap 5 USDC to HOME and send it to the group"), use bankr_swap_and_drop. It swaps in their Bankr wallet, moves the proceeds to their Connect wallet, and drops them split evenly — one call, no other tools for the transfer steps.
-- First resolve recipients the usual way (discord_get_role_members or discord_search_messages for "everyone" — this tool takes an explicit recipients list, not presenceFilter), excluding the requester unless they asked to be included.
+## Swaps (bankr_swap_and_drop)
+Every swap, buy or sell goes through bankr_swap_and_drop — including "swap 5 USDC to HOME and send it to the group". By default it takes the sell tokens from the user's Connect wallet, swaps them in their Bankr wallet, and brings the result back to Connect. With recipients it then sends the result to them split evenly; without, the tokens wait in Connect for a later send.
+- Only use source="bankr" when the user says to use funds already in their Bankr wallet.
+- Resolve recipients first the usual way (discord_get_role_members or discord_search_messages for "everyone" — this tool takes an explicit recipients list, not presenceFilter), excluding the requester unless they asked to be included. Omit recipients when the user only asked to swap.
 - Tokens must be contract addresses on that chain, or "native". USDC on Base is 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913. For anything else ask bankr_agent for the contract address (e.g. "what is the contract address of HOME on Base"). If the symbol is ambiguous, ask the user — look-alike tokens exist.
-- If the user asks for a specific amount per person instead of "split it", work out the sell amount only if you can do it from a price you just fetched; otherwise ask.
-- Needs both keys: Bankr (with Wallet API enabled) and Quidli.
-- Report the message field. status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
+- If the user asks for a specific amount per person instead of "split it", work out the sell amount only from a price you just fetched; otherwise ask.
+- Needs both keys: Bankr (Agent API and Wallet API enabled) and Quidli.
+- If the result has stage "gas", tell the user plainly their Bankr wallet needs gas: how much to add, on which chain, and the address — all from the message. Nothing was moved; they can ask again once it's funded.
+- Report the message field. Status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
 
 ## Bankr (bankr_agent)
 - Key commands (!bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation, and never suggest posting a key in a server channel — keys go in a DM to the bot only. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare !bankr in DM shows the user their link status.
-Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for trading and market actions: token prices and research, swaps/buys/sells, and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
+Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for market questions (token prices, research, contract addresses) and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
 - Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
-- For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
+- Swaps never go through bankr_agent — use bankr_swap_and_drop. For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
 - To swap and then send the result to people, use bankr_swap_and_drop instead of chaining tools yourself.
 - One clear instruction per call with explicit amounts, token and chain. Bankr has a $0.05 minimum transfer.
 - If the result status is still_running, the job may still execute: say so and do NOT call bankr_agent again for the same thing.
@@ -1288,23 +1290,24 @@ const tools = [
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
   {
     name: 'bankr_swap_and_drop',
-    description: 'Swap one token for another in the sender\'s Bankr wallet, move everything the swap returned into their Quidli Connect wallet, then drop it split evenly to the recipients. Use this whenever the user wants to swap/buy a token and send it to people (e.g. "swap 5 USDC to HOME and send it to the group"). Runs every step itself and stops safely if one fails — do not call bankr_agent or quidli_drop for the same request. Takes 30–120s. Tokens must be contract addresses on that chain ("native" for ETH); never guess one.',
+    description: 'Swap tokens for the user. Connect can\'t swap, so this sends the sell amount from the user\'s Connect wallet to their Bankr wallet, swaps there, sends everything the swap returned back to Connect, and then — if recipients are given — drops it to them split evenly. With no recipients the tokens stay in Connect, ready to send. Use it for EVERY swap/buy/sell request unless the user says to use funds already in Bankr (then source="bankr"). Runs every step itself and stops safely if one fails — never call bankr_agent or quidli_drop for the same request. Takes 1–3 minutes. Tokens must be contract addresses on that chain ("native" for ETH/POL); never guess one.',
     input_schema: {
       type: 'object',
       properties: {
         sellToken: { type: 'string', description: 'Contract address of the token to sell, or "native".' },
-        buyToken: { type: 'string', description: 'Contract address of the token to buy and send, or "native".' },
+        buyToken: { type: 'string', description: 'Contract address of the token to buy, or "native".' },
         sellAmount: { type: 'string', description: 'Human-readable amount to sell, e.g. "5" for 5 USDC.' },
-        chain: { type: 'string', enum: ['base', 'mainnet', 'polygon', 'arbitrum'], description: 'Chain for both the swap and the drop. Default base.' },
-        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Who receives the bought tokens, split evenly. Exclude the requester unless they asked to be included.' },
+        chain: { type: 'string', enum: ['base', 'mainnet', 'polygon', 'arbitrum'], description: 'Chain for every step. Default base.' },
+        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Optional. Who receives the bought tokens, split evenly. Omit to keep them in the Connect wallet. Exclude the requester unless they asked to be included.' },
+        source: { type: 'string', enum: ['connect', 'bankr'], description: 'Where the sell tokens come from. Default "connect". Use "bankr" only when the user says to use their Bankr funds.' },
         slippageBps: { type: 'number', description: 'Optional slippage tolerance in bps (default 500).' },
       },
-      required: ['sellToken', 'buyToken', 'sellAmount', 'recipients'],
+      required: ['sellToken', 'buyToken', 'sellAmount'],
     },
   },
   {
     name: 'bankr_agent',
-    description: 'Ask Bankr (bankr.bot), a crypto trading agent, to do something with the SENDER\'S OWN Bankr wallet: token prices and research, swaps/buys/sells, Bankr wallet balances, and transfers to wallet addresses, ENS names, or X/Farcaster/Telegram handles that already have a Bankr account. Write one clear natural-language instruction with exact amounts, tokens and chain (e.g. "buy $5 of HOME on Base", "what is my Bankr balance on Base"). Bankr can only pay people who are already Bankr users — to pay anyone else (email, Discord, GitHub, new Telegram users) use quidli_drop instead. Takes 5–30s. Never resubmit a request whose result says still_running.',
+    description: 'Ask Bankr (bankr.bot), a crypto trading agent, to do something with the SENDER\'S OWN Bankr wallet: token prices, research and contract addresses, Bankr wallet balances, and transfers to wallet addresses, ENS names, or X/Farcaster/Telegram handles that already have a Bankr account. Write one clear natural-language instruction with exact amounts, tokens and chain (e.g. "what is the contract address of HOME on Base", "what is my Bankr balance on Base"). NOT for swaps — use bankr_swap_and_drop. Bankr can only pay people who are already Bankr users — to pay anyone else (email, Discord, GitHub, new Telegram users) use quidli_drop instead. Takes 5–30s. Never resubmit a request whose result says still_running.',
     input_schema: {
       type: 'object',
       properties: {
