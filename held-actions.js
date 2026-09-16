@@ -204,7 +204,7 @@ function summarise({ tool, input }) {
 /**
  * @param outcome 'executed' | 'failed' | 'unknown' | 'cancelled'
  */
-export function formatOutcomeRecord(action, outcome, detail = '') {
+export function formatOutcomeRecord(action, outcome, detail = '', explorerUrl = null) {
   const what = summarise(action);
   const d = String(detail ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 200);
   const status = {
@@ -213,7 +213,8 @@ export function formatOutcomeRecord(action, outcome, detail = '') {
     unknown: `was confirmed but its OUTCOME IS UNKNOWN${d ? ` (${d})` : ''}. It may have gone through. Do not retry it; tell the user to check their balance first`,
     cancelled: 'was CANCELLED by the user. Nothing was sent',
   }[outcome];
-  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held transfer ${action.code} (${what}) ${status}.]`;
+  const link = explorerUrl ? ` Explorer link (verified): ${explorerUrl}` : '';
+  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held transfer ${action.code} (${what}) ${status}.${link}]`;
 }
 
 export function createRecordQueue({ maxPerContext = 10 } = {}) {
@@ -231,5 +232,27 @@ export function createRecordQueue({ maxPerContext = 10 } = {}) {
       q.delete(contextId);
       return list;
     },
+  };
+}
+
+// ─── Verified explorer links ─────────────────────────────────────────────────
+// sanitizeUnverifiedTxClaims() strips any explorer link that didn't come from a
+// real drop *in the current turn*. A drop run by !confirm happens between turns,
+// and a user may ask for an earlier link again — both real, both stripped, and
+// the warning ("may not have really happened") invites a duplicate send.
+// Only URLs from actual quidliDrop() results are ever added here, so this
+// widens what's trusted without letting a model's invented hash through.
+
+export function createVerifiedLinkStore({ maxPerContext = 20 } = {}) {
+  const links = new Map();
+  return {
+    add(contextId, url) {
+      if (!contextId || !url) return;
+      const list = (links.get(contextId) ?? []).filter((u) => u !== url);
+      list.push(url);
+      links.set(contextId, list.slice(-maxPerContext));
+    },
+    list(contextId) { return [...(links.get(contextId) ?? [])]; },
+    clear(contextId) { links.delete(contextId); },
   };
 }
