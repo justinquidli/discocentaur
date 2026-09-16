@@ -212,7 +212,7 @@ When the user wants to swap or buy a token and send the result to people ("swap 
 - Report the message field. status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
 
 ## Bankr (bankr_agent)
-- Key commands (!bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare !bankr in DM shows the user their link status.
+- Key commands (!bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation, and never suggest posting a key in a server channel — keys go in a DM to the bot only. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare !bankr in DM shows the user their link status.
 Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for trading and market actions: token prices and research, swaps/buys/sells, and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
 - Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
 - For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
@@ -354,7 +354,7 @@ try { db.exec(`ALTER TABLE channel_settings ADD COLUMN model TEXT`); } catch { /
 
 function getUserApiKey(discordId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE discord_id = ?').get(discordId);
-  if (!row) return null;
+  if (!row?.api_key) return null; // '' = row exists only for a Bankr key
   return decrypt(row.api_key);
 }
 
@@ -378,7 +378,9 @@ function getUserBankrKey(userId) {
 }
 
 function setUserBankrKey(userId, apiKey) {
-  db.prepare(`INSERT INTO user_keys (discord_id, bankr_api_key) VALUES (?, ?)
+  // api_key is NOT NULL with no default in this table, so a user who never ran
+  // !connect needs an explicit '' — otherwise the insert throws and the DM gets no reply.
+  db.prepare(`INSERT INTO user_keys (discord_id, api_key, bankr_api_key) VALUES (?, '', ?)
     ON CONFLICT(discord_id) DO UPDATE SET bankr_api_key = excluded.bankr_api_key`)
     .run(String(userId), encrypt(apiKey));
 }
