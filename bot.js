@@ -28,7 +28,7 @@ import {
 } from './documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
-  formatOutcomeRecord, createRecordQueue, neutraliseBotRecords,
+  formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -1250,6 +1250,8 @@ const tools = [
 const heldActions = createHeldActionStore();
 // Outcomes of !confirm / !cancel, delivered to the channel's next model turn.
 const heldOutcomeRecords = createRecordQueue();
+// Explorer links from real drops per conversation, so a later turn can repeat them.
+const verifiedTxLinks = createVerifiedLinkStore();
 
 // Tracks explorer URLs produced during a single handleMessage turn so they can
 // always be shown — even if the LLM forgets to include them in its response.
@@ -2195,6 +2197,7 @@ async function handleMessage(message) {
     geminiHistories.delete(contextId);
     openaiHistories.delete(contextId);
     documentTaint.clear(contextId);
+    verifiedTxLinks.clear(contextId);
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'hermes' ? NOUS_MODEL
@@ -2395,7 +2398,8 @@ async function handleMessage(message) {
 
     // Append any explorer URLs the LLM forgot to include
     let finalText = accumulated || '_(no response)_';
-    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingExplorerUrls);
+    finalText = sanitizeUnverifiedTxClaims(finalText, [..._pendingExplorerUrls, ...verifiedTxLinks.list(contextId)]);
+    for (const url of _pendingExplorerUrls) verifiedTxLinks.add(contextId, url);
     for (const url of _pendingExplorerUrls) {
       if (!finalText.includes(url)) {
         finalText += `\n🔗 ${url}`;
@@ -2648,8 +2652,9 @@ async function handleConfirmCommand(message, { verb, code }) {
   }
 
   const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash : !!result.success;
+  if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   heldOutcomeRecords.push(action.contextId, succeeded
-    ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''))
+    ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
   if (action.tool === 'quidli_drop') {

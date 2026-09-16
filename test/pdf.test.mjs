@@ -335,6 +335,7 @@ function buildConfirm(runToolImpl) {
   const deps = {
     heldActions: createHeldActionStore(),
     heldOutcomeRecords: createRecordQueue(),
+    verifiedTxLinks: createVerifiedLinkStore(),
     describeHeldAction, formatOutcomeRecord,
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
@@ -389,4 +390,61 @@ test('handleMessage gates on the taint flag, not only on history text', () => {
   assert.match(m[1], /documentTaint\.isTainted\(contextId\)/);
   assert.match(m[1], /historyHasDocument\(/);
   assert.match(SRC, /if \(docBlocks\.length\) documentTaint\.mark\(contextId\);\n\s*const documentInContext/, 'mark before the gate is computed');
+});
+
+// ─── real links from !confirm must survive the fabricated-link filter ────────
+
+import { createVerifiedLinkStore } from '../held-actions.js';
+
+const buildSanitize = () => {
+  const re = SRC.match(/^const EXPLORER_TX_RE = .*;$/m)[0];
+  const fn = SRC.match(/^function sanitizeUnverifiedTxClaims[\s\S]*?\n}$/m)[0];
+  return new Function(`${re}\n${fn}\nreturn sanitizeUnverifiedTxClaims;`)();
+};
+const REAL = 'https://basescan.org/tx/0x19a9d3ec5281fe69250be4dccf678e8d04f7c9cd985615d8a1448d087f0789ad';
+const FAKE = 'https://basescan.org/tx/0x' + 'ab'.repeat(32);
+
+test('a confirmed drop records its link, and the next turn may repeat it', async () => {
+  const { fn, deps, message } = buildConfirm(async () => JSON.stringify({ transferHash: REAL.split('/tx/')[1], explorerUrl: REAL }));
+  const { code } = deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: 'u1', channelId: 'c1', contextId: 'g-c1' });
+  await fn(message, { verb: 'confirm', code });
+
+  assert.deepEqual(deps.verifiedTxLinks.list('g-c1'), [REAL]);
+  assert.match(deps.heldOutcomeRecords.take('g-c1')[0], new RegExp(`Explorer link \\(verified\\): ${REAL}`));
+
+  // The follow-up turn from the bug report: no drop this turn, model repeats the link.
+  const sanitize = buildSanitize();
+  const reply = `Yes! 1.25 USDC was sent — [view on explorer](${REAL})`;
+  assert.equal(sanitize(reply, [...[], ...deps.verifiedTxLinks.list('g-c1')]), reply);
+  // Without the store (the old behaviour) it was stripped — the bug.
+  assert.match(sanitize(reply, []), /unverified transaction link removed/);
+});
+
+test('invented links are still stripped, and other channels do not inherit links', () => {
+  const store = createVerifiedLinkStore();
+  store.add('g-c1', REAL);
+  const sanitize = buildSanitize();
+  assert.match(sanitize(`sent: ${FAKE}`, store.list('g-c1')), /unverified transaction link removed/);
+  assert.match(sanitize(`sent: ${REAL}`, store.list('g-c2')), /unverified transaction link removed/);
+});
+
+test('failed or thrown confirms record no link', async () => {
+  const failing = buildConfirm(async () => JSON.stringify({ error: 'nope', explorerUrl: REAL }));
+  const f = failing.deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: 'u1', channelId: 'c1', contextId: 'x' });
+  await failing.fn(failing.message, { verb: 'confirm', code: f.code });
+  assert.deepEqual(failing.deps.verifiedTxLinks.list('x'), []);
+});
+
+test('link store is bounded, de-duplicated and clearable', () => {
+  const store = createVerifiedLinkStore({ maxPerContext: 2 });
+  store.add('a', 'u1'); store.add('a', 'u2'); store.add('a', 'u1'); store.add('a', 'u3'); store.add(null, 'x');
+  assert.deepEqual(store.list('a'), ['u1', 'u3']);
+  store.clear('a');
+  assert.deepEqual(store.list('a'), []);
+});
+
+test('handleMessage trusts stored links and stores this turn\'s real ones', () => {
+  assert.match(SRC, /sanitizeUnverifiedTxClaims\(finalText, \[\.\.\._pendingExplorerUrls, \.\.\.verifiedTxLinks\.list\(contextId\)\]\)/);
+  assert.match(SRC, /for \(const url of _pendingExplorerUrls\) verifiedTxLinks\.add\(contextId, url\);/);
+  assert.match(SRC, /documentTaint\.clear\(contextId\);\n\s*verifiedTxLinks\.clear\(contextId\);/);
 });
