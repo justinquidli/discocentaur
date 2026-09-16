@@ -5,6 +5,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to individuals or entire Discord roles via Quidli Smart Send
+- **Pay invoices from a PDF** — drop an invoice in chat; the bot reads it and prepares the payment to the vendor's email or social handle, held until you `!confirm` ([details](#pdf-attachments))
 - **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
