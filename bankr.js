@@ -196,7 +196,10 @@ async function bankrPortfolio(chain, apiKey, { fetchImpl, baseUrl }) {
 const errText = (r) => String(r.json?.error ?? r.json?.message ?? `HTTP ${r.status}`).slice(0, 300);
 
 /**
- * @param input { sellToken, buyToken, sellAmount, chain?, recipients?, source?: 'connect'|'bankr', slippageBps? }
+ * @param input { sellToken, buyToken, sellAmount, chain?, recipients?, amountPerRecipient?, sendAll?,
+ *                source?: 'connect'|'bankr', slippageBps? }
+ * With recipients, exactly one of amountPerRecipient (human units of buyToken)
+ * or sendAll:true is required — the tool never guesses how much to send.
  * @param deps  { bankrKey, getConnectBalance(chainId), drop({recipients, amountInWeiPerRecipient, chainId, tokenContract}),
  *                resolveRecipients(list), explorerUrl(chainId, hash), uuid(), minGas? }
  */
@@ -232,6 +235,15 @@ export async function bankrSwapAndDrop(input, deps, {
   if (sellNative === buyNative && (sellNative || input.sellToken.toLowerCase() === input.buyToken.toLowerCase())) return done('refused', 'sellToken and buyToken are the same.');
   if (!/^\d+(\.\d+)?$/.test(String(input.sellAmount ?? '')) || Number(input.sellAmount) <= 0) return done('refused', 'sellAmount must be a positive decimal number, e.g. "5".');
   const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+  const perHuman = input.amountPerRecipient == null || input.amountPerRecipient === '' ? null : String(input.amountPerRecipient);
+  const sendAll = input.sendAll === true;
+  if (recipients.length) {
+    if (perHuman !== null && sendAll) return done('refused', 'Pass either amountPerRecipient or sendAll, not both.');
+    if (perHuman === null && !sendAll) return done('refused', 'Say how much each recipient gets (amountPerRecipient), or set sendAll:true only if the user asked to send everything the swap returns.');
+    if (perHuman !== null && (!/^\d+(\.\d+)?$/.test(perHuman) || Number(perHuman) <= 0)) return done('refused', 'amountPerRecipient must be a positive decimal number, e.g. "500".');
+  } else if (perHuman !== null || sendAll) {
+    return done('refused', 'amountPerRecipient/sendAll need recipients.');
+  }
   if (!bankrKey) return done('refused', 'No Bankr key linked.');
   const sellToken = sellNative ? NATIVE_SENTINEL : input.sellToken;
   const buyToken = buyNative ? NATIVE_SENTINEL : input.buyToken;
@@ -294,6 +306,29 @@ export async function bankrSwapAndDrop(input, deps, {
   note('preflight', true, `Connect ${connectAddress}, Bankr ${bankrAddress}, Bankr gas ${formatUnits(bankrNative, 18)} ${nativeSym}`);
   const buyBefore = connectBalanceOf(cBal, buyToken);
 
+  // Fixed amount: make sure Connect balance + the swap's guaranteed minimum
+  // covers it BEFORE moving anything, so we never swap and then can't send.
+  const legs = { fromChain: chain, toChain: chain, fromToken: sellToken, toToken: buyToken, amount: String(input.sellAmount) };
+  const slip = input.slippageBps ? { slippageBps: input.slippageBps } : {};
+  let perRaw = null;
+  if (perHuman !== null) {
+    const pq = await bankrPost('/wallet/swap-quote', { ...legs, ...slip }, bankrKey, http).catch((err) => ({ ok: false, status: 0, json: { error: err.message } }));
+    if (!pq.ok || !pq.json?.minBuyAmount) return done('failed', `Bankr quote failed, nothing was moved: ${errText(pq)}`, { stage: 'quote' });
+    const d = Number(pq.json.to?.decimals);
+    if (!Number.isInteger(d)) return done('failed', 'Bankr quote did not report token decimals, nothing was moved.', { stage: 'quote' });
+    perRaw = parseUnits(perHuman, d);
+    const need = perRaw * BigInt(payees.length);
+    const minOut = parseUnits(pq.json.minBuyAmount, d);
+    const sym = pq.json.to?.symbol ?? 'tokens';
+    if (buyBefore + minOut < need) {
+      return done('refused',
+        `Not enough: sending ${perHuman} ${sym} to ${payees.length} recipient${payees.length === 1 ? '' : 's'} needs ${formatUnits(need, d)} ${sym}. ` +
+        `Your Connect wallet has ${formatUnits(buyBefore, d)} and swapping ${input.sellAmount} is only guaranteed to return ${formatUnits(minOut, d)}. ` +
+        'Swap more and ask again. Nothing was moved.', { stage: 'amount' });
+    }
+    note('amount_check', true, `need ${formatUnits(need, d)} ${sym}; have ${formatUnits(buyBefore, d)} + swap ≥${pq.json.minBuyAmount}`);
+  }
+
   // Where the sell funds are, for every message after step 2.
   let where = source === 'connect' ? 'in your Connect wallet' : 'in your Bankr wallet';
 
@@ -328,8 +363,6 @@ export async function bankrSwapAndDrop(input, deps, {
   }
 
   // ── 4. Quote + swap ──
-  const legs = { fromChain: chain, toChain: chain, fromToken: sellToken, toToken: buyToken, amount: String(input.sellAmount) };
-  const slip = input.slippageBps ? { slippageBps: input.slippageBps } : {};
   const q = await bankrPost('/wallet/swap-quote', { ...legs, ...slip }, bankrKey, http).catch((err) => ({ ok: false, status: 0, json: { error: err.message } }));
   if (!q.ok || !q.json?.minBuyAmount) return done(source === 'connect' ? 'partial' : 'failed', `Bankr quote failed, nothing was swapped: ${errText(q)}. The ${input.sellAmount} is ${where}.`, { stage: 'quote' });
   const quote = q.json;
@@ -406,8 +439,12 @@ export async function bankrSwapAndDrop(input, deps, {
   }
 
   // ── 7. Drop ──
-  const per = receivedRaw / BigInt(payees.length);
+  const per = perRaw ?? receivedRaw / BigInt(payees.length);
   if (per <= 0n) return done('partial', `${swapped}, but that's too little to split across ${payees.length} people. It's in your Connect wallet.`, { stage: 'drop' });
+  const total = per * BigInt(payees.length);
+  if (seen < total) {
+    return done('partial', `${swapped} and moved it to Connect, but your Connect wallet has ${formatUnits(seen, decimals)} ${symbol}, less than the ${formatUnits(total, decimals)} to send. Nothing was sent to recipients.`, { stage: 'drop', received: receivedHuman, symbol });
+  }
   let dropped;
   try {
     dropped = await drop({ recipients: payees, amountInWeiPerRecipient: per.toString(), chainId, tokenContract: buyNative ? null : buyToken });
@@ -419,7 +456,9 @@ export async function bankrSwapAndDrop(input, deps, {
   }
   if (dropped.explorerUrl) explorerUrls.push(dropped.explorerUrl);
   steps.push({ step: 'drop', ok: true, hash: dropped.transferHash, ...(dropped.explorerUrl ? { explorerUrl: dropped.explorerUrl } : {}) });
+  const left = seen - total;
   return done('completed',
-    `${swapped} and sent ${formatUnits(per, decimals)} ${symbol} each to ${payees.length} recipient${payees.length === 1 ? '' : 's'}.`,
-    { received: receivedHuman, perRecipient: formatUnits(per, decimals), symbol, dropResult: dropped });
+    `${swapped} and sent ${formatUnits(per, decimals)} ${symbol} each to ${payees.length} recipient${payees.length === 1 ? '' : 's'} ` +
+    `(${formatUnits(total, decimals)} total). About ${formatUnits(left, decimals)} ${symbol} is left in your Connect wallet.`,
+    { received: receivedHuman, perRecipient: formatUnits(per, decimals), totalSent: formatUnits(total, decimals), leftInConnect: formatUnits(left, decimals), symbol, dropResult: dropped });
 }

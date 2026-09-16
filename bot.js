@@ -204,11 +204,13 @@ Use connect_scores_batch when asked about trust, reputation, or scores. Pass the
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
 
 ## Swaps (bankr_swap_and_drop)
-Every swap, buy or sell goes through bankr_swap_and_drop — including "swap 5 USDC to HOME and send it to the group". By default it takes the sell tokens from the user's Connect wallet, swaps them in their Bankr wallet, and brings the result back to Connect. With recipients it then sends the result to them split evenly; without, the tokens wait in Connect for a later send.
+Every swap, buy or sell goes through bankr_swap_and_drop — including "swap 5 USDC to HOME and send it to the group". By default it takes the sell tokens from the user's Connect wallet, swaps them in their Bankr wallet, and brings the result back to Connect. With recipients it then sends them the amount asked for; without, the tokens wait in Connect for a later send.
 - Only use source="bankr" when the user says to use funds already in their Bankr wallet.
 - Resolve recipients first the usual way (discord_get_role_members or discord_search_messages for "everyone" — this tool takes an explicit recipients list, not presenceFilter), excluding the requester unless they asked to be included. Omit recipients when the user only asked to swap.
 - Tokens must be contract addresses on that chain, or "native". USDC on Base is 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913. For anything else ask bankr_agent for the contract address (e.g. "what is the contract address of HOME on Base"). If the symbol is ambiguous, ask the user — look-alike tokens exist.
-- If the user asks for a specific amount per person instead of "split it", work out the sell amount only from a price you just fetched; otherwise ask.
+- When the user names an amount to send ("send 500 DEGEN"), pass amountPerRecipient with that amount — also when the swap is only to top up a send that was short. Use sendAll only if they said to send all of what the swap returns. If the request doesn't say, ask.
+- Pick a sellAmount that covers the shortfall with some margin, using a price you just fetched. The tool refuses before moving anything if the swap can't cover the amount.
+- State amounts only from the result fields (received, perRecipient, totalSent, leftInConnect). Never compute or guess a leftover yourself; if you need a balance, call connect_drop_balance.
 - Needs both keys: Bankr (Agent API and Wallet API enabled) and Quidli.
 - If the result has stage "gas", tell the user plainly their Bankr wallet needs gas: how much to add, on which chain, and the address — all from the message. Nothing was moved; they can ask again once it's funded.
 - Report the message field. Status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
@@ -1290,7 +1292,7 @@ const tools = [
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
   {
     name: 'bankr_swap_and_drop',
-    description: 'Swap tokens for the user. Connect can\'t swap, so this sends the sell amount from the user\'s Connect wallet to their Bankr wallet, swaps there, sends everything the swap returned back to Connect, and then — if recipients are given — drops it to them split evenly. With no recipients the tokens stay in Connect, ready to send. Use it for EVERY swap/buy/sell request unless the user says to use funds already in Bankr (then source="bankr"). Runs every step itself and stops safely if one fails — never call bankr_agent or quidli_drop for the same request. Takes 1–3 minutes. Tokens must be contract addresses on that chain ("native" for ETH/POL); never guess one.',
+    description: 'Swap tokens for the user. Connect can\'t swap, so this sends the sell amount from the user\'s Connect wallet to their Bankr wallet, swaps there, sends everything the swap returned back to Connect, and then — if recipients are given — sends them exactly amountPerRecipient each (or everything the swap returned, only with sendAll). With no recipients the tokens stay in Connect, ready to send. Use it for EVERY swap/buy/sell request unless the user says to use funds already in Bankr (then source="bankr"). Runs every step itself and stops safely if one fails — never call bankr_agent or quidli_drop for the same request. Takes 1–3 minutes. Tokens must be contract addresses on that chain ("native" for ETH/POL); never guess one.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1298,7 +1300,9 @@ const tools = [
         buyToken: { type: 'string', description: 'Contract address of the token to buy, or "native".' },
         sellAmount: { type: 'string', description: 'Human-readable amount to sell, e.g. "5" for 5 USDC.' },
         chain: { type: 'string', enum: ['base', 'mainnet', 'polygon', 'arbitrum'], description: 'Chain for every step. Default base.' },
-        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Optional. Who receives the bought tokens, split evenly. Omit to keep them in the Connect wallet. Exclude the requester unless they asked to be included.' },
+        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Optional. Who receives the bought tokens. Omit to keep them in the Connect wallet. Exclude the requester unless they asked to be included.' },
+        amountPerRecipient: { type: 'string', description: 'Exact amount of buyToken each recipient gets, human-readable (e.g. "500"). Required with recipients unless sendAll is true. The Connect wallet\'s existing balance counts toward it; whatever is left stays in Connect.' },
+        sendAll: { type: 'boolean', description: 'Only when the user explicitly asked to send everything the swap returns, split evenly. Never use it to "top up" or "finish" a send of a specific amount.' },
         source: { type: 'string', enum: ['connect', 'bankr'], description: 'Where the sell tokens come from. Default "connect". Use "bankr" only when the user says to use their Bankr funds.' },
         slippageBps: { type: 'number', description: 'Optional slippage tolerance in bps (default 500).' },
       },

@@ -151,7 +151,9 @@ export function describeHeldAction({ code, tool, input }) {
       ? 'Uses funds already in your Bankr wallet; the result is sent to your Connect wallet.'
       : 'Moves the sell amount from your Connect wallet to your Bankr wallet, swaps, and sends the result back to Connect.');
     lines.push(recipients.length
-      ? `Then splits it evenly between ${recipients.length} recipient${recipients.length === 1 ? '' : 's'} → ${shownRecipients}`
+      ? (input.sendAll === true
+        ? `Then sends EVERYTHING the swap returns, split evenly between ${recipients.length} recipient${recipients.length === 1 ? '' : 's'} → ${shownRecipients}`
+        : `Then sends ${input.amountPerRecipient ?? '(no amount given — will be refused)'} each to ${recipients.length} recipient${recipients.length === 1 ? '' : 's'} → ${shownRecipients}`)
       : 'No recipients — the tokens stay in your Connect wallet.');
   } else if (tool === 'bankr_agent') {
     lines.push(`**Bankr agent** request (runs against your Bankr wallet — it may trade or transfer):`);
@@ -218,7 +220,7 @@ export function neutraliseBotRecords(text) {
 }
 
 function summarise({ tool, input }) {
-  if (tool === 'bankr_swap_and_drop') return `swap via Bankr of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} (source ${input.source ?? 'connect'}), then ${Array.isArray(input.recipients) && input.recipients.length ? `split to ${input.recipients.length} recipients` : 'kept in Connect'}`;
+  if (tool === 'bankr_swap_and_drop') return `swap via Bankr of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} (source ${input.source ?? 'connect'}), then ${Array.isArray(input.recipients) && input.recipients.length ? (input.sendAll === true ? `all of it split to ${input.recipients.length} recipients` : `${input.amountPerRecipient} each to ${input.recipients.length} recipients`) : 'kept in Connect'}`;
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;

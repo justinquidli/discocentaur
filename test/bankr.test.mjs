@@ -189,7 +189,7 @@ const clock = () => { let t = 0; return () => (t += 10_000); };
 
 test('Connect → Bankr → swap → Connect → recipients, amounts read back at each step', async () => {
   const { w, run, hit } = world({ lagBankr: 2 });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'completed', r.message);
   assert.equal(w.drops.length, 2);
   assert.deepEqual(w.drops[0], { recipients: [{ type: 'wallet', id: BANKR }], amountInWeiPerRecipient: '1000000', chainId: 8453, tokenContract: USDC });
@@ -215,7 +215,7 @@ test('no recipients: swap lands back in Connect and waits there', async () => {
 
 test('no gas in Bankr: stops before anything moves and says how much to add, and where', async () => {
   const { w, run, hit } = world({ bankr: { eth: '0' } });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'refused');
   assert.equal(r.stage, 'gas');
   assert.match(r.message, /Add at least 0\.00005 ETH on base to 0x64a59e25/);
@@ -272,7 +272,7 @@ test('funds never show up in Bankr → partial, never swaps', async () => {
 
 test('swap reverts after funding → partial, says the funds are in Bankr unswapped', async () => {
   const { run, hit } = world({ swap: [200, { success: false, hash: '0xrev' }] });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'partial');
   assert.match(r.message, /in your Bankr wallet \(not swapped\)/);
   assert.equal(hit(/transfer/).length, 0);
@@ -288,7 +288,7 @@ test('swap 504 → unknown, one attempt only', async () => {
 
 test('transfer back fails → partial, swapped tokens in Bankr, no send', async () => {
   const { w, run } = world({ transfer: [403, { error: 'recipient not allowed' }] });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'partial');
   assert.match(r.message, /recipient not allowed.*in your Bankr wallet/);
   assert.equal(w.drops.length, 1);
@@ -296,7 +296,7 @@ test('transfer back fails → partial, swapped tokens in Bankr, no send', async 
 
 test('Connect never shows the swapped tokens → partial, no send', async () => {
   const { w, run } = world({ freezeConnect: true });
-  const r = await run({ recipients: TWO }, { now: clock(), arrivalTimeoutMs: 30_000 });
+  const r = await run({ recipients: TWO, sendAll: true }, { now: clock(), arrivalTimeoutMs: 30_000 });
   assert.equal(r.status, 'partial');
   assert.equal(r.stage, 'connect_arrival');
   assert.equal(w.drops.length, 1);
@@ -304,21 +304,21 @@ test('Connect never shows the swapped tokens → partial, no send', async () => 
 
 test('final send throws → unknown', async () => {
   const { run } = world({ payDrop: () => { throw new Error('timeout'); } });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'unknown');
   assert.match(r.message, /check your Connect wallet/);
 });
 
 test('unresolvable recipient → refused before any call', async () => {
   const { w, run } = world({ resolveRecipients: async () => ({ error: 'Could not resolve a wallet for: telegram:a.', failed: ['telegram:a'] }) });
-  const r = await run({ recipients: TWO });
+  const r = await run({ recipients: TWO, sendAll: true });
   assert.equal(r.status, 'refused');
   assert.equal(w.calls.length + w.drops.length, 0);
 });
 
 test('source=bankr swaps what is already there, no funding drop', async () => {
   const { w, run } = world({ bankr: { usdc: '3' } });
-  const r = await run({ source: 'bankr', recipients: TWO });
+  const r = await run({ source: 'bankr', recipients: TWO, sendAll: true });
   assert.equal(r.status, 'completed', r.message);
   assert.equal(w.drops.length, 1);
   assert.notEqual(w.drops[0].recipients[0].id, BANKR);
@@ -334,6 +334,50 @@ test('source=bankr with too little in Bankr → refused before the swap', async 
 test('bad inputs refused before any call', async () => {
   const { w, run } = world();
   for (const bad of [{ buyToken: 'HOME' }, { sellAmount: '-1' }, { chain: 'solana' }, { buyToken: USDC }, { source: 'wallet' }]) {
+    const r = await run(bad);
+    assert.equal(r.status, 'refused', JSON.stringify(bad));
+  }
+  assert.equal(w.calls.length + w.drops.length, 0);
+});
+
+test('Guillaume case: "send 500 DEGEN", top up with a swap → sends exactly 500, keeps the rest', async () => {
+  const { w, run } = world({ connect: { home: 277n * 10n ** 18n } });
+  const r = await run({ recipients: [TWO[0]], amountPerRecipient: '500' });
+  assert.equal(r.status, 'completed', r.message);
+  assert.equal(w.drops.at(-1).amountInWeiPerRecipient, (500n * 10n ** 18n).toString());
+  assert.equal(w.connect.home, 277n * 10n ** 18n + RECEIVED - 500n * 10n ** 18n);
+  assert.equal(r.totalSent, '500');
+  assert.equal(r.leftInConnect, formatUnits(w.connect.home, 18));
+  assert.match(r.message, /sent 500 HOME each to 1 recipient \(500 total\)\. About 4389\.04665 HOME is left/);
+});
+
+test('fixed amount per recipient × 2', async () => {
+  const { w, run } = world();
+  const r = await run({ recipients: TWO, amountPerRecipient: '100.5' });
+  assert.equal(r.status, 'completed', r.message);
+  assert.equal(w.drops.at(-1).amountInWeiPerRecipient, (1005n * 10n ** 17n).toString());
+  assert.equal(r.totalSent, '201');
+});
+
+test('fixed amount the swap cannot cover → refused before anything moves', async () => {
+  const { w, run, hit } = world({ connect: { home: 277n * 10n ** 18n } });
+  const r = await run({ recipients: TWO, amountPerRecipient: '2500' }); // needs 5000; 277 + ≥4000 = 4277
+  assert.equal(r.status, 'refused');
+  assert.equal(r.stage, 'amount');
+  assert.match(r.message, /needs 5000 HOME.*has 277 .*only guaranteed to return 4000/);
+  assert.equal(w.drops.length, 0);
+  assert.equal(hit(/\/wallet\/swap$|transfer/).length, 0);
+});
+
+test('existing balance counts toward a fixed amount', async () => {
+  const { run } = world({ connect: { home: 1000n * 10n ** 18n } });
+  const r = await run({ recipients: TWO, amountPerRecipient: '2500' }); // 1000 + ≥4000 ≥ 5000
+  assert.equal(r.status, 'completed', r.message);
+});
+
+test('recipients without an amount or sendAll → refused, nothing called', async () => {
+  const { w, run } = world();
+  for (const bad of [{ recipients: TWO }, { recipients: TWO, amountPerRecipient: '1', sendAll: true }, { amountPerRecipient: '1' }, { sendAll: true }, { recipients: TWO, amountPerRecipient: 'lots' }]) {
     const r = await run(bad);
     assert.equal(r.status, 'refused', JSON.stringify(bad));
   }
