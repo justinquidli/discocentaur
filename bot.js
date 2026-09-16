@@ -30,7 +30,7 @@ import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
-import { bankrAgent, createBankrThreads } from './bankr.js';
+import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -202,11 +202,19 @@ Use connect_scores_batch when asked about trust, reputation, or scores. Pass the
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
 
+## Swap then send (bankr_swap_and_drop)
+When the user wants to swap or buy a token and send the result to people ("swap 5 USDC to HOME and send it to the group"), use bankr_swap_and_drop. It swaps in their Bankr wallet, moves the proceeds to their Connect wallet, and drops them split evenly — one call, no other tools for the transfer steps.
+- First resolve recipients the usual way (discord_get_role_members or discord_search_messages for "everyone" — this tool takes an explicit recipients list, not presenceFilter), excluding the requester unless they asked to be included.
+- Tokens must be contract addresses on that chain, or "native". USDC on Base is 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913. For anything else ask bankr_agent for the contract address (e.g. "what is the contract address of HOME on Base"). If the symbol is ambiguous, ask the user — look-alike tokens exist.
+- If the user asks for a specific amount per person instead of "split it", work out the sell amount only if you can do it from a price you just fetched; otherwise ask.
+- Needs both keys: Bankr (with Wallet API enabled) and Quidli.
+- Report the message field. status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
+
 ## Bankr (bankr_agent)
 Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for trading and market actions: token prices and research, swaps/buys/sells, and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
 - Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
 - For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
-- A combined flow is fine: e.g. buy a token with Bankr, then distribute with quidli_drop — but Bankr's purchase lands in the Bankr wallet, not the Connect wallet, so the drop needs funds already in Connect unless the user first sends them from Bankr to their Connect Smart Send address (connect_me shows it).
+- To swap and then send the result to people, use bankr_swap_and_drop instead of chaining tools yourself.
 - One clear instruction per call with explicit amounts, token and chain. Bankr has a $0.05 minimum transfer.
 - If the result status is still_running, the job may still execute: say so and do NOT call bankr_agent again for the same thing.
 - Only report a Bankr transaction as done if the result status is completed. Show explorer links only from explorerUrls.
@@ -1275,6 +1283,22 @@ const tools = [
   // NOTE: reputation scores are no longer defined here — they come from Connect's
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
   {
+    name: 'bankr_swap_and_drop',
+    description: 'Swap one token for another in the sender\'s Bankr wallet, move everything the swap returned into their Quidli Connect wallet, then drop it split evenly to the recipients. Use this whenever the user wants to swap/buy a token and send it to people (e.g. "swap 5 USDC to HOME and send it to the group"). Runs every step itself and stops safely if one fails — do not call bankr_agent or quidli_drop for the same request. Takes 30–120s. Tokens must be contract addresses on that chain ("native" for ETH); never guess one.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sellToken: { type: 'string', description: 'Contract address of the token to sell, or "native".' },
+        buyToken: { type: 'string', description: 'Contract address of the token to buy and send, or "native".' },
+        sellAmount: { type: 'string', description: 'Human-readable amount to sell, e.g. "5" for 5 USDC.' },
+        chain: { type: 'string', enum: ['base', 'mainnet', 'polygon', 'arbitrum'], description: 'Chain for both the swap and the drop. Default base.' },
+        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'Who receives the bought tokens, split evenly. Exclude the requester unless they asked to be included.' },
+        slippageBps: { type: 'number', description: 'Optional slippage tolerance in bps (default 500).' },
+      },
+      required: ['sellToken', 'buyToken', 'sellAmount', 'recipients'],
+    },
+  },
+  {
     name: 'bankr_agent',
     description: 'Ask Bankr (bankr.bot), a crypto trading agent, to do something with the SENDER\'S OWN Bankr wallet: token prices and research, swaps/buys/sells, Bankr wallet balances, and transfers to wallet addresses, ENS names, or X/Farcaster/Telegram handles that already have a Bankr account. Write one clear natural-language instruction with exact amounts, tokens and chain (e.g. "buy $5 of HOME on Base", "what is my Bankr balance on Base"). Bankr can only pay people who are already Bankr users — to pay anyone else (email, Discord, GitHub, new Telegram users) use quidli_drop instead. Takes 5–30s. Never resubmit a request whose result says still_running.',
     input_schema: {
@@ -1347,7 +1371,9 @@ async function runTool(name, input, {
   // moving anything, and holding a transfer that can't run helps nobody.
   if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId) : !!senderApiKey;
+    const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
+      : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
+      : !!senderApiKey;
     if (hasKey || isOwner) {
       const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
@@ -1375,6 +1401,26 @@ async function runTool(name, input, {
       throw err;
     }
   }
+  if (name === 'bankr_swap_and_drop') {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    const bankrKey = getUserBankrKey(senderId) || (isOwner ? BANKR_API_KEY : null);
+    const quidliKey = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!bankrKey) return JSON.stringify({ status: 'refused', executed: false, message: 'No Bankr key linked. Tell the user to DM me `!bankr <key>` (key needs Wallet API enabled, Read Only off).' });
+    if (!quidliKey) return JSON.stringify({ status: 'refused', executed: false, message: 'No Quidli key linked. Tell the user to DM me `!connect <key>`.' });
+    const rl = bankrRateCheck(String(senderId));
+    if (rl) return JSON.stringify({ status: 'refused', executed: false, message: rl });
+    console.log(`[bankr→connect] start sender=${senderId}`, JSON.stringify(input).slice(0, 200));
+    const result = await bankrSwapAndDrop(input, {
+      bankrKey,
+      getConnectBalance: async (chainId) => JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, quidliKey)),
+      drop: (args) => quidliDrop(args, quidliKey),
+      explorerUrl: explorerTxUrl,
+    });
+    for (const url of result.explorerUrls ?? []) _pendingExplorerUrls.push(url);
+    console.log(`[bankr→connect] ${result.status} stage=${result.stage ?? '-'} sender=${senderId}`, JSON.stringify(result.steps));
+    return JSON.stringify(result, null, 2);
+  }
+
   if (name === 'bankr_agent') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const key = getUserBankrKey(senderId) || (isOwner ? BANKR_API_KEY : null);
@@ -2755,17 +2801,22 @@ async function handleConfirmCommand(message, { verb, code }) {
   }
 
   const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash
-    : action.tool === 'bankr_agent' ? result.status === 'completed'
+    : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
     : !!result.success;
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
-  if (action.tool === 'bankr_agent' && result.status === 'still_running') {
-    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', `Bankr job ${result.jobId} still running`));
+  if (action.tool === 'bankr_swap_and_drop') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
+  if ((action.tool === 'bankr_agent' && result.status === 'still_running') || (action.tool === 'bankr_swap_and_drop' && ['partial', 'unknown'].includes(result.status))) {
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', result.message ?? `Bankr job ${result.jobId} still running`));
   } else heldOutcomeRecords.push(action.contextId, succeeded
     ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
-  if (action.tool === 'bankr_agent') {
+  if (action.tool === 'bankr_swap_and_drop') {
+    const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
+    const icon = { completed: '✅', partial: '⚠️', unknown: '⚠️' }[result.status] ?? '❌';
+    await say(`${icon} \`${action.code}\`: ${String(result.message ?? raw).slice(0, 1200)}${links}`);
+  } else if (action.tool === 'bankr_agent') {
     const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
     await say(result.status === 'completed'
       ? `✅ Bankr (${action.code}): ${String(result.response ?? 'done').slice(0, 1500)}${links}`
