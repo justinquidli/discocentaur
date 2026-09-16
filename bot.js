@@ -22,6 +22,12 @@ import {
   Partials,
   Events,
 } from 'discord.js';
+import {
+  isPdfAttachment, fetchPdf, extractPdfText, hasNoTextLayer, formatDocumentBlock, historyHasDocument,
+} from './documents.js';
+import {
+  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+} from './held-actions.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1238,6 +1244,9 @@ const tools = [
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
 ];
 
+// Transfers parked while a document is in context. See held-actions.js.
+const heldActions = createHeldActionStore();
+
 // Tracks explorer URLs produced during a single handleMessage turn so they can
 // always be shown — even if the LLM forgets to include them in its response.
 const _pendingExplorerUrls = [];
@@ -1262,8 +1271,25 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
   });
 }
 
-async function runTool(name, input, { senderId, botId, senderApiKey, senderUser, currentChannelId } = {}) {
+async function runTool(name, input, {
+  senderId, botId, senderApiKey, senderUser, currentChannelId,
+  documentInContext = false, confirmed = false, heldNotices = null,
+} = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+  // ── Held-transfer gate ───────────────────────────────────────────────────────
+  // With a document in context, money-committing calls are parked, not run.
+  // A sender with no usable key falls through: those branches refuse without
+  // moving anything, and holding a transfer that can't run helps nobody.
+  if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (senderApiKey || isOwner) {
+      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId });
+      if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+      console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
+      return heldToolResult(held.code);
+    }
+  }
   // Tools discovered from Connect's MCP server. Called with the sender's own key
   // — the host key is only used for the owner, same rule as the REST tools. A
   // sender with no key still gets a call: the public tools answer anonymously
@@ -1595,6 +1621,7 @@ const anthropicHistories = new Map(); // { role: 'user'|'assistant', content: st
 const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[]
 const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
 const MAX_HISTORY = 40;
+const MAX_PDFS_PER_MESSAGE = 3;
 
 // Hard bound on tool round-trips per user message. Without this the provider loops
 // are `while (true)` and a model that keeps emitting tool calls never terminates —
@@ -2081,6 +2108,20 @@ async function handleMessage(message) {
   // Replace @role mentions with "roleName (Role ID: 123456)"
   // Strip the bot's own mention
   const botId = message.client.user.id;
+  // PDFs on this message, or — if none — on the message it replies to, so
+  // "@bot summarise this" as a reply to someone's upload works.
+  let pdfSource = message;
+  let pdfAttachments = [...(message.attachments?.values() ?? [])].filter(isPdfAttachment);
+  if (pdfAttachments.length === 0 && message.reference?.messageId) {
+    const ref = await message.fetchReference().catch(() => null);
+    const refPdfs = [...(ref?.attachments?.values() ?? [])].filter(isPdfAttachment);
+    if (refPdfs.length) { pdfSource = ref; pdfAttachments = refPdfs; }
+  }
+  if (pdfAttachments.length > MAX_PDFS_PER_MESSAGE) {
+    await message.reply(`📄 I can read up to ${MAX_PDFS_PER_MESSAGE} PDFs per message — send the rest separately.`).catch(() => {});
+    return;
+  }
+
   let text = message.content
     .replace(/<@!?(\d+)>/g, (match, userId) => {
       if (userId === botId) return '';
@@ -2095,10 +2136,12 @@ async function handleMessage(message) {
     })
     .trim();
 
-  if (!text) {
+  if (!text && pdfAttachments.length === 0) {
     await message.reply('What can I help you with?').catch(() => {});
     return;
   }
+  // A bare upload (just a mention, or a DM with only the file) means "read this".
+  if (!text) text = 'Summarise the attached document and tell me what, if anything, it asks me to do.';
 
   const contextId = message.channel.isThread?.()
     ? message.channelId
@@ -2154,7 +2197,14 @@ async function handleMessage(message) {
 
   const provider = getChannelProvider(contextId);
 
-  const replyMsg = await message.reply('_Thinking…_').catch((err) => {
+  // Minds is a text relay to a separate runtime — it gets no tools and no
+  // history here, so there's nowhere safe to put a document.
+  if (pdfAttachments.length && provider === 'minds') {
+    await message.reply('📄 PDFs aren\'t supported in Minds mode yet. Say "switch to claude" (or another provider) and send it again.').catch(() => {});
+    return;
+  }
+
+  const replyMsg = await message.reply(pdfAttachments.length ? '_Reading document…_' : '_Thinking…_').catch((err) => {
     console.error('[discord] reply failed:', err.message);
     return null;
   });
@@ -2172,7 +2222,35 @@ async function handleMessage(message) {
       : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
-  const contextualText = `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`;
+  // ── Documents ────────────────────────────────────────────────────────────────
+  const docBlocks = [];
+  for (const att of pdfAttachments) {
+    try {
+      const bytes = await fetchPdf(att);
+      const doc = await extractPdfText(bytes);
+      if (hasNoTextLayer(doc.text)) {
+        await editor.finalize(`📄 **${att.name}** has no readable text — it looks like a scan or an image-only PDF. Send a text-based PDF, or paste the relevant part.`);
+        return;
+      }
+      const uploader = pdfSource.member?.displayName ?? pdfSource.author.username;
+      docBlocks.push(formatDocumentBlock({ name: att.name, uploaderName: uploader, uploaderId: pdfSource.author.id, ...doc }));
+      console.log(`[pdf] ${att.name} pages=${doc.pagesRead}/${doc.totalPages} chars=${doc.text.length} truncated=${doc.truncated} ctx=${contextId}`);
+    } catch (err) {
+      console.error(`[pdf] ${att.name} failed:`, err.message);
+      await editor.finalize(`📄 ${err.message}`);
+      return;
+    }
+  }
+
+  const contextualText = `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`
+    + (docBlocks.length ? `\n\n${docBlocks.join('\n\n')}` : '');
+
+  // The gate is per channel, not per uploader: another member's PDF earlier in
+  // this history can steer this user's turn just as well as their own.
+  const documentInContext = docBlocks.length > 0 || historyHasDocument(
+    anthropicHistories.get(contextId), geminiHistories.get(contextId), openaiHistories.get(contextId),
+  );
+  const heldNotices = [];
 
   const toolCtx = {
     senderId: message.author.id,
@@ -2180,6 +2258,8 @@ async function handleMessage(message) {
     senderApiKey,
     senderUser: message.author,
     currentChannelId: message.channelId,
+    documentInContext,
+    heldNotices,
   };
 
   let accumulated = '';
@@ -2306,6 +2386,10 @@ async function handleMessage(message) {
       }
     }
     _pendingExplorerUrls.length = 0;
+
+    // Built from the held arguments, not the model's prose — this is what runs.
+    for (const notice of heldNotices) finalText += `\n\n${notice}`;
+    if (documentInContext && heldNotices.length === 0) finalText += '\n-# 📄 document in context — transfers need `!confirm`';
 
     finalText += `\n-# ${modelLabel}`;
     await editor.finalize(finalText);
@@ -2479,7 +2563,9 @@ async function handleDM(message) {
       '`!llm-remove` — remove your LLM key\n' +
       '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
       '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
-      '`!minds-remove` — remove your Minds credentials\n\n' +
+      '`!minds-remove` — remove your Minds credentials\n' +
+      '`!confirm <code>` / `!cancel <code>` — run or drop a transfer held for confirmation (`!confirm` alone lists them)\n\n' +
+      '📄 Attach a PDF (up to 3, 10 MB each, text-based) and I\'ll read it. While a document is in the conversation, any transfer I start waits for your `!confirm`.\n\n' +
       'Get a Quidli API key at https://connect.quid.li'
     );
     return;
@@ -2487,6 +2573,68 @@ async function handleDM(message) {
 
   // Anything else in a DM: full agent conversation, same as in a server channel
   await handleMessage(message);
+}
+
+// ─── Held-transfer confirmation ───────────────────────────────────────────────
+
+async function handleConfirmCommand(message, { verb, code }) {
+  const senderId = message.author.id;
+  if (!code) {
+    const mine = heldActions.listFor(senderId);
+    await message.reply(mine.length
+      ? `Your transfers waiting for confirmation:\n\n${mine.map(describeHeldAction).join('\n\n')}`
+      : 'You have no transfers waiting for confirmation.').catch(() => {});
+    return;
+  }
+
+  const taken = heldActions.take(code, senderId);
+  if (taken.error) {
+    await message.reply(`⚠️ ${taken.error}`).catch(() => {});
+    return;
+  }
+  const { action } = taken;
+  if (verb === 'cancel') {
+    console.log(`[held] cancelled code=${action.code} sender=${senderId}`);
+    await message.reply(`🗑️ Cancelled \`${action.code}\` — nothing was sent.`).catch(() => {});
+    return;
+  }
+
+  console.log(`[held] confirmed code=${action.code} tool=${action.tool} sender=${senderId}`);
+  const pending = await message.reply(`⏳ Running \`${action.code}\`…`).catch(() => null);
+  const say = (t) => (pending ? pending.edit(t) : message.reply(t)).catch(() => {});
+  let raw;
+  try {
+    // Key is looked up now, not at hold time: a !revoke in between must stick.
+    raw = await runTool(action.tool, action.input, {
+      senderId,
+      botId: message.client.user.id,
+      senderApiKey: getUserApiKey(senderId),
+      senderUser: message.author,
+      currentChannelId: action.channelId,
+      confirmed: true,
+    });
+  } catch (err) {
+    console.error(`[held] ${action.code} failed:`, err.message);
+    await say(`❌ \`${action.code}\` failed: ${err.message.slice(0, 300)}`);
+    return;
+  }
+  let result;
+  try { result = JSON.parse(raw); } catch { result = {}; }
+  // runTool records drop links for the in-flight LLM turn; this isn't one.
+  if (result.explorerUrl) {
+    const i = _pendingExplorerUrls.indexOf(result.explorerUrl);
+    if (i !== -1) _pendingExplorerUrls.splice(i, 1);
+  }
+
+  if (action.tool === 'quidli_drop') {
+    await say(result.transferHash
+      ? `✅ Sent (\`${action.code}\`).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: \`${result.transferHash}\``}`
+      : `❌ \`${action.code}\` did not go through: ${String(result.error ?? result.message ?? raw).slice(0, 300)}`);
+  } else if (result.success) {
+    await say(`✅ \`${action.code}\`: ${result.message ?? 'done'}${result.jobId ? ` (job \`${result.jobId}\`)` : ''}${result.watcherId ? ` (watcher \`${result.watcherId}\`)` : ''}`);
+  } else {
+    await say(`❌ \`${action.code}\` did not go through: ${String(result.error ?? raw).slice(0, 300)}`);
+  }
 }
 
 // ─── Channel watchers ─────────────────────────────────────────────────────────
@@ -2577,6 +2725,13 @@ client.once(Events.ClientReady, (c) => {
 
 client.on(Events.MessageCreate, (message) => {
   if (message.author.bot) return;
+  // !confirm / !cancel work in DMs and in any channel, mention or not. Codes
+  // are bound to the requesting user, so nobody else can fire one.
+  const confirmCmd = parseConfirmCommand(message.content);
+  if (confirmCmd) {
+    handleConfirmCommand(message, confirmCmd).catch((err) => console.error('[held] unhandled error:', err));
+    return;
+  }
   // DMs: handle !connect / !revoke commands
   if (!message.guild) {
     handleDM(message).catch((err) => console.error('[dm] unhandled error:', err));
