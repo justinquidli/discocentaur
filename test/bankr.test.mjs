@@ -190,6 +190,24 @@ test('bad inputs are refused before any request', async () => {
   assert.equal(h.f.calls.length, 0);
 });
 
+test('unresolvable recipient stops before any Bankr call', async () => {
+  const h = harness({ balances: ['0'] });
+  h.deps.resolveRecipients = async () => ({ error: 'Could not resolve a wallet for: telegram:3.', failed: ['telegram:3'] });
+  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
+  assert.equal(r.status, 'refused');
+  assert.equal(h.f.calls.length, 0);
+  assert.equal(h.drops.length, 0);
+});
+
+test('drop receives the resolved wallets, not the social handles', async () => {
+  const W = '0x503a04D04E00d9b0C0898e2D7A16B857BE6cdAF0';
+  const h = harness({ balances: ['0', '46120466500000000000000'] });
+  h.deps.resolveRecipients = async (list) => ({ recipients: list.map(() => ({ type: 'wallet', id: W })) });
+  const r = await bankrSwapAndDrop(input, h.deps, { fetchImpl: h.f, wait: noWait });
+  assert.equal(r.status, 'completed', r.message);
+  assert.deepEqual(h.drops[0].recipients[0], { type: 'wallet', id: W });
+});
+
 test('native buy uses the sentinel for Bankr and null for Connect', async () => {
   const h = harness({ balances: ['0', '5'], swap: () => ({ body: { success: true, hash: '0xs', amountReceivedRaw: '6' } }) });
   h.deps.getConnectBalance = (() => { let n = 0; return async () => ({ walletAddress: CONNECT, assets: n++ ? [{ type: 'native', balanceInWei: '6' }] : [] }); })();

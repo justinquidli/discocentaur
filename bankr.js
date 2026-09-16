@@ -164,7 +164,7 @@ export async function bankrSwapAndDrop(input, deps, {
   fetchImpl = fetch, baseUrl = BANKR_BASE_URL, pollMs = 4000, arrivalTimeoutMs = 120_000,
   now = () => Date.now(), wait = sleep,
 } = {}) {
-  const { bankrKey, getConnectBalance, drop, explorerUrl = () => null, uuid = () => crypto.randomUUID() } = deps;
+  const { bankrKey, getConnectBalance, drop, resolveRecipients = async (r) => ({ recipients: r }), explorerUrl = () => null, uuid = () => crypto.randomUUID() } = deps;
   const chain = String(input.chain ?? 'base').toLowerCase();
   const chainId = BANKR_CHAINS[chain];
   const steps = [];
@@ -189,6 +189,17 @@ export async function bankrSwapAndDrop(input, deps, {
   const sellToken = sellNative ? NATIVE_SENTINEL : input.sellToken;
   const buyToken = buyNative ? NATIVE_SENTINEL : input.buyToken;
   const http = { fetchImpl, baseUrl, timeoutMs: 30_000 };
+
+  // ── 0. Recipients → wallets, before any money moves ──
+  let payees;
+  try {
+    const res = await resolveRecipients(recipients);
+    if (res.error) return done('refused', `${res.error} Nothing was swapped.`, { stage: 'recipients', failedRecipients: res.failed });
+    payees = res.recipients;
+  } catch (err) {
+    return done('failed', `Could not resolve recipients, nothing was swapped: ${err.message}`, { stage: 'recipients' });
+  }
+  note('recipients_resolved', true, `${payees.length} wallet${payees.length === 1 ? '' : 's'}`);
 
   // ── 1. Connect destination ──
   let before, connectAddress;
@@ -267,11 +278,11 @@ export async function bankrSwapAndDrop(input, deps, {
   note('arrived_in_connect', true);
 
   // ── 5. Drop ──
-  const per = receivedRaw / BigInt(recipients.length);
-  if (per <= 0n) return done('partial', `${receivedHuman} ${symbol} is too little to split across ${recipients.length} people. It's in the Connect wallet.`, { stage: 'drop' });
+  const per = receivedRaw / BigInt(payees.length);
+  if (per <= 0n) return done('partial', `${receivedHuman} ${symbol} is too little to split across ${payees.length} people. It's in the Connect wallet.`, { stage: 'drop' });
   let dropped;
   try {
-    dropped = await drop({ recipients, amountInWeiPerRecipient: per.toString(), chainId, tokenContract: buyNative ? null : buyToken });
+    dropped = await drop({ recipients: payees, amountInWeiPerRecipient: per.toString(), chainId, tokenContract: buyNative ? null : buyToken });
   } catch (err) {
     return done('partial', `Swap and transfer done; the drop failed (${err.message.slice(0, 200)}). ${receivedHuman} ${symbol} is in the Connect wallet. Check before retrying — a timed-out drop may still land.`, { stage: 'drop' });
   }
@@ -281,6 +292,6 @@ export async function bankrSwapAndDrop(input, deps, {
   if (dropped.explorerUrl) explorerUrls.push(dropped.explorerUrl);
   steps.push({ step: 'drop', ok: true, hash: dropped.transferHash, ...(dropped.explorerUrl ? { explorerUrl: dropped.explorerUrl } : {}) });
   return done('completed',
-    `Swapped ${input.sellAmount} ${quote.from?.symbol ?? ''} for ${receivedHuman} ${symbol} in Bankr, moved it to Connect, and sent ${formatUnits(per, decimals)} ${symbol} each to ${recipients.length} recipient${recipients.length === 1 ? '' : 's'}.`.replace(/\s+/g, ' '),
+    `Swapped ${input.sellAmount} ${quote.from?.symbol ?? ''} for ${receivedHuman} ${symbol} in Bankr, moved it to Connect, and sent ${formatUnits(per, decimals)} ${symbol} each to ${payees.length} recipient${payees.length === 1 ? '' : 's'}.`.replace(/\s+/g, ' '),
     { received: receivedHuman, perRecipient: formatUnits(per, decimals), symbol, dropResult: dropped });
 }
