@@ -423,3 +423,15 @@ request, or switch providers — nothing after the cap was executed.
 **Conditional drop fires at wrong time:** Make sure `BRAVE_SEARCH_API_KEY` is set — without it the bot can't look up event schedules and will guess the check time.
 
 **Gemini not calling tools:** This is a known limitation of Gemini Flash/Pro for multi-step tool use. Switch back to Claude for any action that involves drops, lookups, or scheduling.
+
+
+## Bankr agent
+
+The bot can hand trading and market requests to [Bankr](https://bankr.bot) through the `bankr_agent` tool (Bankr Agent API, `bankr.js`).
+
+- Each user links their own key: DM `!bankr <key>` (create it at bankr.bot/api with Agent API on, Read Only off). `!bankr-remove` unlinks. Keys are stored encrypted like Quidli keys.
+- The owner can set `BANKR_API_KEY` in `.env` as a host key; only `BOT_OWNER_ID` uses it.
+- Paying people still goes through Quidli Connect by default — Bankr can only pay existing Bankr users.
+- `bankr_swap_and_drop` chains the two: swap in the Bankr wallet (Wallet API, not the chat agent), transfer exactly the received amount to the user's Connect Smart Send wallet, wait until Connect's balance shows it, then drop it split evenly. It needs both keys, and the Bankr key needs **Wallet API enabled**. Any failed or uncertain step stops the chain and reports where the funds are; nothing is retried automatically.
+- `bankr_agent` is a money tool: held for confirm while a document is in context, capped at 8 calls per user per 10 min, and a job still running after 2 min is reported as "may still execute", never resubmitted.
+- Explorer links are shown only when Bankr's own response contained them.
