@@ -212,6 +212,7 @@ When the user wants to swap or buy a token and send the result to people ("swap 
 - Report the message field. status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
 
 ## Bankr (bankr_agent)
+- Key commands (!bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare !bankr in DM shows the user their link status.
 Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for trading and market actions: token prices and research, swaps/buys/sells, and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
 - Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
 - For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
@@ -2591,16 +2592,22 @@ async function handleDM(message) {
     return;
   }
 
-  if (content === '!bankr' || content.startsWith('!bankr ')) {
-    const apiKey = content.slice('!bankr'.length).trim();
+  // Tolerant match: "!bankr KEY", "!bankr: KEY", "!Bankr\nKEY". Anything
+  // starting with !bankr is handled here and never reaches the model.
+  const bankrCmd = content.match(/^!bankr(?![-\w])[\s:=]*([\s\S]*)$/i);
+  if (bankrCmd) {
+    const apiKey = bankrCmd[1].trim().split(/\s+/)[0].replace(/^[`<'"]+|[`>'"]+$/g, '');
     if (!apiKey) {
-      await message.reply('Usage: `!bankr <your-bankr-api-key>` — create one at https://bankr.bot/api with Agent API enabled and Read Only off.');
+      const linked = !!getUserBankrKey(message.author.id);
+      await message.reply((linked ? '✅ Your Bankr key is linked.' : 'No Bankr key linked yet.')
+        + '\nTo set or replace it: `!bankr <your-bankr-api-key>` (create one at https://bankr.bot/api — Agent API and Wallet API on, Read Only off).');
       return;
     }
     setUserBankrKey(message.author.id, apiKey);
+    console.log(`[bankr] key linked for ${message.author.id}`);
     await message.reply(
       '✅ Bankr linked. I can now trade and check balances on your Bankr wallet when you ask.\n\n' +
-      '⚠️ This key controls your Bankr wallet — keep only what you\'re comfortable with there. DM `!bankr-remove` anytime to unlink.'
+      '⚠️ This key controls your Bankr wallet — keep only what you\'re comfortable with there. DM `!bankr-remove` anytime to unlink, or `!bankr` to check status.'
     );
     return;
   }
@@ -2939,7 +2946,7 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
   // A Bankr key posted in a server channel must never reach the model or history.
-  if (/^(<@!?\d+>\s*)?!bankr\s+\S/.test(message.content.trim())) {
+  if (/^(<@!?\d+>\s*)?!bankr(?![-\w])[\s:=]*\S/i.test(message.content.trim())) {
     const deleted = await message.delete().then(() => true).catch(() => false);
     await message.channel.send(`<@${message.author.id}> never post a Bankr key in a channel — DM me \`!bankr <key>\` instead.${deleted ? ' (Deleted your message.)' : ' I could not delete it — delete it yourself and rotate the key.'}`).catch(() => {});
     return;
