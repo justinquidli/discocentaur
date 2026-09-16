@@ -111,9 +111,14 @@ export function formatAmount(amountInWei, tokenContract, chainId = 8453) {
   return `${BigInt(whole).toLocaleString('en-US')}${frac ? '.' + frac : ''} ${tok.symbol}`;
 }
 
+// Email and phone identifiers are the address itself — "email arnaud@x.com",
+// not "email id arnaud@x.com".
+const ADDRESS_TYPES = new Set(['email', 'phone']);
+
 function describeRecipient(r) {
   if (!r || typeof r !== 'object') return '(invalid recipient)';
   if (r.type === 'discord' && r.id) return `<@${r.id}>`;
+  if (ADDRESS_TYPES.has(r.type) && (r.id || r.username)) return `${r.type} ${r.id ?? r.username}`;
   const who = r.username ? `@${r.username}` : r.id ? `id ${r.id}` : '(no id)';
   return `${r.type ?? '?'} ${who}`;
 }
@@ -173,8 +178,15 @@ export function heldToolResult(code) {
   });
 }
 
-export function parseConfirmCommand(content) {
-  const m = String(content ?? '').trim().match(/^!(confirm|cancel)(?:\s+([A-Za-z0-9]{6}))?\s*$/i);
+/**
+ * Also accepts the command after a leading mention of the bot
+ * ("@DiscoCentaur !confirm CODE") when botId is given. Any other leading
+ * mention, or text before the command, is not a command.
+ */
+export function parseConfirmCommand(content, botId = null) {
+  let text = String(content ?? '').trim();
+  if (botId) text = text.replace(new RegExp(`^<@!?${botId}>\\s*`), '');
+  const m = text.match(/^!(confirm|cancel)(?:\s+([A-Za-z0-9]{6}))?\s*$/i);
   if (!m) return null;
   return { verb: m[1].toLowerCase(), code: m[2]?.toUpperCase() ?? null };
 }

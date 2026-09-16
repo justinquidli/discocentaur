@@ -2604,7 +2604,7 @@ async function handleConfirmCommand(message, { verb, code }) {
     const mine = heldActions.listFor(senderId);
     await message.reply(mine.length
       ? `Your transfers waiting for confirmation:\n\n${mine.map(describeHeldAction).join('\n\n')}`
-      : 'You have no transfers waiting for confirmation.').catch(() => {});
+      : 'Nothing is waiting for your confirmation. Ask me to pay or send something — while a document is in the conversation, I\'ll post a code for you to `!confirm`.').catch(() => {});
     return;
   }
 
@@ -2758,7 +2758,7 @@ client.on(Events.MessageCreate, (message) => {
   if (message.author.bot) return;
   // !confirm / !cancel work in DMs and in any channel, mention or not. Codes
   // are bound to the requesting user, so nobody else can fire one.
-  const confirmCmd = parseConfirmCommand(message.content);
+  const confirmCmd = parseConfirmCommand(message.content, message.client.user?.id);
   if (confirmCmd) {
     handleConfirmCommand(message, confirmCmd).catch((err) => console.error('[held] unhandled error:', err));
     return;

@@ -448,3 +448,28 @@ test('handleMessage trusts stored links and stores this turn\'s real ones', () =
   assert.match(SRC, /for \(const url of _pendingExplorerUrls\) verifiedTxLinks\.add\(contextId, url\);/);
   assert.match(SRC, /documentTaint\.clear\(contextId\);\n\s*verifiedTxLinks\.clear\(contextId\);/);
 });
+
+// ─── confirm UX ──────────────────────────────────────────────────────────────
+
+test('email and phone recipients show the address, not "id"', () => {
+  const t = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'email', id: 'arnaud@girosense.com' }, { type: 'discord', id: '111' }] } });
+  assert.match(t, /→ email arnaud@girosense\.com, <@111>/);
+  assert.doesNotMatch(t, /email id/);
+});
+
+test('"@DiscoCentaur !confirm CODE" is a command; other mentions are not', () => {
+  const BOT = '555';
+  assert.deepEqual(parseConfirmCommand('<@555> !confirm abc234', BOT), { verb: 'confirm', code: 'ABC234' });
+  assert.deepEqual(parseConfirmCommand('<@!555>   !cancel ABC234', BOT), { verb: 'cancel', code: 'ABC234' });
+  assert.deepEqual(parseConfirmCommand('<@555> !confirm', BOT), { verb: 'confirm', code: null });
+  assert.equal(parseConfirmCommand('<@777> !confirm ABC234', BOT), null, 'someone else\'s mention');
+  assert.equal(parseConfirmCommand('<@555> please !confirm ABC234', BOT), null);
+  assert.equal(parseConfirmCommand('<@555> !confirm ABC234', null), null, 'no bot id, no stripping');
+  assert.match(SRC, /parseConfirmCommand\(message\.content, message\.client\.user\?\.id\)/);
+});
+
+test('bare !confirm with nothing held explains how to get a code', async () => {
+  const { fn, message, replies } = buildConfirm(async () => '{}');
+  await fn(message, { verb: 'confirm', code: null });
+  assert.match(replies.at(-1), /Nothing is waiting.*!confirm/);
+});
