@@ -260,7 +260,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const branches = [...runToolSrc.matchAll(/if \(name === '([a-z_]+)'\) \{([\s\S]*?)\n  \}/g)];
   assert.ok(branches.length > 5, 'branch parser still matches runTool');
   const spending = branches
-    .filter(([, , body]) => /quidliDrop\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
+    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
   assert.deepEqual(spending.sort(), [...MONEY_TOOLS].sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
