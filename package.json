@@ -8,6 +8,7 @@
     "start": "node bot.js",
     "dev": "node --watch bot.js",
     "test": "node --test",
+    "sync-shared": "node scripts/sync-shared.mjs",
     "check": "node --check bot.js && node --test"
   },
   "dependencies": {
