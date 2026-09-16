@@ -17,9 +17,9 @@ export const PDF_MAX_PAGES = 50;
 // out, so this is a cost bound as much as a context bound (~12k tokens).
 export const PDF_MAX_CHARS = 48_000;
 
-// Every document block starts with this marker. Its presence anywhere in a
-// channel's history is what puts that channel into held-transfer mode — so the
-// gate lifts exactly when the document leaves the model's context, no timers.
+// Every document block starts with this marker. Its presence in a channel's
+// history is one of two signals for held-transfer mode; the other is
+// createDocumentTaint() below, which outlasts the text itself.
 export const DOC_MARKER = '[ATTACHED DOCUMENT';
 
 export function isPdfAttachment(att) {
@@ -92,6 +92,7 @@ export function hasNoTextLayer(text) {
 export function formatDocumentBlock({ name, uploaderName, uploaderId, text, totalPages, pagesRead, truncated }) {
   // Neutralise anything in the document that would look like our own framing.
   const neutralise = (s) => String(s)
+    .replaceAll('[Bot record', '[bot-record')
     .replaceAll(DOC_MARKER, '[attached-document')
     .replaceAll('[END DOCUMENT', '[end-document');
   const safe = neutralise(text);
@@ -130,4 +131,32 @@ export function historyHasDocument(...histories) {
     }
   }
   return false;
+}
+
+/**
+ * Per-channel "a document was here" flag, independent of the history text.
+ *
+ * historyHasDocument() alone isn't enough: the model's own replies can restate
+ * a document ("it says to pay @x 500 USDC") and those replies outlive the
+ * document in the rolling history. So the gate stays on for `turns` turns after
+ * the most recent upload — with a 40-message (20-turn) history, 40 turns means
+ * every reply that could have seen the document has also aged out.
+ *
+ * clear() is only for when the history itself is wiped (provider switch).
+ */
+export function createDocumentTaint({ turns }) {
+  const remaining = new Map();
+  return {
+    mark(contextId) { remaining.set(contextId, turns); },
+    isTainted(contextId) { return (remaining.get(contextId) ?? 0) > 0; },
+    /** Call once per completed model turn in this context. */
+    tick(contextId) {
+      const n = remaining.get(contextId);
+      if (n === undefined) return;
+      if (n <= 1) remaining.delete(contextId);
+      else remaining.set(contextId, n - 1);
+    },
+    clear(contextId) { remaining.delete(contextId); },
+    remaining(contextId) { return remaining.get(contextId) ?? 0; },
+  };
 }

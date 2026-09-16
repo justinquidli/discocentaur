@@ -24,9 +24,11 @@ import {
 } from 'discord.js';
 import {
   isPdfAttachment, fetchPdf, extractPdfText, hasNoTextLayer, formatDocumentBlock, historyHasDocument,
+  createDocumentTaint,
 } from './documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+  formatOutcomeRecord, createRecordQueue, neutraliseBotRecords,
 } from './held-actions.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -1246,6 +1248,8 @@ const tools = [
 
 // Transfers parked while a document is in context. See held-actions.js.
 const heldActions = createHeldActionStore();
+// Outcomes of !confirm / !cancel, delivered to the channel's next model turn.
+const heldOutcomeRecords = createRecordQueue();
 
 // Tracks explorer URLs produced during a single handleMessage turn so they can
 // always be shown — even if the LLM forgets to include them in its response.
@@ -1272,7 +1276,7 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, currentChannelId,
+  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
@@ -1283,7 +1287,7 @@ async function runTool(name, input, {
   if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     if (senderApiKey || isOwner) {
-      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId });
+      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
       console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
       heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
@@ -1622,6 +1626,10 @@ const geminiHistories    = new Map(); // { role: 'user'|'model', parts: [...] }[
 const openaiHistories    = new Map(); // { role: 'user'|'assistant', content: string }[]
 const MAX_HISTORY = 40;
 const MAX_PDFS_PER_MESSAGE = 3;
+// Held-transfer mode lasts this many turns after the latest upload. History
+// keeps MAX_HISTORY messages = MAX_HISTORY/2 turns, so this covers the document
+// aging out AND every reply written while it was visible aging out after it.
+const documentTaint = createDocumentTaint({ turns: MAX_HISTORY });
 
 // Hard bound on tool round-trips per user message. Without this the provider loops
 // are `while (true)` and a model that keeps emitting tool calls never terminates —
@@ -2186,6 +2194,7 @@ async function handleMessage(message) {
     anthropicHistories.delete(contextId);
     geminiHistories.delete(contextId);
     openaiHistories.delete(contextId);
+    documentTaint.clear(contextId);
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'hermes' ? NOUS_MODEL
@@ -2242,12 +2251,18 @@ async function handleMessage(message) {
     }
   }
 
-  const contextualText = `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${text}`
+  // Results of !confirm / !cancel since the last turn. Minds turns are relayed
+  // as plain text to another runtime, so records wait for a non-Minds turn.
+  const outcomeRecords = provider === 'minds' ? [] : heldOutcomeRecords.take(contextId);
+  const contextualText =
+    (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '') +
+    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${neutraliseBotRecords(text)}`
     + (docBlocks.length ? `\n\n${docBlocks.join('\n\n')}` : '');
 
   // The gate is per channel, not per uploader: another member's PDF earlier in
   // this history can steer this user's turn just as well as their own.
-  const documentInContext = docBlocks.length > 0 || historyHasDocument(
+  if (docBlocks.length) documentTaint.mark(contextId);
+  const documentInContext = documentTaint.isTainted(contextId) || historyHasDocument(
     anthropicHistories.get(contextId), geminiHistories.get(contextId), openaiHistories.get(contextId),
   );
   const heldNotices = [];
@@ -2258,6 +2273,7 @@ async function handleMessage(message) {
     senderApiKey,
     senderUser: message.author,
     currentChannelId: message.channelId,
+    contextId,
     documentInContext,
     heldNotices,
   };
@@ -2393,6 +2409,7 @@ async function handleMessage(message) {
 
     finalText += `\n-# ${modelLabel}`;
     await editor.finalize(finalText);
+    documentTaint.tick(contextId);
 
   } catch (err) {
     console.error(`[${provider}] error:`, err);
@@ -2595,6 +2612,7 @@ async function handleConfirmCommand(message, { verb, code }) {
   const { action } = taken;
   if (verb === 'cancel') {
     console.log(`[held] cancelled code=${action.code} sender=${senderId}`);
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'cancelled'));
     await message.reply(`🗑️ Cancelled \`${action.code}\` — nothing was sent.`).catch(() => {});
     return;
   }
@@ -2615,6 +2633,9 @@ async function handleConfirmCommand(message, { verb, code }) {
     });
   } catch (err) {
     console.error(`[held] ${action.code} failed:`, err.message);
+    // A thrown drop may still have landed server-side (e.g. timeout after
+    // submit), so tell the model it is unknown rather than that nothing moved.
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', err.message));
     await say(`❌ \`${action.code}\` failed: ${err.message.slice(0, 300)}`);
     return;
   }
@@ -2625,6 +2646,11 @@ async function handleConfirmCommand(message, { verb, code }) {
     const i = _pendingExplorerUrls.indexOf(result.explorerUrl);
     if (i !== -1) _pendingExplorerUrls.splice(i, 1);
   }
+
+  const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash : !!result.success;
+  heldOutcomeRecords.push(action.contextId, succeeded
+    ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''))
+    : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
   if (action.tool === 'quidli_drop') {
     await say(result.transferHash

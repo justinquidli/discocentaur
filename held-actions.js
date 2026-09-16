@@ -63,7 +63,7 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
 
   return {
     /** @returns {{ code: string } | { error: string }} */
-    hold({ tool, input, senderId, channelId }) {
+    hold({ tool, input, senderId, channelId, contextId = null }) {
       sweep();
       const mine = [...held.values()].filter((a) => a.senderId === senderId).length;
       if (mine >= maxPerUser) {
@@ -72,7 +72,7 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
       const code = newCode();
       // Deep copy: what gets confirmed is exactly what was shown, whatever
       // happens to the model's argument object afterwards.
-      held.set(code, { code, tool, input: structuredClone(input), senderId, channelId, createdAt: now() });
+      held.set(code, { code, tool, input: structuredClone(input), senderId, channelId, contextId, createdAt: now() });
       return { code };
     },
 
@@ -177,4 +177,59 @@ export function parseConfirmCommand(content) {
   const m = String(content ?? '').trim().match(/^!(confirm|cancel)(?:\s+([A-Za-z0-9]{6}))?\s*$/i);
   if (!m) return null;
   return { verb: m[1].toLowerCase(), code: m[2]?.toUpperCase() ?? null };
+}
+
+// ─── Outcome records ─────────────────────────────────────────────────────────
+// !confirm runs outside any model turn, so without this the model never learns
+// a transfer went out — and "did that go through?" can produce a second send.
+// Records are queued per channel and prepended to that channel's next turn.
+
+export const BOT_RECORD_MARKER = '[Bot record';
+
+/** Stop user or document text from impersonating a record. */
+export function neutraliseBotRecords(text) {
+  return String(text ?? '').replaceAll(BOT_RECORD_MARKER, '[bot-record');
+}
+
+function summarise({ tool, input }) {
+  const chainId = input.chainId ?? 8453;
+  const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
+  const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
+  const n = Array.isArray(input.recipients) ? input.recipients.length : 0;
+  const kind = { quidli_drop: 'send', schedule_drop: 'scheduled send', conditional_drop: 'conditional send', create_watcher: 'watcher' }[tool] ?? tool;
+  const who = n ? `to ${n} recipient${n === 1 ? '' : 's'} (${input.recipients.slice(0, 5).map((r) => `${r.type}:${r.id ?? r.username}`).join(', ')}${n > 5 ? ', …' : ''})` : '';
+  return `${kind} of ${amount} each ${who} on ${chain}`.replace(/\s+/g, ' ');
+}
+
+/**
+ * @param outcome 'executed' | 'failed' | 'unknown' | 'cancelled'
+ */
+export function formatOutcomeRecord(action, outcome, detail = '') {
+  const what = summarise(action);
+  const d = String(detail ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 200);
+  const status = {
+    executed: `was CONFIRMED by the user and has ALREADY RUN${d ? ` (${d})` : ''}. Do not issue it again unless the user explicitly asks for another one`,
+    failed: `was confirmed but FAILED${d ? ` (${d})` : ''}. No transfer was recorded`,
+    unknown: `was confirmed but its OUTCOME IS UNKNOWN${d ? ` (${d})` : ''}. It may have gone through. Do not retry it; tell the user to check their balance first`,
+    cancelled: 'was CANCELLED by the user. Nothing was sent',
+  }[outcome];
+  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held transfer ${action.code} (${what}) ${status}.]`;
+}
+
+export function createRecordQueue({ maxPerContext = 10 } = {}) {
+  const q = new Map();
+  return {
+    push(contextId, record) {
+      if (!contextId) return;
+      const list = q.get(contextId) ?? [];
+      list.push(record);
+      q.set(contextId, list.slice(-maxPerContext));
+    },
+    /** Returns and clears. */
+    take(contextId) {
+      const list = q.get(contextId) ?? [];
+      q.delete(contextId);
+      return list;
+    },
+  };
 }

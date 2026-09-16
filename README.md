@@ -379,7 +379,7 @@ Attach a PDF (or reply to a message that has one) and mention the bot — it rea
 - Text extraction only (`unpdf`). Scanned / image-only PDFs are refused with a message, not guessed at. Password-protected PDFs are refused.
 - The text goes into the channel's conversation history, so follow-ups ("now pay line 3") work until it ages out of the 40-message window or the provider is switched.
 
-**Transfers are held while a document is in context.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So while any document is in a channel's history — anyone's, not just yours — `quidli_drop`, `schedule_drop`, `conditional_drop` and `create_watcher` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
+**Transfers are held while a document is in context.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads a document to a channel — long enough for both the document and every reply that quoted it to leave the 40-message history — `quidli_drop`, `schedule_drop`, `conditional_drop` and `create_watcher` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
 
 ```
 !confirm K7QM2P   — run it
@@ -387,7 +387,7 @@ Attach a PDF (or reply to a message that has one) and mention the bot — it rea
 !confirm          — list your held transfers
 ```
 
-Codes are one-shot, bound to the user who made the request, expire after 10 minutes, and live in memory (a restart clears them — re-ask). This is enforced in `runTool`, not the prompt. Logic lives in `documents.js` and `held-actions.js`; tests in `test/pdf.test.mjs`, including one that fails if a new money-moving tool is added without being gated.
+Codes are one-shot, bound to the user who made the request, expire after 10 minutes, and live in memory (a restart clears them — re-ask). The result of each `!confirm` / `!cancel` (sent, failed, unknown, cancelled) is passed to the model on the channel's next turn, so "did that go through?" gets a real answer instead of a second send. Switching provider wipes the history and ends held-transfer mode with it; so does a restart (the flag is in memory). This is enforced in `runTool`, not the prompt. Logic lives in `documents.js` and `held-actions.js`; tests in `test/pdf.test.mjs`, including one that fails if a new money-moving tool is added without being gated.
 
 ## Tool-loop safety
 
