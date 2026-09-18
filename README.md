@@ -5,6 +5,8 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to individuals or entire Discord roles via Quidli Smart Send
+- **Swap, then send** — "swap 5 USDC to DEGEN and send 500 to @alice": the bot moves the sell amount from your Connect wallet to your [Bankr](https://bankr.bot) wallet, swaps, brings the result back, and sends the exact amount you asked for ([details](#bankr--swaps-and-market-data))
+- **Market questions** — token prices, contract addresses and your Bankr wallet balance, via Bankr
 - **Pay invoices from a PDF** — drop an invoice in chat; the bot reads it and prepares the payment to the vendor's email or social handle, held until you `!confirm` ([details](#pdf-attachments))
 - **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
@@ -88,6 +90,7 @@ cp .env.example .env
 | `QUIDLI_API_KEY` | ✅ | API key from [connect.quid.li](https://connect.quid.li) |
 | `MASTER_ENCRYPTION_KEY` | ✅ | 64 hex chars (32 bytes) — encrypts stored user API keys. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `BOT_OWNER_ID` | ✅* | Your Discord user ID. Grants you the host Quidli wallet without `!connect`, **and** is the only account that can use the host's LLM keys by default. Leave it unset and nobody can — every user must bring their own key. |
+| `BANKR_API_KEY` | — | Your own [Bankr](https://bankr.bot/api) key, used only by `BOT_OWNER_ID`. Everyone else links their own with `!bankr <key>`. Needed for swaps and market questions; the bot runs without it, minus those ([details](#bankr--swaps-and-market-data)) |
 | `BRAVE_SEARCH_API_KEY` | — | From [brave.com/search/api](https://brave.com/search/api) — required for web search and conditional drops |
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
 | `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `hermes` |
@@ -146,6 +149,9 @@ Users can link their own Quidli account so drops use their Smart Send wallet:
 ```
 DM @DiscoCentaur: !connect <your-api-key>
 DM @DiscoCentaur: !revoke
+DM @DiscoCentaur: !bankr <your-bankr-key>   — link your Bankr wallet (swaps, prices)
+DM @DiscoCentaur: !bankr                    — check whether a Bankr key is linked
+DM @DiscoCentaur: !bankr-remove
 ```
 
 Get a key at [connect.quid.li](https://connect.quid.li). Keys are stored encrypted with AES-256-GCM.
@@ -425,14 +431,31 @@ request, or switch providers — nothing after the cap was executed.
 **Gemini not calling tools:** This is a known limitation of Gemini Flash/Pro for multi-step tool use. Switch back to Claude for any action that involves drops, lookups, or scheduling.
 
 
-## Bankr agent
+## How recipients are resolved
 
-The bot can hand trading and market requests to [Bankr](https://bankr.bot) through the `bankr_agent` tool (Bankr Agent API, `bankr.js`).
+Every drop resolves its recipients to wallet addresses first (`recipients.js`), then sends to
+those addresses. Connect's `/drop` currently rejects social recipients outright
+(`recipients.0.property type should not exist`), even though `connect_lookup` accepts the same
+shape — observed 2026-09-15 and again in both bots' logs on 2026-09-16.
 
-- Each user links their own key: DM `!bankr <key>` (create it at bankr.bot/api with Agent API on, Read Only off). `!bankr-remove` unlinks. Keys are stored encrypted like Quidli keys.
+Resolution is all-or-nothing: if any recipient can't be resolved, **nothing** is sent and the
+bot names who failed, rather than paying some of the list. Looking up a recipient who has no
+wallet provisions one for them, which is what lets the bots pay people who have never used
+crypto. This applies to every drop — direct, scheduled, conditional, watchers and claim links.
+
+## Bankr — swaps and market data
+
+Connect has no swap of its own, so swaps run in the user's [Bankr](https://bankr.bot) wallet
+and the proceeds come back to Connect. Bankr is reached over its HTTP API from `bankr.js`; no
+Bankr SDK or package is installed. Two tools: `bankr_swap_and_drop` (the swap flow, on Bankr's
+Wallet API) and `bankr_agent` (prices, contract addresses, Bankr balance, on Bankr's Agent API).
+
+Without a linked key, both tools refuse and nothing else about the bot changes.
+
+- Each user links their own key: DM `!bankr <key>` (`!bankr` alone reports whether one is linked) (create it at bankr.bot/api with Agent API on, Read Only off). `!bankr-remove` unlinks. Keys are stored encrypted like Quidli keys.
 - The owner can set `BANKR_API_KEY` in `.env` as a host key; only `BOT_OWNER_ID` uses it.
 - Paying people still goes through Quidli Connect by default — Bankr can only pay existing Bankr users.
-- `bankr_swap_and_drop` handles every swap. By default it sends the sell amount from the user's Connect Smart Send wallet to their Bankr wallet, swaps there (Wallet API, not the chat agent), sends exactly the received amount back to Connect, then optionally sends recipients an exact `amountPerRecipient` (existing Connect balance counts; the rest stays in Connect) — or everything, only with an explicit `sendAll`. A fixed amount the swap can't cover is refused before anything moves. `source: "bankr"` swaps funds already in Bankr. It stops before moving anything if the Bankr wallet has no gas (`MIN_BANKR_GAS` in `bankr.js`) and tells the user how much to add. Needs both keys; the Bankr key needs **Wallet API enabled**. Any failed or uncertain step stops the chain and reports where the funds are; nothing is retried automatically.
+- `bankr_swap_and_drop` handles every swap. By default it sends the sell amount from the user's Connect Smart Send wallet to their Bankr wallet, swaps there (Wallet API, not the chat agent), sends exactly the received amount back to Connect, then optionally sends recipients an exact `amountPerRecipient` (existing Connect balance counts; the rest stays in Connect) — or everything, only with an explicit `sendAll`. A fixed amount the swap can't cover is refused before anything moves. `source: "bankr"` swaps funds already in Bankr. It stops before moving anything if the Bankr wallet has no gas (`MIN_BANKR_GAS` in `bankr.js`) and tells the user how much to add. Needs both keys (`!connect` for Quidli, `!bankr` for Bankr); the Bankr key needs **Wallet API enabled**. Any failed or uncertain step stops the chain and reports where the funds are; nothing is retried automatically.
 - `bankr_agent` is a money tool: held for confirm while a document is in context, capped at 8 calls per user per 10 min, and a job still running after 2 min is reported as "may still execute", never resubmitted.
 - Explorer links are shown only when Bankr's own response contained them.
 
