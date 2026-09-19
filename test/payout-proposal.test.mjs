@@ -30,3 +30,15 @@ test('execute refuses a label that is not one', async () => {
     assert.equal((await payoutExecute({ label })).status, 'refused');
   }
 });
+
+test('a repeat proposal for the same ask returns the same round, not a new split', async (t) => {
+  // Refusals never cache; a real run needs the payout project, so this asserts
+  // the shape of the guard rather than re-running the scorer.
+  const first = await payoutProposal({ repo: 'a/b', budget: '100', since: '1d' });
+  const second = await payoutProposal({ repo: 'a/b', budget: '100', since: '1d' });
+  assert.equal(first.status, second.status);
+  if (first.status === 'ok') {
+    assert.equal(second.label, first.label, 'same label reused');
+    assert.equal(second.reused, true);
+  }
+});

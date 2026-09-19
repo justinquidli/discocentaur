@@ -64,6 +64,12 @@ function trim(out) {
   return cleaned.length > MAX_CHARS ? cleaned.slice(0, MAX_CHARS) + '\n… (truncated)' : cleaned;
 }
 
+// A model that asks for the same proposal twice gets the same answer. Scoring
+// is not deterministic, so without this a second call returns a DIFFERENT split
+// and the user ends up confirming numbers they never read.
+const recent = new Map();
+const RECENT_TTL_MS = Number(process.env.PAYOUT_REPROPOSE_TTL_MS ?? 15 * 60 * 1000);
+
 export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'USDC', budget }) {
   const repo = normaliseRepo(rawRepo);
   if (!REPO.test(repo)) return { status: 'refused', error: `could not read a repo out of "${String(rawRepo ?? '').slice(0, 80)}" — paste its GitHub URL, or give owner/name` };
@@ -71,6 +77,12 @@ export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'US
   if (!TOKEN.test(token)) return { status: 'refused', error: 'token must be a symbol or a 0x address' };
   if (!/^\d+(\.\d+)?$/.test(String(budget ?? ''))) return { status: 'refused', error: 'budget must be a number' };
   if (!existsSync(resolve(DIR, 'payout.js'))) return { status: 'refused', error: `contributor-payout not found at ${DIR}` };
+
+  const key = `${repo}|${since}|${token}|${budget}`;
+  const seen = recent.get(key);
+  if (seen && Date.now() - seen.at < RECENT_TTL_MS && existsSync(roundPath(seen.label))) {
+    return { ...seen.result, reused: true };
+  }
 
   // The label ties this proposal to a file on disk, so the split that gets
   // executed later is the one people actually read here — not a second,
@@ -91,7 +103,9 @@ export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'US
     return { status: 'error', executed: false, error: reason || `exited ${code}` };
   }
   const wrote = existsSync(roundPath(label));
-  return { status: 'ok', executed: false, label: wrote ? label : null, proposal: trim(out) };
+  const result = { status: 'ok', executed: false, label: wrote ? label : null, proposal: trim(out) };
+  if (wrote) recent.set(key, { label, result, at: Date.now() });
+  return result;
 }
 
 /**

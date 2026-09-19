@@ -1323,7 +1323,7 @@ const tools = [
   },
   {
     name: 'payout_proposal',
-    description: 'Propose how to split a reward budget among the contributors of a GitHub repo, based on their MERGED pull requests. Read-only: it scores the work and returns a table of who earned what share and why. It NEVER sends anything and cannot move money — say so if asked to pay. Open PRs are not counted; merging is what makes work eligible. Takes 60-120 seconds.',
+    description: 'Propose how to split a reward budget among the contributors of a GitHub repo, based on their MERGED pull requests. Read-only: it scores the work and returns a table of who earned what share and why, plus a round LABEL. It NEVER sends anything and cannot move money. Open PRs are not counted; merging is what makes work eligible. Takes 60-120 seconds. Call this AT MOST ONCE per request: if you already have a label from this conversation, reuse it — calling again produces a DIFFERENT split and the user would be approving numbers they never read.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1337,7 +1337,7 @@ const tools = [
   },
   {
     name: 'payout_execute',
-    description: 'Pay a payout round that payout_proposal already produced, identified by its round label. Sends real tokens to real contributors from the agent wallet. Every amount comes from the saved round, not from the conversation — you cannot change who is paid or how much. It is always held for the user to confirm with a code; never claim it was sent.',
+    description: 'Pay a payout round that payout_proposal already produced, identified by its round label. Sends real tokens to real contributors from the agent wallet. Every amount comes from the saved round, not from the conversation — you cannot change who is paid or how much. Use the label you already have; never call payout_proposal again first. Do NOT ask the user whether to go ahead: this tool is always held and the bot posts the split with a confirm code, so asking first makes them approve twice. Call it directly when the user wants the contributors paid, and never claim it was sent.',
     input_schema: {
       type: 'object',
       properties: {
