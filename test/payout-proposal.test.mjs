@@ -55,3 +55,12 @@ test('windows the user spelled in words are accepted', () => {
   assert.equal(groundCheck({ repo: 'a/skills', budget: '10', since: '7d' }, 'pay skills 10 for the last week'), null);
   assert.equal(groundCheck({ repo: 'a/skills', budget: '10', since: '48h' }, 'skills, 10, last 48 hours'), null);
 });
+
+test('a run that broadcasts nothing is never reported as paid', async (t) => {
+  // payout.js exits 0 when the rails reject a plan and when nothing is owed,
+  // so the exit code cannot be the success signal.
+  const { execSync } = await import('node:child_process');
+  const src = execSync('cat payout-proposal.js', { encoding: 'utf8' });
+  assert.match(src, /Exit 0 does NOT mean paid/);
+  assert.match(src, /const sent = \/\^Sent\\\.\$\/m\.test\(out\) && hashes\.length > 0;/);
+});

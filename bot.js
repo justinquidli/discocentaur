@@ -2901,7 +2901,7 @@ async function handleConfirmCommand(message, { verb, code }) {
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
   if (action.tool === 'payout') {
-    const icon = { ok: '✅', unknown: '⚠️' }[result.status] ?? '❌';
+    const icon = { ok: '✅', unknown: '⚠️', not_paid: '⚠️' }[result.status] ?? '❌';
     const detail = result.status === 'ok' ? result.output : (result.error ?? result.output ?? 'no detail');
     await say(`${icon} \`${action.code}\` round \`${result.label ?? action.input?.label ?? '?'}\`:\n\`\`\`\n${String(detail).slice(0, 1500)}\n\`\`\``);
   } else if (action.tool === 'bankr_swap_and_drop') {

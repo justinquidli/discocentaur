@@ -136,12 +136,29 @@ export async function payoutExecute({ label }) {
     '--execute', '--yes', '--comment',
   ], EXEC_TIMEOUT_MS);
 
-  const tail = (out + err).split('\n').filter(Boolean).slice(-12).join('\n').slice(0, 1200);
+  const all = (out + err).split('\n').filter(Boolean);
+  // Keep the END of the output: the tx hashes are the last thing printed, and
+  // truncating from the start threw away the only part that proves anything.
+  const tail = all.slice(-14).join('\n').slice(-1400);
+
   if (signal === 'SIGKILL') {
     return { status: 'unknown', error: `timed out after ${EXEC_TIMEOUT_MS / 1000}s — check ledger.json and Basescan before re-running`, output: tail };
   }
   if (code !== 0) return { status: 'failed', executed: false, error: tail || `exited ${code}` };
-  return { status: 'ok', executed: true, label, output: tail };
+
+  // Exit 0 does NOT mean paid. payout.js exits 0 when the rails reject a plan
+  // and when there is nothing to pay, so success is proven by transactions in
+  // the output, never by the exit code.
+  const hashes = [...(out + err).matchAll(/0x[0-9a-fA-F]{64}/g)].map((m) => m[0]);
+  const sent = /^Sent\.$/m.test(out) && hashes.length > 0;
+  if (!sent) {
+    const why = /Rails rejected|✗/.test(out) ? 'the rails rejected the plan'
+      : /Nothing to pay/.test(out) ? 'every contributor was allocated 0'
+      : /Cancelled/.test(out) ? 'the run was cancelled'
+      : 'the run finished without broadcasting anything';
+    return { status: 'not_paid', executed: false, error: `No payment was made: ${why}.`, output: tail };
+  }
+  return { status: 'ok', executed: true, label, txHashes: hashes, output: tail };
 }
 
 /**
