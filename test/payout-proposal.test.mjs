@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normaliseRepo, payoutProposal, payoutExecute } from '../payout-proposal.js';
+import { normaliseRepo, payoutProposal, payoutExecute, groundCheck } from '../payout-proposal.js';
 
 test('a pasted GitHub link reduces to owner/name', () => {
   const cases = {
@@ -41,4 +41,17 @@ test('a repeat proposal for the same ask returns the same round, not a new split
     assert.equal(second.label, first.label, 'same label reused');
     assert.equal(second.reused, true);
   }
+});
+
+test('a parameter the user never gave is refused before any scoring runs', async () => {
+  const said = 'reward the contributors of https://github.com/BankrBot/skills from the past 3 days out of 5000 BNKR';
+  assert.equal(groundCheck({ repo: 'BankrBot/skills', budget: '5000', since: '3d' }, said), null);
+  assert.match(groundCheck({ repo: 'BankrBot/skills', budget: '5000', since: '14d' }, said), /window/);
+  assert.match(groundCheck({ repo: 'BankrBot/skills', budget: '20000', since: '3d' }, said), /budget/);
+  assert.match(groundCheck({ repo: 'BankrBot/other', budget: '5000', since: '3d' }, said), /repo/);
+});
+
+test('windows the user spelled in words are accepted', () => {
+  assert.equal(groundCheck({ repo: 'a/skills', budget: '10', since: '7d' }, 'pay skills 10 for the last week'), null);
+  assert.equal(groundCheck({ repo: 'a/skills', budget: '10', since: '48h' }, 'skills, 10, last 48 hours'), null);
 });

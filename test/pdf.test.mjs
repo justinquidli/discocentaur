@@ -206,6 +206,7 @@ function buildRunTool() {
     ALWAYS_HELD,
     SELF_HELD,
     bankrRateCheck: () => null,
+    groundCheck: () => null,
     summariseRound: (label) => `round ${label}`,
     payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),

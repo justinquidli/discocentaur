@@ -32,7 +32,7 @@ import {
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
-import { payoutProposal, payoutExecute, summariseRound } from './payout-proposal.js';
+import { payoutProposal, payoutExecute, summariseRound, groundCheck } from './payout-proposal.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1387,7 +1387,7 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null,
+  senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
@@ -1438,6 +1438,19 @@ async function runTool(name, input, {
       const done = await payoutExecute({ label: input.label });
       console.log(`[payout] execute ${done.status}`);
       return JSON.stringify(done, null, 2);
+    }
+
+    // Check the extraction against what the user wrote before spending a
+    // scoring run on it. A window or budget the model supplied on its own pays
+    // a different set of people and looks entirely plausible doing it.
+    const ungrounded = groundCheck(input, userText);
+    if (ungrounded) {
+      console.log(`[payout] ungrounded: ${ungrounded}`);
+      return JSON.stringify({
+        status: 'refused',
+        executed: false,
+        message: `Not run: ${ungrounded}. Do not retry with a value you chose yourself — ask the user for the repo, the budget and the time window, and use exactly what they say.`,
+      }, null, 2);
     }
 
     const rl = bankrRateCheck(String(senderId));
@@ -2468,6 +2481,7 @@ async function handleMessage(message) {
     botId: message.client.user.id,
     senderApiKey,
     senderUser: message.author,
+    userText: message.content,
     currentChannelId: message.channelId,
     contextId,
     documentInContext,

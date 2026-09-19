@@ -164,3 +164,43 @@ export function summariseRound(label) {
     r.summary ? `\n${r.summary}` : '',
   ].filter(Boolean).join('\n');
 }
+
+/**
+ * Every parameter must be traceable to what the user actually wrote.
+ *
+ * The failures here were never the scorer: they were the model supplying a
+ * parameter nobody asked for — a 14d window when the user said 3 days, a
+ * budget or repo it inferred — and the result looking perfectly reasonable.
+ * A wrong window silently pays a different set of people. So rather than
+ * trusting the extraction, check it against the message and refuse when a
+ * value cannot be found there.
+ */
+const WINDOW_WORDS = {
+  today: '1d', yesterday: '2d', week: '7d', fortnight: '14d', month: '30d', quarter: '90d',
+};
+
+export function groundCheck({ repo, budget, since }, userText) {
+  const text = String(userText ?? '').toLowerCase();
+  if (!text) return null; // nothing to check against (confirm path, tests)
+
+  const name = normaliseRepo(repo).split('/')[1]?.toLowerCase();
+  if (!name || !text.includes(name)) {
+    return `the repo "${normaliseRepo(repo)}" does not appear in the request`;
+  }
+
+  const amount = String(budget).replace(/[,_]/g, '');
+  if (!text.replace(/[,_]/g, '').includes(amount)) {
+    return `the budget "${budget}" does not appear in the request`;
+  }
+
+  const m = String(since ?? '').match(/^(\d+)([dh])$/);
+  if (!m) return `the window "${since}" is not a number of days or hours`;
+  const [, qty, unit] = m;
+  const unitWord = unit === 'd' ? 'day' : 'hour';
+  const spelled = new RegExp(`\\b${qty}\\s*(${unitWord}s?|${unit})\\b`);
+  const phrase = Object.entries(WINDOW_WORDS).some(([word, w]) => w === since && text.includes(word));
+  if (!spelled.test(text) && !phrase) {
+    return `the window "${since}" does not appear in the request`;
+  }
+  return null;
+}
