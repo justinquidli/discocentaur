@@ -78,7 +78,10 @@ export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'US
   if (!/^\d+(\.\d+)?$/.test(String(budget ?? ''))) return { status: 'refused', error: 'budget must be a number' };
   if (!existsSync(resolve(DIR, 'payout.js'))) return { status: 'refused', error: `contributor-payout not found at ${DIR}` };
 
-  const key = `${repo}|${since}|${token}|${budget}`;
+  // Keyed on the repo alone. A model that re-asks rarely re-asks identically —
+  // "3d" becomes "72h", the symbol becomes a contract address — and any
+  // difference used to produce a second, different split for the same request.
+  const key = repo.toLowerCase();
   const seen = recent.get(key);
   if (seen && Date.now() - seen.at < RECENT_TTL_MS && existsSync(roundPath(seen.label))) {
     return { ...seen.result, reused: true };
