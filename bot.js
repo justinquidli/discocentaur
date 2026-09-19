@@ -27,7 +27,7 @@ import {
   createDocumentTaint,
 } from './documents.js';
 import {
-  MONEY_TOOLS, ALWAYS_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+  MONEY_TOOLS, ALWAYS_HELD, SELF_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
@@ -1322,28 +1322,17 @@ const tools = [
     },
   },
   {
-    name: 'payout_proposal',
-    description: 'Propose how to split a reward budget among the contributors of a GitHub repo, based on their MERGED pull requests. Read-only: it scores the work and returns a table of who earned what share and why, plus a round LABEL. It NEVER sends anything and cannot move money. Open PRs are not counted; merging is what makes work eligible. Takes 60-120 seconds. Call this AT MOST ONCE per request: if you already have a label from this conversation, reuse it — calling again produces a DIFFERENT split and the user would be approving numbers they never read.',
+    name: 'payout',
+    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and holds the payment for the user to confirm with a code. You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request.',
     input_schema: {
       type: 'object',
       properties: {
-        repo: { type: 'string', description: 'The repo, as the user gave it: a pasted GitHub URL (https://github.com/owner/name, a link to a PR, or one wrapped in <>) or owner/name. Pass it through as-is; do not rewrite it.' },
-        since: { type: 'string', description: 'How far back to look, e.g. "14d" or "48h". Default 14d.' },
+        repo: { type: 'string', description: 'The repo as the user gave it: a pasted GitHub URL or owner/name. Pass it through as-is.' },
+        budget: { type: 'string', description: 'Total to split, in units of the token, e.g. "5000".' },
         token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
-        budget: { type: 'string', description: 'Total to split, in units of that token, e.g. "5000".' },
+        since: { type: 'string', description: 'How far back to look, e.g. "14d" or "48h". Default 14d.' },
       },
       required: ['repo', 'budget'],
-    },
-  },
-  {
-    name: 'payout_execute',
-    description: 'Pay a payout round that payout_proposal already produced, identified by its round label. Sends real tokens to real contributors from the agent wallet. Every amount comes from the saved round, not from the conversation — you cannot change who is paid or how much. Use the label you already have; never call payout_proposal again first. Do NOT ask the user whether to go ahead: this tool is always held and the bot posts the split with a confirm code, so asking first makes them approve twice. Call it directly when the user wants the contributors paid, and never claim it was sent.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        label: { type: 'string', description: 'The round label returned by payout_proposal, e.g. dc-BankrBot-skills-m1x2y3.' },
-      },
-      required: ['label'],
     },
   },
 ];
@@ -1406,22 +1395,16 @@ async function runTool(name, input, {
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
-  if (MONEY_TOOLS.has(name) && (documentInContext || ALWAYS_HELD.has(name)) && !confirmed) {
+  if (MONEY_TOOLS.has(name) && !SELF_HELD.has(name) && (documentInContext || ALWAYS_HELD.has(name)) && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
-      : name === 'payout_execute' ? true
       : !!senderApiKey;
     if (hasKey || isOwner) {
-      // A payout is held with its split attached, so the confirmation message
-      // shows the real numbers rather than trusting the model to repeat them.
-      const heldInput = name === 'payout_execute'
-        ? { ...input, summary: summariseRound(input.label) ?? undefined }
-        : input;
-      const held = heldActions.hold({ tool: name, input: heldInput, senderId, channelId: currentChannelId, contextId });
+      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
       console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
-      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: heldInput }));
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
       return heldToolResult(held.code);
     }
   }
@@ -1444,38 +1427,43 @@ async function runTool(name, input, {
       throw err;
     }
   }
-  // Pays a round that was already proposed and published. The label is the
-  // only thing this message controls; the amounts come from the file.
-  if (name === 'payout_execute') {
+  // One call: score, post the split, hold. The label lives in the held action,
+  // never in the conversation, so nothing the model says can change what pays.
+  if (name === 'payout') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can execute a payout.' });
-    console.log(`[payout] execute sender=${senderId}`, JSON.stringify(input).slice(0, 120));
-    const result = await payoutExecute(input);
-    console.log(`[payout] execute ${result.status}`);
-    return JSON.stringify(result, null, 2);
-  }
+    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run a payout.' });
 
-  // Read-only: proposes a split, never sends. No signing wallet is reachable
-  // from here, so a chat message cannot move money however it is phrased.
-  if (name === 'payout_proposal') {
-    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run payout proposals.' });
+    if (confirmed) {
+      console.log(`[payout] execute label=${input.label}`);
+      const done = await payoutExecute({ label: input.label });
+      console.log(`[payout] execute ${done.status}`);
+      return JSON.stringify(done, null, 2);
+    }
+
     const rl = bankrRateCheck(String(senderId));
     if (rl) return JSON.stringify({ status: 'refused', executed: false, message: rl });
-    console.log(`[payout] proposal sender=${senderId}`, JSON.stringify(input).slice(0, 160));
-    const result = await payoutProposal(input);
-    console.log(`[payout] ${result.status}`);
-    if (result.status !== 'ok') return JSON.stringify(result, null, 2);
-    // The bot posts the split verbatim and the model never receives the
-    // amounts: a model that retyped them got two rows wrong while the total
-    // still matched, which is the hardest kind of error to catch by eye.
-    heldNotices?.push('```\n' + String(result.proposal).slice(0, 1800) + '\n```');
-    return JSON.stringify({
-      status: 'ok',
-      executed: false,
-      label: result.label,
-      message: 'The split has been posted to the channel already. Do NOT restate, summarise or retype any amounts, shares or contributor names — you do not have them. Say the proposal is above and ask whether to pay it, or pass this label to payout_execute if the user already asked for payment.',
-    }, null, 2);
+    console.log(`[payout] propose sender=${senderId}`, JSON.stringify(input).slice(0, 160));
+    const proposal = await payoutProposal(input);
+    console.log(`[payout] propose ${proposal.status}`);
+    if (proposal.status !== 'ok') return JSON.stringify(proposal, null, 2);
+    if (!proposal.label) return JSON.stringify({ status: 'error', executed: false, error: 'the round was not written; nothing to confirm' }, null, 2);
+
+    // The bot posts the split itself. The model is never given the figures,
+    // because a model that retyped them got two rows wrong while the total
+    // still matched — the hardest kind of error to catch by eye.
+    heldNotices?.push('```\n' + String(proposal.proposal).slice(0, 1800) + '\n```');
+
+    const held = heldActions.hold({
+      tool: name,
+      input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined },
+      senderId,
+      channelId: currentChannelId,
+      contextId,
+    });
+    if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+    console.log(`[held] payout code=${held.code} label=${proposal.label}`);
+    heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined } }));
+    return heldToolResult(held.code);
   }
 
   if (name === 'bankr_swap_and_drop') {
@@ -2887,7 +2875,7 @@ async function handleConfirmCommand(message, { verb, code }) {
 
   const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
-    : action.tool === 'payout_execute' ? result.status === 'ok'
+    : action.tool === 'payout' ? result.status === 'ok'
     : !!result.success;
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
@@ -2898,7 +2886,7 @@ async function handleConfirmCommand(message, { verb, code }) {
     ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
-  if (action.tool === 'payout_execute') {
+  if (action.tool === 'payout') {
     const icon = { ok: '✅', unknown: '⚠️' }[result.status] ?? '❌';
     const detail = result.status === 'ok' ? result.output : (result.error ?? result.output ?? 'no detail');
     await say(`${icon} \`${action.code}\` round \`${result.label ?? action.input?.label ?? '?'}\`:\n\`\`\`\n${String(detail).slice(0, 1500)}\n\`\`\``);

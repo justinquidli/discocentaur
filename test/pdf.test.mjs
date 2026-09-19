@@ -20,7 +20,7 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult,
-  formatAmount, parseConfirmCommand, ALWAYS_HELD } from '../held-actions.js';
+  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD } from '../held-actions.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -204,8 +204,11 @@ function buildRunTool() {
     describeHeldAction,
     heldToolResult,
     ALWAYS_HELD,
-    summariseRound: (label) => `round ${label}: @alice — 100 BNKR (100.00%)`,
-    payoutExecute: async () => { calls.push({ tool: 'payout_execute' }); return { status: 'ok', executed: true }; },
+    SELF_HELD,
+    bankrRateCheck: () => null,
+    summariseRound: (label) => `round ${label}`,
+    payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
+    payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
     mcpToolNames: new Set(),
     _pendingExplorerUrls: [],
     quidliDrop: async (input, key) => { calls.push({ tool: 'quidli_drop', key }); return { transferHash: '0xabc', explorerUrl: null }; },
@@ -241,23 +244,23 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
   });
 }
 
-test('payout_execute is held even with no document in context', async () => {
+test('payout proposes, posts the split itself, and holds — in one call', async () => {
   const { runTool, calls } = buildRunTool();
   const heldNotices = [];
-  const out = JSON.parse(await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'owner', heldNotices }));
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices }));
   assert.equal(out.status, 'held_for_confirmation');
   assert.deepEqual(calls, [], 'nothing paid before confirmation');
-  assert.equal(heldNotices.length, 1);
-  assert.match(heldNotices[0], /moves money/i);
-  assert.match(heldNotices[0], /@alice — 100 BNKR/, 'the split is shown by the bot, not left to the model');
+  assert.match(heldNotices.join('\n'), /@alice — 100 BNKR/, 'the bot posts the split');
+  assert.match(heldNotices.join('\n'), /moves money/i);
+  assert.ok(!out.message?.includes('100 BNKR'), 'the model is not given the amounts');
 
-  await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
-  assert.deepEqual(calls, [{ tool: 'payout_execute' }], 'confirmed call executes');
+  await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
+  assert.deepEqual(calls, [{ tool: 'payout' }], 'confirmed call executes');
 });
 
-test('payout_execute is refused for anyone but the owner', async () => {
+test('payout is refused for anyone but the owner', async () => {
   const { runTool, calls } = buildRunTool();
-  const out = JSON.parse(await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'someone', confirmed: true }));
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'someone', confirmed: true }));
   assert.equal(out.status, 'refused');
   assert.deepEqual(calls, []);
 });
