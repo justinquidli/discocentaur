@@ -204,6 +204,7 @@ function buildRunTool() {
     describeHeldAction,
     heldToolResult,
     ALWAYS_HELD,
+    summariseRound: (label) => `round ${label}: @alice — 100 BNKR (100.00%)`,
     payoutExecute: async () => { calls.push({ tool: 'payout_execute' }); return { status: 'ok', executed: true }; },
     mcpToolNames: new Set(),
     _pendingExplorerUrls: [],
@@ -248,6 +249,7 @@ test('payout_execute is held even with no document in context', async () => {
   assert.deepEqual(calls, [], 'nothing paid before confirmation');
   assert.equal(heldNotices.length, 1);
   assert.match(heldNotices[0], /moves money/i);
+  assert.match(heldNotices[0], /@alice — 100 BNKR/, 'the split is shown by the bot, not left to the model');
 
   await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
   assert.deepEqual(calls, [{ tool: 'payout_execute' }], 'confirmed call executes');

@@ -126,3 +126,24 @@ export async function payoutExecute({ label }) {
   if (code !== 0) return { status: 'failed', executed: false, error: tail || `exited ${code}` };
   return { status: 'ok', executed: true, label, output: tail };
 }
+
+/**
+ * A one-screen summary of a saved round, read straight from the file.
+ * The bot prints this when it asks for confirmation, so what a person approves
+ * is the actual split — not whatever the model chose to say about it.
+ */
+export function summariseRound(label) {
+  if (!LABEL.test(label ?? '')) return null;
+  const path = roundPath(label);
+  if (!existsSync(path)) return null;
+  let r;
+  try { r = JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+  const lines = (r.contributors ?? []).map(
+    (c) => `  @${c.github} — ${c.amount} ${r.token?.symbol ?? ''} (${c.share})`,
+  );
+  return [
+    `${r.repo} · ${r.total} ${r.token?.symbol ?? ''} to ${lines.length} contributor(s)`,
+    ...lines,
+    r.summary ? `\n${r.summary}` : '',
+  ].filter(Boolean).join('\n');
+}

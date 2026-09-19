@@ -32,7 +32,7 @@ import {
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
-import { payoutProposal, payoutExecute } from './payout-proposal.js';
+import { payoutProposal, payoutExecute, summariseRound } from './payout-proposal.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1413,10 +1413,15 @@ async function runTool(name, input, {
       : name === 'payout_execute' ? true
       : !!senderApiKey;
     if (hasKey || isOwner) {
-      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
+      // A payout is held with its split attached, so the confirmation message
+      // shows the real numbers rather than trusting the model to repeat them.
+      const heldInput = name === 'payout_execute'
+        ? { ...input, summary: summariseRound(input.label) ?? undefined }
+        : input;
+      const held = heldActions.hold({ tool: name, input: heldInput, senderId, channelId: currentChannelId, contextId });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
       console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
-      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: heldInput }));
       return heldToolResult(held.code);
     }
   }

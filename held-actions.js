@@ -176,7 +176,10 @@ export function describeHeldAction({ code, tool, input }) {
     lines.push(`**Watcher** on ${chain}: ${amount} to each of the first ${input.maxWinners ?? 1} people to type “${String(input.triggerPhrase ?? '').slice(0, 100)}”`);
   } else if (tool === 'payout_execute') {
     lines.push(`**Pay out round \`${String(input.label ?? '?').slice(0, 64)}\`** from the agent's Dynamic wallet.`);
-    lines.push('Pays exactly the split already posted for that round — amounts come from the round file, not from this message.');
+    // Printed by the bot, read from the round file — so what is approved is the
+    // actual split, whatever the model said or left out.
+    if (input.summary) lines.push('```\n' + String(input.summary).slice(0, 1200) + '\n```');
+    lines.push('These amounts come from the saved round, not from this conversation.');
   } else {
     lines.push(`**${tool}**`);
   }
