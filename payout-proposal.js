@@ -15,6 +15,21 @@ const EXEC_TIMEOUT_MS = Number(process.env.PAYOUT_EXEC_TIMEOUT_MS ?? 600_000);
 const MAX_CHARS = 1500; // Discord hard-caps at 2000; leave room for the model's reply.
 
 const REPO = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/**
+ * People paste the URL, not the path — nobody thinks of a repo as "owner/name".
+ * Accept any github.com link (with or without scheme, .git, trailing slash, or
+ * a deeper path like /pull/3) and reduce it to owner/name.
+ */
+export function normaliseRepo(value) {
+  let v = String(value ?? '').trim();
+  v = v.replace(/^<|>$/g, '');                       // Discord wraps pasted links
+  v = v.replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+  v = v.replace(/^github\.com\//i, '');
+  v = v.replace(/\.git$/i, '');
+  const parts = v.split('/').filter(Boolean);
+  return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : v;
+}
 const SINCE = /^\d{1,3}[dh]$/;
 const TOKEN = /^(0x[0-9a-fA-F]{40}|[A-Za-z0-9]{1,12})$/;
 const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
@@ -49,8 +64,9 @@ function trim(out) {
   return cleaned.length > MAX_CHARS ? cleaned.slice(0, MAX_CHARS) + '\n… (truncated)' : cleaned;
 }
 
-export async function payoutProposal({ repo, since = '14d', token = 'USDC', budget }) {
-  if (!REPO.test(repo ?? '')) return { status: 'refused', error: 'repo must look like owner/name' };
+export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'USDC', budget }) {
+  const repo = normaliseRepo(rawRepo);
+  if (!REPO.test(repo)) return { status: 'refused', error: `could not read a repo out of "${String(rawRepo ?? '').slice(0, 80)}" — paste its GitHub URL, or give owner/name` };
   if (!SINCE.test(since)) return { status: 'refused', error: 'since must look like 14d or 48h' };
   if (!TOKEN.test(token)) return { status: 'refused', error: 'token must be a symbol or a 0x address' };
   if (!/^\d+(\.\d+)?$/.test(String(budget ?? ''))) return { status: 'refused', error: 'budget must be a number' };

@@ -1327,7 +1327,7 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        repo: { type: 'string', description: 'GitHub repo as owner/name, e.g. BankrBot/skills.' },
+        repo: { type: 'string', description: 'The repo, as the user gave it: a pasted GitHub URL (https://github.com/owner/name, a link to a PR, or one wrapped in <>) or owner/name. Pass it through as-is; do not rewrite it.' },
         since: { type: 'string', description: 'How far back to look, e.g. "14d" or "48h". Default 14d.' },
         token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
         budget: { type: 'string', description: 'Total to split, in units of that token, e.g. "5000".' },
