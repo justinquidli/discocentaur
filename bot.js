@@ -1330,9 +1330,9 @@ const tools = [
         repo: { type: 'string', description: 'The repo as the user gave it: a pasted GitHub URL or owner/name. Pass it through as-is.' },
         budget: { type: 'string', description: 'Total to split, in units of the token, e.g. "5000".' },
         token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
-        since: { type: 'string', description: 'How far back to look, e.g. "14d" or "48h". Default 14d.' },
+        since: { type: 'string', description: 'How far back to look, as the user said it: "3d", "48h", "2 weeks" -> "14d". Required — never leave it out and never substitute a default, because the window decides which PRs are scored and a wrong one silently rewards the wrong people.' },
       },
-      required: ['repo', 'budget'],
+      required: ['repo', 'budget', 'since'],
     },
   },
 ];
