@@ -1465,7 +1465,17 @@ async function runTool(name, input, {
     console.log(`[payout] proposal sender=${senderId}`, JSON.stringify(input).slice(0, 160));
     const result = await payoutProposal(input);
     console.log(`[payout] ${result.status}`);
-    return JSON.stringify(result, null, 2);
+    if (result.status !== 'ok') return JSON.stringify(result, null, 2);
+    // The bot posts the split verbatim and the model never receives the
+    // amounts: a model that retyped them got two rows wrong while the total
+    // still matched, which is the hardest kind of error to catch by eye.
+    heldNotices?.push('```\n' + String(result.proposal).slice(0, 1800) + '\n```');
+    return JSON.stringify({
+      status: 'ok',
+      executed: false,
+      label: result.label,
+      message: 'The split has been posted to the channel already. Do NOT restate, summarise or retype any amounts, shares or contributor names — you do not have them. Say the proposal is above and ask whether to pay it, or pass this label to payout_execute if the user already asked for payment.',
+    }, null, 2);
   }
 
   if (name === 'bankr_swap_and_drop') {
