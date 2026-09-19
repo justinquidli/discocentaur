@@ -27,11 +27,12 @@ import {
   createDocumentTaint,
 } from './documents.js';
 import {
-  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+  MONEY_TOOLS, ALWAYS_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
+import { payoutProposal, payoutExecute } from './payout-proposal.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1320,6 +1321,31 @@ const tools = [
       required: ['prompt'],
     },
   },
+  {
+    name: 'payout_proposal',
+    description: 'Propose how to split a reward budget among the contributors of a GitHub repo, based on their MERGED pull requests. Read-only: it scores the work and returns a table of who earned what share and why. It NEVER sends anything and cannot move money — say so if asked to pay. Open PRs are not counted; merging is what makes work eligible. Takes 60-120 seconds.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'GitHub repo as owner/name, e.g. BankrBot/skills.' },
+        since: { type: 'string', description: 'How far back to look, e.g. "14d" or "48h". Default 14d.' },
+        token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
+        budget: { type: 'string', description: 'Total to split, in units of that token, e.g. "5000".' },
+      },
+      required: ['repo', 'budget'],
+    },
+  },
+  {
+    name: 'payout_execute',
+    description: 'Pay a payout round that payout_proposal already produced, identified by its round label. Sends real tokens to real contributors from the agent wallet. Every amount comes from the saved round, not from the conversation — you cannot change who is paid or how much. It is always held for the user to confirm with a code; never claim it was sent.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'The round label returned by payout_proposal, e.g. dc-BankrBot-skills-m1x2y3.' },
+      },
+      required: ['label'],
+    },
+  },
 ];
 
 // Transfers parked while a document is in context. See held-actions.js.
@@ -1380,10 +1406,11 @@ async function runTool(name, input, {
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
-  if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
+  if (MONEY_TOOLS.has(name) && (documentInContext || ALWAYS_HELD.has(name)) && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
+      : name === 'payout_execute' ? true
       : !!senderApiKey;
     if (hasKey || isOwner) {
       const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
@@ -1412,6 +1439,30 @@ async function runTool(name, input, {
       throw err;
     }
   }
+  // Pays a round that was already proposed and published. The label is the
+  // only thing this message controls; the amounts come from the file.
+  if (name === 'payout_execute') {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can execute a payout.' });
+    console.log(`[payout] execute sender=${senderId}`, JSON.stringify(input).slice(0, 120));
+    const result = await payoutExecute(input);
+    console.log(`[payout] execute ${result.status}`);
+    return JSON.stringify(result, null, 2);
+  }
+
+  // Read-only: proposes a split, never sends. No signing wallet is reachable
+  // from here, so a chat message cannot move money however it is phrased.
+  if (name === 'payout_proposal') {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run payout proposals.' });
+    const rl = bankrRateCheck(String(senderId));
+    if (rl) return JSON.stringify({ status: 'refused', executed: false, message: rl });
+    console.log(`[payout] proposal sender=${senderId}`, JSON.stringify(input).slice(0, 160));
+    const result = await payoutProposal(input);
+    console.log(`[payout] ${result.status}`);
+    return JSON.stringify(result, null, 2);
+  }
+
   if (name === 'bankr_swap_and_drop') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const bankrKey = getUserBankrKey(senderId) || (isOwner ? BANKR_API_KEY : null);
@@ -2821,6 +2872,7 @@ async function handleConfirmCommand(message, { verb, code }) {
 
   const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
+    : action.tool === 'payout_execute' ? result.status === 'ok'
     : !!result.success;
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
@@ -2831,7 +2883,11 @@ async function handleConfirmCommand(message, { verb, code }) {
     ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
 
-  if (action.tool === 'bankr_swap_and_drop') {
+  if (action.tool === 'payout_execute') {
+    const icon = { ok: '✅', unknown: '⚠️' }[result.status] ?? '❌';
+    const detail = result.status === 'ok' ? result.output : (result.error ?? result.output ?? 'no detail');
+    await say(`${icon} \`${action.code}\` round \`${result.label ?? action.input?.label ?? '?'}\`:\n\`\`\`\n${String(detail).slice(0, 1500)}\n\`\`\``);
+  } else if (action.tool === 'bankr_swap_and_drop') {
     const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
     const icon = { completed: '✅', partial: '⚠️', unknown: '⚠️' }[result.status] ?? '❌';
     await say(`${icon} \`${action.code}\`: ${String(result.message ?? raw).slice(0, 1200)}${links}`);

@@ -22,7 +22,11 @@ import { randomInt } from 'node:crypto';
 // Tools whose execution commits the sender's funds, now or later.
 // bankr_agent is here because a Bankr prompt can swap or transfer from the
 // sender's Bankr wallet — we can't tell a price check from a send by its args.
-export const MONEY_TOOLS = new Set(['quidli_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'bankr_agent', 'bankr_swap_and_drop']);
+export const MONEY_TOOLS = new Set(['quidli_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'bankr_agent', 'bankr_swap_and_drop', 'payout_execute']);
+
+// Held every time, document or not: it pays real contributors from a file, and
+// the whole point of proposing in public is that a human commits it afterwards.
+export const ALWAYS_HELD = new Set(['payout_execute']);
 
 export const HOLD_TTL_MS = 10 * 60 * 1000;
 export const MAX_HELD_PER_USER = 5;
@@ -170,12 +174,17 @@ export function describeHeldAction({ code, tool, input }) {
     lines.push(`→ ${presence ?? (shownRecipients || '(none)')}`);
   } else if (tool === 'create_watcher') {
     lines.push(`**Watcher** on ${chain}: ${amount} to each of the first ${input.maxWinners ?? 1} people to type “${String(input.triggerPhrase ?? '').slice(0, 100)}”`);
+  } else if (tool === 'payout_execute') {
+    lines.push(`**Pay out round \`${String(input.label ?? '?').slice(0, 64)}\`** from the agent's Dynamic wallet.`);
+    lines.push('Pays exactly the split already posted for that round — amounts come from the round file, not from this message.');
   } else {
     lines.push(`**${tool}**`);
   }
 
   return (
-    `⏸️ **Held for confirmation** — a document is in this conversation, so transfers don't run automatically.\n` +
+    (ALWAYS_HELD.has(tool)
+      ? `⏸️ **Held for confirmation** — this one moves money, so it never runs automatically.\n`
+      : `⏸️ **Held for confirmation** — a document is in this conversation, so transfers don't run automatically.\n`) +
     lines.join('\n') +
     `\nReply \`!confirm ${code}\` to run it, or \`!cancel ${code}\`. Expires in ${Math.round(HOLD_TTL_MS / 60000)} min.`
   );

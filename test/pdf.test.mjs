@@ -20,8 +20,7 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult,
-  formatAmount, parseConfirmCommand,
-} from '../held-actions.js';
+  formatAmount, parseConfirmCommand, ALWAYS_HELD } from '../held-actions.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -204,6 +203,8 @@ function buildRunTool() {
     heldActions: createHeldActionStore(),
     describeHeldAction,
     heldToolResult,
+    ALWAYS_HELD,
+    payoutExecute: async () => { calls.push({ tool: 'payout_execute' }); return { status: 'ok', executed: true }; },
     mcpToolNames: new Set(),
     _pendingExplorerUrls: [],
     quidliDrop: async (input, key) => { calls.push({ tool: 'quidli_drop', key }); return { transferHash: '0xabc', explorerUrl: null }; },
@@ -239,6 +240,26 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
   });
 }
 
+test('payout_execute is held even with no document in context', async () => {
+  const { runTool, calls } = buildRunTool();
+  const heldNotices = [];
+  const out = JSON.parse(await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'owner', heldNotices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.deepEqual(calls, [], 'nothing paid before confirmation');
+  assert.equal(heldNotices.length, 1);
+  assert.match(heldNotices[0], /moves money/i);
+
+  await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
+  assert.deepEqual(calls, [{ tool: 'payout_execute' }], 'confirmed call executes');
+});
+
+test('payout_execute is refused for anyone but the owner', async () => {
+  const { runTool, calls } = buildRunTool();
+  const out = JSON.parse(await runTool('payout_execute', { label: 'dc-demo-1' }, { senderId: 'someone', confirmed: true }));
+  assert.equal(out.status, 'refused');
+  assert.deepEqual(calls, []);
+});
+
 test('without a document, drops run as before', async () => {
   const { runTool, calls } = buildRunTool();
   await runTool('quidli_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
@@ -260,7 +281,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const branches = [...runToolSrc.matchAll(/if \(name === '([a-z_]+)'\) \{([\s\S]*?)\n  \}/g)];
   assert.ok(branches.length > 5, 'branch parser still matches runTool');
   const spending = branches
-    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
+    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
   assert.deepEqual(spending.sort(), [...MONEY_TOOLS].sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
