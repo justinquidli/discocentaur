@@ -199,10 +199,21 @@ MCP 0.5.8 that was nine tools (the trust tools below came later):
 | `connect_get_price` | x402 list prices |
 
 `connect_drop` is how the bot sends. It is annotated non-read-only and is offered only because it
-is named in `MCP_SEND_TOOLS`; the model sees Connect's own description and schema and the call is
-forwarded as written. It is held for confirmation like every money tool while a document is in the
-conversation. Scheduled/conditional drops, watchers, claims and swap-and-send call it the same way.
-The hand-written REST `/drop` client and the x402 host-wallet path are gone.
+is named in `MCP_SEND_TOOLS`. The model sees Connect's own description and schema, with two
+changes, and the call is otherwise forwarded as written:
+
+- **The bot sets `idempotencyKey`**, a fresh UUID per call, and the field is hidden from the
+  model. A model once reused the UUID spec's example key; Connect treats a reused key as the same
+  send, so a later send could have returned an old transfer instead of making a new one.
+- **Plain types.** Connect declares some fields as unions (`tokenContract` is `["string","null"]`,
+  the amount an `anyOf`); `plainSchema()` shows them as plain `string`. A weaker model sent the
+  USDC address as the number `7.49e+47` through the union type.
+
+A `202` from Connect means recipient wallets are still being set up and nothing was sent; the bot
+retries with the same key (up to 5 × 3 s). A send is held for confirmation like every money tool
+while a document is in the conversation. Scheduled/conditional drops, watchers, claims and
+swap-and-send call `connect_drop` the same way, each with its own key. The hand-written REST
+`/drop` client and the x402 host-wallet path are gone.
 
 Trust tools: `connect_trust_check` and `connect_trust_graph` are read-only and register like the
 rest. `connect_trust_create` and `connect_trust_revoke` are write tools — they sign an EAS
@@ -430,10 +441,13 @@ Codes are one-shot, bound to the user who made the request, expire after 10 minu
 ## Tool-loop safety
 
 Every user message is capped at **25 tool round-trips** (`MAX_TOOL_ROUNDS`) across all
-providers. A drop typically uses 3–15 (resolve → lookup retries → drop), so the cap only
-trips on a model that's looping. This matters because the model mints each
-`connect_drop` idempotency key, so an unbounded loop would issue repeated *distinct*
-transfers rather than harmless retries. On hitting the cap the bot stops and says so.
+providers. A send is usually 1–2 calls (sometimes a balance check, then `connect_drop`), so the
+cap only trips on a model that's looping. It still matters: every `connect_drop` call gets its own
+idempotency key, so a model that calls it repeatedly issues repeated *distinct* transfers rather
+than harmless retries. On hitting the cap the bot stops and says so.
+
+Every model call times out after 2 minutes and is retried once (`LLM_TIMEOUT`), so a stalled
+provider shows an error instead of "Thinking…" for up to half an hour (the SDK defaults).
 
 Two related guards on the OpenAI-compatible path (OpenAI, OpenRouter, Hermes):
 
@@ -464,15 +478,19 @@ request, or switch providers — nothing after the cap was executed.
 
 ## How recipients are resolved
 
-Every drop resolves its recipients to wallet addresses first (`recipients.js`), then sends to
-those addresses. Connect's `/drop` currently rejects social recipients outright
-(`recipients.0.property type should not exist`), even though `connect_lookup` accepts the same
-shape — observed 2026-09-15 and again in both bots' logs on 2026-09-16.
+Connect resolves recipients itself. `connect_drop` takes social recipients (email, phone,
+Telegram, Discord, Farcaster, X, GitHub — by numeric id or username) and pays their Ethereum
+address on EVM chains or their Solana address on Solana, creating a wallet for people who don't
+have one yet. linkedin and slack aren't accepted by `connect_drop`: the model looks those up with
+`connect_lookup` and sends to the returned address as `{ "type": "wallet", "id": … }`. The bot
+does not look anyone up before a send.
 
-Resolution is all-or-nothing: if any recipient can't be resolved, **nothing** is sent and the
-bot names who failed, rather than paying some of the list. Looking up a recipient who has no
-wallet provisions one for them, which is what lets the bots pay people who have never used
-crypto. This applies to every drop — direct, scheduled, conditional, watchers and claim links.
+Mentions reach the model as the recipient `connect_drop` takes —
+`@Guillaume = {"type":"discord","id":"731076204307677226"}` — so it sends by ID. A Discord
+display name is not an identifier and Connect cannot resolve it.
+
+`recipients.js` (EVM wallet resolution via `connect_lookup`) is used only by Bankr
+swap-and-send, which needs wallet addresses before it starts.
 
 ## Bankr — swaps and market data
 
@@ -492,4 +510,4 @@ Without a linked key, both tools refuse and nothing else about the bot changes.
 
 ## Shared files
 
-`bankr.js`, `recipients.js` and their tests must be identical in TeleCentaur and DiscoCentaur (list: `scripts/shared-files.mjs`). `npm test` fails if they drift, when the other repo sits next to this one (or `SHARED_SIBLING=/path`). Edit in one repo, then run `npm run sync-shared` there to copy the files over, review `git diff` in the other repo, and commit both.
+`bankr.js`, `recipients.js`, `connect-mcp.js`, `secrets.js`, `shutdown.js` and their tests must be identical in TeleCentaur and DiscoCentaur (list: `scripts/shared-files.mjs`). `npm test` fails if they drift, when the other repo sits next to this one (or `SHARED_SIBLING=/path`). Edit in one repo, then run `npm run sync-shared` there to copy the files over, review `git diff` in the other repo, and commit both.
