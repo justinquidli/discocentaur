@@ -207,6 +207,9 @@ function buildRunTool() {
     mcpToolNames: new Set(),
     MCP_CONFIRM_TOOLS,
     MCP_WRAPPED_TOOLS,
+    AMOUNT_TOOLS: new Function(`${SRC.match(/^const AMOUNT_TOOLS = new Set\(\[[^\]]*\]\);$/m)[0]}\nreturn AMOUNT_TOOLS;`)(),
+    normalizeAmounts,
+    mentionToId: new Function(`${SRC.match(/^function mentionToId[\s\S]*?\n}$/m)[0]}\nreturn mentionToId;`)(),
     shutdown: { stopping: false, track: (p) => p },
     mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
     redactConnectMe: (t) => t,
@@ -484,6 +487,7 @@ test('bare !confirm with nothing held explains how to get a code', async () => {
 // ─── Connect write tools: always confirmed, document or not ─────────────────
 
 import { MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from '../connect-mcp.js';
+import { normalizeAmounts } from '../connect-drop.js';
 
 const trustInput = { to: { type: 'github', username: 'alice' }, level: 80, context: 'team:quidli' };
 
@@ -556,7 +560,6 @@ import { checkAmountGrounded, tokenInfo } from '../connect-drop.js';
 
 function buildGuardedRunTool() {
   const verifySrc = SRC.match(/^async function verifyAmount[\s\S]*?\n}$/m)[0];
-  const amountToolsSrc = SRC.match(/^const AMOUNT_TOOLS = new Set\(\[[^\]]*\]\);$/m)[0];
   const balance = { assets: [{ type: 'erc20', tokenContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', decimals: 6 }] };
   const { runTool: _unused, calls, deps } = buildRunTool();
   deps.mcpCallTool = async (name, input, key) => {
@@ -565,7 +568,7 @@ function buildGuardedRunTool() {
     return '{"ok":true}';
   };
   const helpers = new Function(...Object.keys(deps), 'tokenInfo', 'checkAmountGrounded',
-    `${amountToolsSrc}\n${verifySrc}\nreturn { AMOUNT_TOOLS, verifyAmount };`)(...Object.values(deps), tokenInfo, checkAmountGrounded);
+    `${verifySrc}\nreturn { verifyAmount };`)(...Object.values(deps), tokenInfo, checkAmountGrounded);
   const all = { ...deps, ...helpers };
   const runTool = new Function(...Object.keys(all), `${runToolSrc}\nreturn runTool;`)(...Object.values(all));
   return { runTool, calls };
@@ -594,4 +597,91 @@ test('a confirmed held send is not re-checked (the user approved the readable am
   await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
     { senderId: 'u1', senderApiKey: 'k', userText: 'yes', confirmed: true });
   assert.deepEqual(calls.map((c) => c.tool), ['connect_drop']);
+});
+
+// ─── replay of 2026-09-23 19:26: "send @Guillaume 0.01 USDC on solana" ─────────
+// Runs the real runTool → quidliDrop → recipients.js → connect-drop.js with only
+// Connect faked. What failed live: amount sent as a number, recipient sent as
+// the display name "Guillaume".
+
+import { createConnectDrop, checkAmountGrounded as cag, tokenInfo as ti } from '../connect-drop.js';
+import { resolveRecipientsToWallets } from '../recipients.js';
+
+const GUILLAUME = '731076204307677226';
+const G_SOL = '5FM2b3jnxzu122hinVQVQsNZUVwuWpmpoVbzokG5oU4R';
+const G_EVM = '0x6a48ADE3bE3F9f0b8B4c9af61Bb654A219311699';
+const SOL_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+function buildLive() {
+  const connect = [];
+  const fakeCall = async (tool, args) => {
+    connect.push({ tool, args });
+    if (tool === 'connect_drop_balance') return JSON.stringify({ assets: [{ type: 'erc20', tokenContract: SOL_USDC, symbol: 'USDC', decimals: 6 }] });
+    if (tool === 'connect_lookup') {
+      const ok = args.recipients.every((r) => r.type === 'discord' && r.id === GUILLAUME);
+      return JSON.stringify(ok
+        ? { status: 'completed', results: [{ type: 'discord', value: GUILLAUME, ethWalletAddress: G_EVM, solWalletAddress: G_SOL }] }
+        : { status: 'completed', results: [], failed: args.recipients });
+    }
+    throw new Error(`unexpected ${tool}`);
+  };
+  const rpc = async (method, params) => {
+    connect.push({ tool: params.name, args: params.arguments });
+    return { content: [{ type: 'text', text: JSON.stringify({ httpStatus: 201, transferHash: '4sig' }) }] };
+  };
+  const { deps } = buildRunTool();
+  const pieces = {
+    ...deps,
+    mcpCallTool: fakeCall,
+    connectDrop: createConnectDrop({ rpc, uuid: () => 'k1', logger: { log() {}, error() {} } }),
+    resolveRecipientsToWallets,
+    explorerTxUrl: (c, h) => (h ? `https://solscan.io/tx/${h}` : null),
+    tokenInfo: ti, checkAmountGrounded: cag,
+    QUIDLI_API_KEY: 'host',
+  };
+  const src = ['quidliDropOnce', 'quidliDrop', 'verifyAmount'].map((n) => SRC.match(new RegExp(`^(?:async )?function ${n}\\(.*?\\n}$`, 'ms'))[0]).join('\n');
+  const helpers = new Function(...Object.keys(pieces), `${src}\nreturn { quidliDrop, verifyAmount };`)(...Object.values(pieces));
+  const all = { ...pieces, ...helpers };
+  const run = new Function(...Object.keys(all), `${runToolSrc}\nreturn runTool;`)(...Object.values(all));
+  return { run, connect };
+}
+
+test('replay: display name + numeric amount → sent to his Solana address, as a string, once', async () => {
+  const { run, connect } = buildLive();
+  const out = JSON.parse(await run('connect_drop',
+    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', username: 'Guillaume' }], amountInWeiPerRecipient: 10000 },
+    { senderId: 'owner', senderApiKey: 'k', userText: '  send   0.01 USDC on solana', mentions: new Map([['guillaume', GUILLAUME]]) }));
+  assert.equal(out.status, 'submitted');
+  const drops = connect.filter((c) => c.tool === 'connect_drop');
+  assert.equal(drops.length, 1);
+  assert.deepEqual(drops[0].args.recipients, [{ type: 'wallet', id: G_SOL }], 'his Solana address, not EVM, not a name');
+  assert.equal(drops[0].args.amountInWeiPerRecipient, '10000');
+  assert.equal(drops[0].args.chainId, 1399811149);
+  assert.deepEqual(connect.find((c) => c.tool === 'connect_lookup').args.recipients, [{ type: 'discord', id: GUILLAUME }]);
+});
+
+test('replay: same send on Base goes to his EVM address', async () => {
+  const { run, connect } = buildLive();
+  await run('connect_drop',
+    { chainId: 8453, tokenContract: SOL_USDC, recipients: [{ type: 'discord', id: GUILLAUME }], amountInWeiPerRecipient: '10000' },
+    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC on base', mentions: new Map() });
+  assert.deepEqual(connect.find((c) => c.tool === 'connect_drop').args.recipients, [{ type: 'wallet', id: G_EVM }]);
+});
+
+test('replay: 10× the amount is refused before any lookup or send', async () => {
+  const { run, connect } = buildLive();
+  const out = JSON.parse(await run('connect_drop',
+    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', id: GUILLAUME }], amountInWeiPerRecipient: '100000' },
+    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC on solana', mentions: new Map() }));
+  assert.equal(out.status, 'refused');
+  assert.deepEqual(connect.map((c) => c.tool), ['connect_drop_balance']);
+});
+
+test('replay: a name nobody mentioned fails before sending — nothing goes out', async () => {
+  const { run, connect } = buildLive();
+  const out = JSON.parse(await run('connect_drop',
+    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', username: 'Someone' }], amountInWeiPerRecipient: '10000' },
+    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC', mentions: new Map([['guillaume', GUILLAUME]]) }));
+  assert.equal(out.status, 'failed');
+  assert.equal(connect.filter((c) => c.tool === 'connect_drop').length, 0);
 });

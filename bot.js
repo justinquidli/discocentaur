@@ -29,7 +29,7 @@ import {
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from './connect-mcp.js';
-import { createConnectDrop, checkAmountGrounded, tokenInfo } from './connect-drop.js';
+import { createConnectDrop, checkAmountGrounded, tokenInfo, normalizeAmounts } from './connect-drop.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 
@@ -149,7 +149,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
 ## Sending tokens (connect_drop)
-- Send with connect_drop — ONE call per request. Pass people directly as recipients, e.g. { type: "discord", id: "<Discord ID>" }, or telegram, discord, email, phone, twitter, farcaster, github (id or username). Connect resolves them and pays the right wallet for the chain (their Ethereum address on EVM chains, their Solana address on Solana), creating a wallet for people who don't have one yet. Do NOT call connect_lookup before a send.
+- Send with connect_drop — ONE call per request. Pass people directly as recipients, e.g. { type: "discord", id: "<Discord ID>" }, or telegram, discord, email, phone, twitter, farcaster, github (id or username). The bot looks up their wallet itself — their Ethereum address on EVM chains, their Solana address on Solana — creating one for people who don't have one yet, so you don't need connect_lookup first. For anyone @mentioned, use the Discord ID shown next to their name, never their display name. If you only have a name, get their ID first (connect_lookup_exposed or discord_search_messages).
 - linkedin and slack can't be sent to directly: call connect_lookup for them, then send to the address it returns as { type: "wallet", id: "<address>" } — ethWalletAddress on EVM chains, solWalletAddress on Solana. Never mix wallet and social recipients in one call.
 - Amounts are whole numbers of base units (amountInWeiPerRecipient). USDC has 6 decimals: 0.01 USDC = 10000, 1 USDC = 1000000. SOL has 9, ETH 18. For any other token use the decimals from connect_drop_balance. The bot converts your amount back and refuses the send unless it matches a number the user wrote — if it refuses, recompute the decimals; never invent an amount the user didn't give.
 - You don't need connect_drop_balance before a routine send. Use it for balance questions, before a large send, or after a send fails for funds — then say plainly what's short: the token, or gas (ETH on EVM chains, SOL on Solana).
@@ -819,7 +819,16 @@ async function quidliDropOnce(args, apiKey = QUIDLI_API_KEY) {
   if (!apiKey) {
     throw new Error('No Quidli API key available for this drop. Link one with the connect command, or ask the bot owner to configure a host key.');
   }
-  const result = await connectDrop.send(args, apiKey);
+  // Resolve people to wallet addresses first (recipients.js) — the path proven
+  // to work — picking the Solana address on Solana and the EVM one elsewhere.
+  const chainId = args?.chainId ?? 8453;
+  const resolved = await resolveRecipientsToWallets(args?.recipients, async (social) =>
+    JSON.parse(await mcpCallTool('connect_lookup', { recipients: social }, apiKey)), { chainId });
+  if (resolved.error) {
+    console.log(`[drop] failed before sending — ${resolved.error}`);
+    return { status: 'failed', executed: false, error: resolved.error, failedRecipients: resolved.failed };
+  }
+  const result = await connectDrop.send({ ...args, recipients: resolved.recipients }, apiKey);
   console.log(`[drop] ${result.status} key=${result.idempotencyKey}${result.transferHash ? ` tx=${result.transferHash}` : ''}${result.error ? ` — ${String(result.error).slice(0, 160)}` : ''}`);
   // Attach the link here so no caller has to know which chain it was.
   return { ...result, explorerUrl: explorerTxUrl(args?.chainId ?? 8453, result.transferHash) };
@@ -1225,6 +1234,31 @@ function trackedRunTool(name, input, ctx) {
 // checkAmountGrounded() in connect-drop.js for why.
 const AMOUNT_TOOLS = new Set(['connect_drop', 'schedule_drop', 'conditional_drop', 'create_watcher']);
 
+// Maps a { type: 'discord', username } recipient to { type: 'discord', id }
+// when that name belongs to someone @mentioned in the message.
+function mentionToId(r, mentions) {
+  if (r?.type !== 'discord' || (r.id != null && r.id !== '') || !r.username) return r;
+  const id = mentions.get(String(r.username).replace(/^@/, '').trim().toLowerCase());
+  if (!id) return r;
+  const { username: _drop, ...rest } = r;
+  return { ...rest, id };
+}
+
+// Every name a mentioned user can go by (username, global name, server
+// nickname), lowercased, to their Discord ID. The bot itself is left out.
+function mentionMap(message) {
+  const map = new Map();
+  const botId = message.client.user.id;
+  for (const [id, user] of message.mentions?.users ?? []) {
+    if (id === botId) continue;
+    const member = message.guild?.members.cache.get(id);
+    for (const n of [user.username, user.globalName, member?.displayName, member?.nickname]) {
+      if (n) map.set(String(n).trim().toLowerCase(), id);
+    }
+  }
+  return map;
+}
+
 async function verifyAmount(input, { senderId, senderApiKey, userText }) {
   const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
   const key = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
@@ -1251,12 +1285,23 @@ async function verifyAmount(input, { senderId, senderApiKey, userText }) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null, userText = null,
+  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null, userText = null, mentions = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
     return JSON.stringify({ status: 'refused', executed: false, error: 'The bot is restarting. Nothing was sent or changed — tell the user to ask again in a minute.' });
+  }
+  // Amounts as integer strings, before anything is checked, held or stored.
+  if (AMOUNT_TOOLS.has(name)) {
+    const norm = normalizeAmounts(input);
+    if (norm.error) return JSON.stringify({ status: 'refused', executed: false, error: norm.error });
+    input = norm.input;
+    // Someone @mentioned is sent by Discord ID, never by display name: a name
+    // doesn't resolve (seen live 2026-09-23 even though the ID was in the message).
+    if (mentions?.size && Array.isArray(input.recipients)) {
+      input = { ...input, recipients: input.recipients.map((r) => mentionToId(r, mentions)) };
+    }
   }
   // ── Amount check ──────────────────────────────────────────────────────────────
   // The raw amount must convert back to a number the user wrote. See
@@ -2330,8 +2375,10 @@ async function handleMessage(message) {
     botId: message.client.user.id,
     senderApiKey,
     senderUser: message.author,
-    // What the user wrote this turn — amounts are checked against it.
-    userText: message.content,
+    // What the user wrote this turn — amounts are checked against it. Mention
+    // tokens are removed so a user or role ID can't pass as an amount.
+    userText: message.content.replace(/<(?:@[!&]?|#)\d+>/g, ' '),
+    mentions: mentionMap(message),
     currentChannelId: message.channelId,
     contextId,
     documentInContext,

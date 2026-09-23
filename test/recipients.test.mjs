@@ -48,3 +48,42 @@ test('still processing after all tries → error, no recipients', async () => {
   const r = await resolveRecipientsToWallets([{ type: 'email', id: 'x@y.com' }], async () => ({ status: 'processing' }), { wait: noWait, tries: 2 });
   assert.match(r.error, /still creating/);
 });
+
+// ── chains (2026-09-23: every Solana drop failed — EVM address, EVM-only regex) ──
+
+const SOL_G = '5FM2b3jnxzu122hinVQVQsNZUVwuWpmpoVbzokG5oU4R';
+const SOL_J = '8vo1awED98mwqDa4qR9JyMsk7qJYiwnTSG4EnXGyWXRh';
+const both = async () => ({ status: 'completed', results: [
+  { type: 'discord', value: '731076204307677226', ethWalletAddress: A, solWalletAddress: SOL_G },
+] });
+
+test('Solana drops get the Solana address, EVM drops the EVM one', async () => {
+  const sol = await resolveRecipientsToWallets([{ type: 'discord', id: '731076204307677226' }], both, { chainId: 1399811149 });
+  assert.deepEqual(sol.recipients, [{ type: 'wallet', id: SOL_G }]);
+  const base = await resolveRecipientsToWallets([{ type: 'discord', id: '731076204307677226' }], both, { chainId: 8453 });
+  assert.deepEqual(base.recipients, [{ type: 'wallet', id: A }]);
+  const dflt = await resolveRecipientsToWallets([{ type: 'discord', id: '731076204307677226' }], both);
+  assert.deepEqual(dflt.recipients, [{ type: 'wallet', id: A }], 'default stays EVM (Bankr swap-and-send)');
+});
+
+test('a pasted Solana address is accepted on Solana and refused on EVM', async () => {
+  const sol = await resolveRecipientsToWallets([{ type: 'wallet', id: SOL_G }], async () => {}, { chainId: 1399811149 });
+  assert.deepEqual(sol.recipients, [{ type: 'wallet', id: SOL_G }]);
+  const evm = await resolveRecipientsToWallets([{ type: 'wallet', id: SOL_G }], async () => {}, { chainId: 8453 });
+  assert.match(evm.error, /Invalid EVM wallet address/);
+  const evmOnSol = await resolveRecipientsToWallets([{ type: 'wallet', id: A }], async () => {}, { chainId: 1399811149 });
+  assert.match(evmOnSol.error, /Invalid Solana wallet address/);
+});
+
+test('a lookup with no Solana address fails a Solana drop — never falls back to EVM', async () => {
+  const r = await resolveRecipientsToWallets([{ type: 'discord', id: '1' }],
+    async () => ({ status: 'completed', results: [{ type: 'discord', value: '1', ethWalletAddress: A }] }), { chainId: 1399811149 });
+  assert.match(r.error, /Could not resolve a Solana wallet for: discord:1\. Nothing was sent/);
+});
+
+test('per-recipient amounts survive resolution, in order', async () => {
+  const r = await resolveRecipientsToWallets(
+    [{ type: 'wallet', id: SOL_J, amountInWei: '5' }, { type: 'discord', id: '731076204307677226', amountInWei: '7' }],
+    both, { chainId: 1399811149 });
+  assert.deepEqual(r.recipients, [{ type: 'wallet', id: SOL_J, amountInWei: '5' }, { type: 'wallet', id: SOL_G, amountInWei: '7' }]);
+});

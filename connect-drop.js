@@ -61,10 +61,12 @@ export function createConnectDrop({
      *   { status: 'unknown', executed: 'unknown', error: string, idempotencyKey: string }>}
      */
     async send(args, apiKey) {
-      const body = {};
-      for (const k of BODY_FIELDS) if (args?.[k] !== undefined) body[k] = args[k];
-      if (body.chainId === undefined) body.chainId = 8453;
+      const norm = normalizeAmounts(args);
       const idempotencyKey = uuid();
+      if (norm.error) return { status: 'failed', executed: false, error: norm.error, idempotencyKey };
+      const body = {};
+      for (const k of BODY_FIELDS) if (norm.input[k] !== undefined) body[k] = norm.input[k];
+      if (body.chainId === undefined) body.chainId = 8453;
       const call = { ...body, idempotencyKey };
 
       let lastUncertain = null;
@@ -117,6 +119,43 @@ export function createConnectDrop({
 }
 
 // ── amounts ───────────────────────────────────────────────────────────────────
+
+const isIntString = (v) => typeof v === 'string' && /^\d+$/.test(v);
+
+/**
+ * Connect takes amounts as integer STRINGS. Models often send a JSON number,
+ * which Connect rejects (seen live 2026-09-23). A number is converted only
+ * when it is an exact safe integer: beyond 2^53 the value was already rounded
+ * when the tool call was parsed, so it is refused rather than sent wrong.
+ *
+ * @returns {{ input: object } | { error: string }} a copy with string amounts
+ */
+export function normalizeAmounts(input) {
+  const fix = (v, where) => {
+    if (v == null || isIntString(v)) return { v };
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return { v: String(v) };
+    if (typeof v === 'string' && /^\s*\d+\s*$/.test(v)) return { v: v.trim() };
+    return { error: `Nothing was sent: ${where} must be a whole number of base units written as a string, e.g. "10000" for 0.01 USDC (got ${JSON.stringify(v)}).` };
+  };
+  const out = { ...(input ?? {}) };
+  if ('amountInWeiPerRecipient' in out) {
+    const r = fix(out.amountInWeiPerRecipient, 'amountInWeiPerRecipient');
+    if (r.error) return { error: r.error };
+    out.amountInWeiPerRecipient = r.v;
+  }
+  if (Array.isArray(out.recipients)) {
+    const recips = [];
+    for (const rec of out.recipients) {
+      if (rec && typeof rec === 'object' && 'amountInWei' in rec) {
+        const r = fix(rec.amountInWei, 'amountInWei');
+        if (r.error) return { error: r.error };
+        recips.push({ ...rec, amountInWei: r.v });
+      } else recips.push(rec);
+    }
+    out.recipients = recips;
+  }
+  return { input: out };
+}
 
 const sameToken = (a, b) => {
   if (a == null || b == null) return a == null && b == null;
