@@ -567,7 +567,28 @@ test('connect_drop is forwarded to Connect exactly as the model wrote it', async
   })();
   const input = { idempotencyKey: 'from-model', chainId: 1399811149, tokenContract: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', recipients: [{ type: 'discord', id: '731076204307677226' }], amountInWeiPerRecipient: '10000' };
   const out = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
-  assert.deepEqual(seen, [{ name: 'connect_drop', input, key: 'k' }], 'same tool, same arguments, sender key');
+  assert.equal(seen.length, 1);
+  const { idempotencyKey: sent, ...rest } = seen[0].input;
+  const { idempotencyKey: _model, ...expected } = input;
+  assert.deepEqual({ name: seen[0].name, input: rest, key: seen[0].key }, { name: 'connect_drop', input: expected, key: 'k' }, 'same tool, same arguments, sender key');
+  assert.match(sent, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'a fresh UUID from the bot');
+  assert.notEqual(sent, 'from-model', 'never the key the model chose');
   assert.equal(out.transferHash, '0xabc');
   assert.ok(out.explorerUrl, 'the real explorer link is attached and recorded');
+});
+
+test('connect_drop gets a new key on every call, and a 202 is retried with the same key', async () => {
+  const { deps } = buildRunTool();
+  const seen = [];
+  const replies = ['{"httpStatus":202,"status":"processing"}', '{"httpStatus":201,"transferHash":"0xabc"}', '{"httpStatus":201,"transferHash":"0xdef"}'];
+  const d = { ...deps, mcpCallTool: async (name, input) => { seen.push(input.idempotencyKey); return replies[seen.length - 1]; } };
+  const rt = new Function(...Object.keys(d), `${runToolSrc}\nreturn runTool;`)(...Object.values(d));
+  const input = { idempotencyKey: 'f47ac10b-58cc-4372-a567-0e02b2c3d479', chainId: 8453, recipients: [{ type: 'discord', id: '1' }], amountInWeiPerRecipient: '10000' };
+  const first = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  assert.equal(first.transferHash, '0xabc');
+  assert.equal(seen[0], seen[1], '202 retry reuses the same key');
+  const second = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  assert.equal(second.transferHash, '0xdef');
+  assert.notEqual(seen[2], seen[0], 'a new call gets a new key, even when the model repeats its own');
+  assert.ok(!seen.includes('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
 });

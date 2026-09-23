@@ -160,3 +160,12 @@ test('registered tools are shown with plain types', async () => {
   await reg.refresh();
   assert.equal(tools.find((t) => t.name === 'connect_drop').input_schema.properties.tokenContract.type, 'string');
 });
+
+test('the model is not shown connect_drop\'s idempotencyKey; other tools are unchanged', async () => {
+  const schema = { type: 'object', properties: { idempotencyKey: { type: 'string' }, chainId: { type: 'integer' } }, required: ['idempotencyKey', 'chainId'] };
+  const { tools, reg } = setup([[{ ...rw('connect_drop'), inputSchema: schema }, { ...ro('connect_lookup'), inputSchema: schema }]]);
+  await reg.refresh();
+  const drop = tools.find((t) => t.name === 'connect_drop').input_schema;
+  assert.deepEqual(drop, { type: 'object', properties: { chainId: { type: 'integer' } }, required: ['chainId'] });
+  assert.deepEqual(tools.find((t) => t.name === 'connect_lookup').input_schema, schema);
+});
