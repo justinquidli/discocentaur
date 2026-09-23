@@ -21,8 +21,7 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult,
-  formatAmount, parseConfirmCommand,
-} from '../held-actions.js';
+  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD } from '../held-actions.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -205,6 +204,13 @@ function buildRunTool() {
     heldActions: createHeldActionStore(),
     describeHeldAction,
     heldToolResult,
+    ALWAYS_HELD,
+    SELF_HELD,
+    bankrRateCheck: () => null,
+    groundCheck: () => null,
+    summariseRound: (label) => `round ${label}`,
+    payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
+    payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
     mcpToolNames: new Set(['connect_drop']),
     explorerTxUrl: (c, h) => (h ? `https://basescan.org/tx/${h}` : null),
     MCP_CONFIRM_TOOLS,
@@ -250,6 +256,27 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
   });
 }
 
+test('payout proposes, posts the split itself, and holds — in one call', async () => {
+  const { runTool, calls } = buildRunTool();
+  const heldNotices = [];
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.deepEqual(calls, [], 'nothing paid before confirmation');
+  assert.match(heldNotices.join('\n'), /@alice — 100 BNKR/, 'the bot posts the split');
+  assert.match(heldNotices.join('\n'), /moves money/i);
+  assert.ok(!out.message?.includes('100 BNKR'), 'the model is not given the amounts');
+
+  await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
+  assert.deepEqual(calls, [{ tool: 'payout' }], 'confirmed call executes');
+});
+
+test('payout is refused for anyone but the owner', async () => {
+  const { runTool, calls } = buildRunTool();
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'someone', confirmed: true }));
+  assert.equal(out.status, 'refused');
+  assert.deepEqual(calls, []);
+});
+
 test('without a document, drops run as before', async () => {
   const { runTool, calls } = buildRunTool();
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
@@ -271,7 +298,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const branches = [...runToolSrc.matchAll(/if \(name === '([a-z_]+)'\) \{([\s\S]*?)\n  \}/g)];
   assert.ok(branches.length > 5, 'branch parser still matches runTool');
   const spending = branches
-    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
+    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
   assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => !MCP_SEND_TOOLS.has(t)).sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');

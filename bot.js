@@ -23,11 +23,12 @@ import {
   createDocumentTaint,
 } from './documents.js';
 import {
-  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+  MONEY_TOOLS, ALWAYS_HELD, SELF_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
+import { payoutProposal, payoutExecute, summariseRound, groundCheck } from './payout-proposal.js';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
@@ -1136,6 +1137,20 @@ const tools = [
       required: ['prompt'],
     },
   },
+  {
+    name: 'payout',
+    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and holds the payment for the user to confirm with a code. You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'The repo as the user gave it: a pasted GitHub URL or owner/name. Pass it through as-is.' },
+        budget: { type: 'string', description: 'Total to split, in units of the token, e.g. "5000".' },
+        token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
+        since: { type: 'string', description: 'How far back to look, as the user said it: "3d", "48h", "2 weeks" -> "14d". Required — never leave it out and never substitute a default, because the window decides which PRs are scored and a wrong one silently rewards the wrong people.' },
+      },
+      required: ['repo', 'budget', 'since'],
+    },
+  },
 ];
 
 const mcpRegistry = createMcpRegistry({ tools, listTools: () => mcpRpc('tools/list', {}, QUIDLI_API_KEY) });
@@ -1206,7 +1221,7 @@ function trackedRunTool(name, input, ctx) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null,
+  senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
@@ -1217,7 +1232,7 @@ async function runTool(name, input, {
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
-  if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
+  if (MONEY_TOOLS.has(name) && !SELF_HELD.has(name) && (documentInContext || ALWAYS_HELD.has(name)) && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
@@ -1283,6 +1298,58 @@ async function runTool(name, input, {
       throw err;
     }
   }
+  // One call: score, post the split, hold. The label lives in the held action,
+  // never in the conversation, so nothing the model says can change what pays.
+  if (name === 'payout') {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run a payout.' });
+
+    if (confirmed) {
+      console.log(`[payout] execute label=${input.label}`);
+      const done = await payoutExecute({ label: input.label });
+      console.log(`[payout] execute ${done.status}`);
+      return JSON.stringify(done, null, 2);
+    }
+
+    // Check the extraction against what the user wrote before spending a
+    // scoring run on it. A window or budget the model supplied on its own pays
+    // a different set of people and looks entirely plausible doing it.
+    const ungrounded = groundCheck(input, userText);
+    if (ungrounded) {
+      console.log(`[payout] ungrounded: ${ungrounded}`);
+      return JSON.stringify({
+        status: 'refused',
+        executed: false,
+        message: `Not run: ${ungrounded}. Do not retry with a value you chose yourself — ask the user for the repo, the budget and the time window, and use exactly what they say.`,
+      }, null, 2);
+    }
+
+    const rl = bankrRateCheck(String(senderId));
+    if (rl) return JSON.stringify({ status: 'refused', executed: false, message: rl });
+    console.log(`[payout] propose sender=${senderId}`, JSON.stringify(input).slice(0, 160));
+    const proposal = await payoutProposal(input);
+    console.log(`[payout] propose ${proposal.status}`);
+    if (proposal.status !== 'ok') return JSON.stringify(proposal, null, 2);
+    if (!proposal.label) return JSON.stringify({ status: 'error', executed: false, error: 'the round was not written; nothing to confirm' }, null, 2);
+
+    // The bot posts the split itself. The model is never given the figures,
+    // because a model that retyped them got two rows wrong while the total
+    // still matched — the hardest kind of error to catch by eye.
+    heldNotices?.push('```\n' + String(proposal.proposal).slice(0, 1800) + '\n```');
+
+    const held = heldActions.hold({
+      tool: name,
+      input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined },
+      senderId,
+      channelId: currentChannelId,
+      contextId,
+    });
+    if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+    console.log(`[held] payout code=${held.code} label=${proposal.label}`);
+    heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined } }));
+    return heldToolResult(held.code);
+  }
+
   if (name === 'bankr_swap_and_drop') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const bankrKey = getUserBankrKey(senderId) || (isOwner ? BANKR_API_KEY : null);
@@ -2253,6 +2320,7 @@ async function handleMessage(message) {
     botId: message.client.user.id,
     senderApiKey,
     senderUser: message.author,
+    userText: message.content,
     currentChannelId: message.channelId,
     contextId,
     documentInContext,
@@ -2664,6 +2732,7 @@ async function handleConfirmCommand(message, { verb, code }) {
   const succeeded = isConnectWrite ? !String(raw ?? '').startsWith('Error:')
     : action.tool === 'connect_drop' ? !!result.transferHash
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
+    : action.tool === 'payout' ? result.status === 'ok'
     : !!result.success;
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
@@ -2674,7 +2743,11 @@ async function handleConfirmCommand(message, { verb, code }) {
     ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? (isConnectWrite ? String(raw ?? '') : '')));
 
-  if (action.tool === 'bankr_swap_and_drop') {
+  if (action.tool === 'payout') {
+    const icon = { ok: '✅', unknown: '⚠️', not_paid: '⚠️' }[result.status] ?? '❌';
+    const detail = result.status === 'ok' ? result.output : (result.error ?? result.output ?? 'no detail');
+    await say(`${icon} \`${action.code}\` round \`${result.label ?? action.input?.label ?? '?'}\`:\n\`\`\`\n${String(detail).slice(0, 1500)}\n\`\`\``);
+  } else if (action.tool === 'bankr_swap_and_drop') {
     const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
     const icon = { completed: '✅', partial: '⚠️', unknown: '⚠️' }[result.status] ?? '❌';
     await say(`${icon} \`${action.code}\`: ${String(result.message ?? raw).slice(0, 1200)}${links}`);
