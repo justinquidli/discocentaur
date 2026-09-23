@@ -123,7 +123,7 @@ npm start
 
 For production with pm2:
 ```bash
-pm2 start bot.js --name claudetaur
+pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
@@ -141,6 +141,22 @@ the legacy fallback, the keyless header), the drop recipient enum, which has sil
 the server's once already, per-chain explorer links, and the fabricated-transaction-link guard. `bot.js` connects to Discord on import, so the tests extract the
 functions under test from its source rather than importing it — a stopgap until it's split into
 modules.
+
+### Restarts and shutdown
+
+`ecosystem.config.cjs` sets pm2's `kill_timeout` to 15 s. On SIGINT/SIGTERM the bot stops taking
+messages, refuses new transfers and trust changes, waits up to 10 s for any drop already submitted
+to come back (`shutdown.js`), then exits 0. With pm2's default 1.6 s, a deploy used to SIGKILL the
+bot — possibly after a transfer went out but before it was recorded.
+
+A process first started with `pm2 start bot.js --name claudetaur` keeps the old timeout; switch it once
+with `pm2 delete claudetaur && pm2 start ecosystem.config.cjs && pm2 save`. A clean restart logs
+`[shutdown] clean exit`, and `~/.pm2/pm2.log` shows `exited with code [0] via signal [SIGINT]`
+rather than `[SIGKILL]`.
+
+Stored keys that can't be decrypted (for example after `MASTER_ENCRYPTION_KEY` changed) are
+treated as missing and logged once as `[keys] ⚠️  a stored key … could not be read` — they are
+never sent upstream as a key. A malformed `MASTER_ENCRYPTION_KEY` stops the bot at startup.
 
 ## Per-user API keys
 
@@ -167,8 +183,9 @@ Connect exposes itself as an MCP server, and the bot consumes part of its surfac
 rather than hand-writing REST calls. **Which tools are offered is decided by the server, not by
 a list in `bot.js`.**
 
-Connect annotates every tool with the MCP `readOnlyHint`. At startup the bot discovers the tool
-list and registers everything marked read-only. As of Connect MCP 0.5.8 that is nine tools:
+Connect annotates every tool with the MCP `readOnlyHint`. The bot discovers the tool list at
+startup, re-reads it every 10 minutes, and registers everything marked read-only. As of Connect
+MCP 0.5.8 that was nine tools (the trust tools below came later):
 
 | Tool | Notes |
 |---|---|
@@ -182,22 +199,34 @@ list and registers everything marked read-only. As of Connect MCP 0.5.8 that is 
 | `connect_get_chains` | which chains support which features |
 | `connect_get_price` | x402 list prices |
 
-`connect_drop` is the tenth tool and is **never** offered to the model. It is annotated
-non-read-only, so the gate withholds it; drops go through the hardcoded `quidli_drop`.
+`connect_drop` is **never** offered to the model. It is annotated non-read-only, so the gate
+withholds it; drops go through the hardcoded `quidli_drop`.
+
+Trust tools: `connect_trust_check` and `connect_trust_graph` are read-only and register like the
+rest. `connect_trust_create` and `connect_trust_revoke` are write tools — they sign an EAS
+attestation from the key owner's wallet — and are offered only because they are named in
+`MCP_CONFIRM_TOOLS`. Every call to them is held and runs only after the user's
+`!confirm <code>`, whether or not a document is in the conversation. Any other write tool Connect
+adds stays withheld until someone deliberately adds it to that set.
 
 How it works:
 
-- `selectMcpTools()` in `bot.js` is the gate. It is a pure function precisely so it can be tested,
+- `selectMcpTools()` in `connect-mcp.js` (shared with the other bot) is the gate. It is a pure function precisely so it can be tested,
   and it **fails closed**: a tool with no `readOnlyHint` is withheld. That is the case a
   name-pattern rule gets wrong — a future `connect_payout` matches `/pay/`, a `connect_execute`
   matches nothing at all. Absence of an annotation is unambiguous; a name is not.
-- A new read-only Connect tool therefore needs **no code change here** — it appears on the next
-  restart. This is the whole point; do not reintroduce a name list.
+- A new read-only Connect tool therefore needs **no code change and no restart** — it appears
+  within 10 minutes (`MCP_REFRESH_MS`), and the log says `[mcp] tools updated — added: …`.
+  Removed and re-described tools are swapped the same way. This is the whole point; do not
+  reintroduce a name list.
 - `MCP_LEGACY_ALLOWLIST` is the fallback for a Connect MCP older than the annotations (< 0.5.8).
   If the server annotates nothing, the bot cannot tell a read from a spend, so it offers exactly
   the five tools it always did and logs a loud warning. Without this, pointing at an old server
   would register zero tools.
-- Discovery happens once at startup via plain JSON-RPC over POST. The server is stateless and
+- Discovery (`createMcpRegistry()`) runs at startup and then on a timer, via plain JSON-RPC over
+  POST — the bots never hear `listChanged`, so they poll. A failed or empty `tools/list` keeps the
+  last good set, and an MCP tool whose name matches a hardcoded one is skipped, not allowed to
+  shadow it. The server is stateless and
   reads `x-api-key` per request, so there's no initialize handshake and no MCP SDK dependency.
 - Each call uses the **sender's** key; the host key is used only for the bot owner. A sender with
   no key still gets a call: `connect_get_chains` and `connect_get_price` are served anonymously,

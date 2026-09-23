@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { selectMcpTools } from '../connect-mcp.js';
 
 const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'bot.js'), 'utf8');
 const grab = (name) => {
@@ -24,10 +25,8 @@ const grab = (name) => {
 const build = (body, ret, args = {}) =>
   new Function(...Object.keys(args), `${body}\nreturn ${ret};`)(...Object.values(args));
 
-const buildSelect = () => {
-  const legacy = SRC.match(/^const MCP_LEGACY_ALLOWLIST = new Set\(\[[^\]]*\]\);$/m)[0];
-  return build(`${legacy}\n${grab('selectMcpTools')}`, 'selectMcpTools');
-};
+// selectMcpTools lives in connect-mcp.js now; more cases in connect-mcp.test.mjs.
+const buildSelect = () => selectMcpTools;
 
 test('read-only tools auto-register and connect_drop never does', () => {
   const selectMcpTools = buildSelect();

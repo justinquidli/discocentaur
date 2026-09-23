@@ -211,6 +211,10 @@ function buildRunTool() {
     payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
     mcpToolNames: new Set(),
+    MCP_CONFIRM_TOOLS,
+    shutdown: { stopping: false, track: (p) => p },
+    mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
+    redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
     quidliDrop: async (input, key) => { calls.push({ tool: 'quidli_drop', key }); return { transferHash: '0xabc', explorerUrl: null }; },
     // Any DB touch means a scheduled/conditional/watcher write happened.
@@ -364,9 +368,11 @@ function buildConfirm(runToolImpl) {
     heldOutcomeRecords: createRecordQueue(),
     verifiedTxLinks: createVerifiedLinkStore(),
     describeHeldAction, formatOutcomeRecord,
+    MCP_CONFIRM_TOOLS,
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
     runTool: runToolImpl,
+    trackedRunTool: runToolImpl,
   };
   const fn = new Function(...Object.keys(deps), `${src}\nreturn handleConfirmCommand;`)(...Object.values(deps));
   const replies = [];
@@ -499,4 +505,73 @@ test('bare !confirm with nothing held explains how to get a code', async () => {
   const { fn, message, replies } = buildConfirm(async () => '{}');
   await fn(message, { verb: 'confirm', code: null });
   assert.match(replies.at(-1), /Nothing is waiting.*!confirm/);
+});
+
+// ─── Connect write tools: always confirmed, document or not ─────────────────
+
+import { MCP_CONFIRM_TOOLS } from '../connect-mcp.js';
+
+const trustInput = { to: { type: 'github', username: 'alice' }, level: 80, context: 'team:quidli' };
+
+for (const tool of ['connect_trust_create', 'connect_trust_revoke']) {
+  test(`${tool} waits for !confirm even with no document in context`, async () => {
+    const { runTool, calls, deps } = buildRunTool();
+    deps.mcpToolNames.add(tool);
+    const heldNotices = [];
+    const out = JSON.parse(await runTool(tool, trustInput, { senderId: 'u1', senderApiKey: 'k', heldNotices }));
+    assert.equal(out.status, 'held_for_confirmation');
+    assert.match(out.message, /Trust changes/);
+    assert.deepEqual(calls, [], 'nothing written before confirmation');
+    assert.equal(heldNotices.length, 1);
+    assert.match(heldNotices[0], new RegExp(`!confirm ${out.code}`));
+    assert.match(heldNotices[0], /trust graph/);
+    assert.match(heldNotices[0], /alice/);
+
+    await runTool(tool, trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true });
+    assert.deepEqual(calls, [{ tool, key: 'k' }], 'confirmed call runs with the sender\'s key');
+  });
+}
+
+test('trust write from a keyless non-owner is not held and never gets the host key', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.mcpToolNames.add('connect_trust_create');
+  await runTool('connect_trust_create', trustInput, { senderId: 'nobody' });
+  assert.equal(deps.heldActions.size, 0);
+  assert.deepEqual(calls, [{ tool: 'connect_trust_create', key: null }], 'anonymous call — the server refuses it');
+});
+
+test('read-only MCP tools are never held', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.mcpToolNames.add('connect_trust_check');
+  await runTool('connect_trust_check', {}, { senderId: 'u1', senderApiKey: 'k', documentInContext: true });
+  assert.deepEqual(calls, [{ tool: 'connect_trust_check', key: 'k' }]);
+});
+
+test('!confirm on a trust write reports the server result and records it', async () => {
+  const ok = buildConfirm(async () => '{"uid":"0xatt","status":"created"}');
+  const a = ok.deps.heldActions.hold({ tool: 'connect_trust_create', input: trustInput, senderId: 'u1', channelId: 'c1', contextId: 't' });
+  await ok.fn(ok.message, { verb: 'confirm', code: a.code });
+  assert.match(ok.replies.at(-1), /✅ Done/);
+  const rec = ok.deps.heldOutcomeRecords.take('t')[0];
+  assert.match(rec, /held action .* \(trust attestation for github:alice at level 80 in context team:quidli\) was CONFIRMED/);
+
+  const no = buildConfirm(async () => 'Error: this needs your own Quidli key.');
+  const b = no.deps.heldActions.hold({ tool: 'connect_trust_revoke', input: trustInput, senderId: 'u1', channelId: 'c1', contextId: 't' });
+  await no.fn(no.message, { verb: 'confirm', code: b.code });
+  assert.match(no.replies.at(-1), /did not go through: Error: this needs your own Quidli key/);
+  assert.match(no.deps.heldOutcomeRecords.take('t')[0], /FAILED/);
+});
+
+test('while the bot is shutting down, new money and trust actions are refused, reads are not', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.shutdown.stopping = true;
+  deps.mcpToolNames.add('connect_trust_create');
+  deps.mcpToolNames.add('connect_lookup');
+  for (const tool of ['quidli_drop', 'connect_trust_create']) {
+    const out = JSON.parse(await runTool(tool, tool === 'quidli_drop' ? drop : trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
+    assert.equal(out.status, 'refused');
+    assert.match(out.error, /restarting/);
+  }
+  await runTool('connect_lookup', {}, { senderId: 'u1', senderApiKey: 'k' });
+  assert.deepEqual(calls, [{ tool: 'connect_lookup', key: 'k' }]);
 });
