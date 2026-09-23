@@ -1463,10 +1463,13 @@ async function runTool(name, input, {
 
 // ─── LLM clients ─────────────────────────────────────────────────────────────
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+// Model calls give up after 2 min and retry once, instead of the SDK default
+// of 10 min × 3 tries — a stalled provider left "Thinking…" up for ages.
+const LLM_TIMEOUT = { timeout: 120_000, maxRetries: 1 };
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY, ...LLM_TIMEOUT });
 
 function getAnthropicClient(userApiKey) {
-  if (userApiKey) return new Anthropic({ apiKey: userApiKey });
+  if (userApiKey) return new Anthropic({ apiKey: userApiKey, ...LLM_TIMEOUT });
   return anthropic;
 }
 
@@ -1481,7 +1484,7 @@ async function getOpenAIClient(userApiKey, baseURL) {
   const key = userApiKey || OPENAI_API_KEY;
   if (!key) throw new Error('No OpenAI API key available. DM me `!llm openai <key>` to connect your own.');
   const { default: OpenAI } = await import('openai');
-  return new OpenAI({ apiKey: key, ...(baseURL ? { baseURL } : {}) });
+  return new OpenAI({ apiKey: key, ...LLM_TIMEOUT, ...(baseURL ? { baseURL } : {}) });
 }
 
 // ─── Tool format converters ───────────────────────────────────────────────────
