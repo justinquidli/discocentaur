@@ -147,7 +147,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
 ## Sending tokens (connect_drop)
-- Pass people straight to connect_drop as recipients — Connect resolves them to the right wallet for the chain and creates one if they don't have one yet. You don't need connect_lookup first. If Connect answers "processing", call connect_drop again with the same idempotencyKey.
+- Pass people straight to connect_drop as recipients — Connect resolves them to the right wallet for the chain and creates one if they don't have one yet. You don't need connect_lookup first. If the result still says "processing", Connect is setting up the recipient's wallet and nothing was sent: tell the user to ask again in a minute.
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
@@ -1270,7 +1270,17 @@ async function runTool(name, input, {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
     try {
-      const mcpOut = await mcpCallTool(name, input, keyToUse);
+      // connect_drop's idempotency key comes from the bot, one per call: a
+      // model reused the UUID spec's example key, and Connect treats a reused
+      // key as the same send (2026-09-23). A 202 means Connect is still
+      // setting up recipient wallets and sent nothing yet — it asks for a
+      // retry with the same key, which only the bot can do now.
+      const callInput = name === 'connect_drop' ? { ...input, idempotencyKey: crypto.randomUUID() } : input;
+      let mcpOut = await mcpCallTool(name, callInput, keyToUse);
+      for (let i = 0; name === 'connect_drop' && i < 5 && /"httpStatus":\s*202/.test(mcpOut); i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        mcpOut = await mcpCallTool(name, callInput, keyToUse);
+      }
       if (name === 'connect_drop') {
         let body;
         try { body = JSON.parse(mcpOut); } catch { return mcpOut; }

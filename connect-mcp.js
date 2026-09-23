@@ -60,6 +60,17 @@ export function plainSchema(node) {
   return out;
 }
 
+// The bot sets connect_drop's idempotencyKey itself (see runTool), so the
+// model isn't shown the field.
+function modelSchema(t) {
+  const s = plainSchema(t.inputSchema);
+  if (!MCP_SEND_TOOLS.has(t.name) || !s?.properties?.idempotencyKey) return s;
+  const { idempotencyKey: _key, ...properties } = s.properties;
+  const out = { ...s, properties };
+  if (Array.isArray(s.required)) out.required = s.required.filter((k) => k !== 'idempotencyKey');
+  return out;
+}
+
 export const MCP_REFRESH_MS = 10 * 60 * 1000;
 
 /**
@@ -142,7 +153,7 @@ export function createMcpRegistry({ tools, listTools, logger = console }) {
       names.clear();
       sigs.clear();
       for (const t of next) {
-        tools.push({ name: t.name, description: t.description ?? '', input_schema: plainSchema(t.inputSchema) });
+        tools.push({ name: t.name, description: t.description ?? '', input_schema: modelSchema(t) });
         names.add(t.name);
         sigs.set(t.name, signature(t));
       }
