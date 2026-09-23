@@ -23,7 +23,7 @@ import { MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 // Tools whose execution commits the sender's funds, now or later.
 // bankr_agent is here because a Bankr prompt can swap or transfer from the
 // sender's Bankr wallet — we can't tell a price check from a send by its args.
-export const MONEY_TOOLS = new Set(['quidli_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'bankr_agent', 'bankr_swap_and_drop', 'payout']);
+export const MONEY_TOOLS = new Set(['connect_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'bankr_agent', 'bankr_swap_and_drop', 'payout']);
 
 // payout holds itself: it must score and post the split BEFORE asking for a
 // confirmation, so the generic gate would fire too early. Kept as a set so the
@@ -108,6 +108,16 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
   };
 }
 
+// connect_drop can carry a different amount per recipient instead of one
+// uniform amount; show each one rather than an "invalid amount".
+function amountLabel(input, chainId) {
+  const per = Array.isArray(input.recipients) && input.amountInWeiPerRecipient == null
+    ? input.recipients.map((r) => r?.amountInWei).filter((a) => a != null) : [];
+  return per.length
+    ? `per-recipient amounts (${per.slice(0, 15).map((a) => formatAmount(a, input.tokenContract, chainId)).join(', ')})`
+    : formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
+}
+
 export function formatAmount(amountInWei, tokenContract, chainId = 8453) {
   const raw = String(amountInWei ?? '');
   if (!/^\d+$/.test(raw)) return `⚠️ invalid amount "${raw.slice(0, 40)}"`;
@@ -139,7 +149,7 @@ function describeRecipient(r) {
 export function describeHeldAction({ code, tool, input }) {
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
-  const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
+  const amount = amountLabel(input, chainId);
   const lines = [];
 
   const recipients = Array.isArray(input.recipients) ? input.recipients : [];
@@ -165,7 +175,7 @@ export function describeHeldAction({ code, tool, input }) {
   } else if (tool === 'bankr_agent') {
     lines.push(`**Bankr agent** request (runs against your Bankr wallet — it may trade or transfer):`);
     lines.push(`“${String(input.prompt ?? '').slice(0, 500)}”`);
-  } else if (tool === 'quidli_drop') {
+  } else if (tool === 'connect_drop') {
     lines.push(`**Send now** on ${chain}: ${amount} each to ${recipients.length} recipient${recipients.length === 1 ? '' : 's'}`);
     lines.push(`→ ${shownRecipients || '(none)'}`);
   } else if (tool === 'schedule_drop') {
@@ -262,9 +272,9 @@ function summarise({ tool, input }) {
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
-  const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
+  const amount = amountLabel(input, chainId);
   const n = Array.isArray(input.recipients) ? input.recipients.length : 0;
-  const kind = { quidli_drop: 'send', schedule_drop: 'scheduled send', conditional_drop: 'conditional send', create_watcher: 'watcher' }[tool] ?? tool;
+  const kind = { connect_drop: 'send', schedule_drop: 'scheduled send', conditional_drop: 'conditional send', create_watcher: 'watcher' }[tool] ?? tool;
   const who = n ? `to ${n} recipient${n === 1 ? '' : 's'} (${input.recipients.slice(0, 5).map((r) => `${r.type}:${r.id ?? r.username}`).join(', ')}${n > 5 ? ', …' : ''})` : '';
   return `${kind} of ${amount} each ${who} on ${chain}`.replace(/\s+/g, ' ');
 }

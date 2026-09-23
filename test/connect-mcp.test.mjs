@@ -16,10 +16,10 @@ const quiet = { log: () => {}, error: () => {} };
 // ── selectMcpTools ───────────────────────────────────────────────────────────
 
 test('connect_drop can never be made confirmable', () => {
-  assert.equal(MCP_CONFIRM_TOOLS.has('connect_drop'), false, 'the money path stays in quidli_drop');
+  assert.equal(MCP_CONFIRM_TOOLS.has('connect_drop'), false, 'connect_drop is wrapped, not a confirm tool');
 });
 
-test('write tools are withheld unless named in MCP_CONFIRM_TOOLS', () => {
+test('write tools are withheld unless named as confirm or wrapped tools', () => {
   const { register, skipped } = selectMcpTools([
     ro('connect_lookup'),
     rw('connect_drop'),
@@ -27,8 +27,8 @@ test('write tools are withheld unless named in MCP_CONFIRM_TOOLS', () => {
     rw('connect_trust_revoke'),
     rw('connect_something_new'),
   ]);
-  assert.deepEqual(register.map((t) => t.name), ['connect_lookup', 'connect_trust_create', 'connect_trust_revoke']);
-  assert.deepEqual(skipped, ['connect_drop', 'connect_something_new']);
+  assert.deepEqual(register.map((t) => t.name), ['connect_lookup', 'connect_drop', 'connect_trust_create', 'connect_trust_revoke']);
+  assert.deepEqual(skipped, ['connect_something_new'], 'connect_drop is wrapped; any other new write tool stays out');
 });
 
 test('a confirmable name without readOnlyHint:false is still withheld', () => {
@@ -46,7 +46,7 @@ test('legacy fallback never offers a confirmable write tool', () => {
 // ── createMcpRegistry ────────────────────────────────────────────────────────
 
 function setup(responses) {
-  const tools = [{ name: 'quidli_drop', description: 'local', input_schema: {} }];
+  const tools = [{ name: 'schedule_drop', description: 'local', input_schema: {} }];
   let i = 0;
   let listCalls = 0;
   const listTools = async () => {
@@ -62,11 +62,13 @@ function setup(responses) {
 const toolNames = (tools) => tools.map((t) => t.name);
 
 test('first refresh registers the allowed tools next to the hardcoded ones', async () => {
-  const { tools, reg } = setup([[ro('connect_lookup'), rw('connect_drop')]]);
+  const { tools, reg } = setup([[ro('connect_lookup'), rw('connect_drop'), rw('connect_settle')]]);
   const r = await reg.refresh();
   assert.equal(r.ok, true);
-  assert.deepEqual(toolNames(tools), ['quidli_drop', 'connect_lookup']);
-  assert.deepEqual([...reg.names], ['connect_lookup']);
+  assert.deepEqual(toolNames(tools), ['schedule_drop', 'connect_lookup', 'connect_drop']);
+  assert.deepEqual([...reg.names], ['connect_lookup', 'connect_drop']);
+  const drop = tools.find((t) => t.name === 'connect_drop');
+  assert.equal(drop.input_schema.properties?.idempotencyKey, undefined, 'registered in its model-facing form');
 });
 
 test('a new tool appears, a retired one goes, without a restart', async () => {
@@ -79,7 +81,7 @@ test('a new tool appears, a retired one goes, without a restart', async () => {
   const r = await reg.refresh();
   assert.deepEqual(r.added, ['connect_trust_graph']);
   assert.deepEqual(r.removed, ['connect_me']);
-  assert.deepEqual(toolNames(tools).sort(), ['connect_lookup', 'connect_trust_graph', 'quidli_drop']);
+  assert.deepEqual(toolNames(tools).sort(), ['connect_lookup', 'connect_trust_graph', 'schedule_drop']);
   assert.equal(reg.names, namesRef, 'the set the dispatcher holds is mutated in place');
   assert.ok(reg.names.has('connect_trust_graph') && !reg.names.has('connect_me'));
 });
@@ -110,16 +112,16 @@ test('a failed or empty tools/list keeps the last good set', async () => {
   await reg.refresh();
   assert.equal((await reg.refresh()).ok, false);
   assert.equal((await reg.refresh()).ok, false);
-  assert.deepEqual(toolNames(tools), ['quidli_drop', 'connect_lookup']);
+  assert.deepEqual(toolNames(tools), ['schedule_drop', 'connect_lookup']);
   assert.ok(reg.names.has('connect_lookup'));
 });
 
 test('an MCP tool cannot shadow a hardcoded tool', async () => {
-  const { tools, reg } = setup([[ro('quidli_drop'), ro('connect_lookup')]]);
+  const { tools, reg } = setup([[ro('schedule_drop'), ro('connect_lookup')]]);
   await reg.refresh();
-  assert.deepEqual(toolNames(tools), ['quidli_drop', 'connect_lookup']);
+  assert.deepEqual(toolNames(tools), ['schedule_drop', 'connect_lookup']);
   assert.equal(tools[0].description, 'local');
-  assert.equal(reg.names.has('quidli_drop'), false);
+  assert.equal(reg.names.has('schedule_drop'), false);
 });
 
 test('overlapping refreshes share one tools/list call', async () => {
