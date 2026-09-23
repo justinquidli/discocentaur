@@ -19,39 +19,13 @@ export const MCP_LEGACY_ALLOWLIST = new Set(['connect_drop_balance', 'connect_sc
 // Write tools the model may call, but which never run without the user's
 // explicit /confirm (Telegram) or !confirm (Discord) — document or not. Named
 // one by one on purpose: a new write tool from Connect stays withheld until
-// someone decides it belongs here. connect_drop is not here: it is wrapped
-// (below) and follows the same hold rules as every other money tool.
+// someone decides it belongs here.
 export const MCP_CONFIRM_TOOLS = new Set(['connect_trust_create', 'connect_trust_revoke']);
 
-// Write tools the model sees with Connect's own description and schema, but
-// which the bot never forwards as-is: runTool routes them to its own code
-// (connect-drop.js for connect_drop) — the bot sets the idempotency key,
-// checks the amount and retries safely. The key is removed from what the
-// model sees, because a model-chosen key turns a retry into a second payment.
-export const MCP_WRAPPED_TOOLS = new Set(['connect_drop']);
-const WRAPPED_NOTE = {
-  connect_drop: ' The bot sets idempotencyKey and retries timeouts itself — call connect_drop ONCE per request. ' +
-    'A result with status "unknown" may have gone through: tell the user and do not send again. ' +
-    'The bot also checks that the amount matches a number the user wrote, and refuses a mismatch.',
-};
-
-/** What the model is shown for a discovered tool. Pure; exported for tests. */
-export function modelFacingTool(t) {
-  const tool = { name: t.name, description: t.description ?? '', input_schema: t.inputSchema };
-  if (!MCP_WRAPPED_TOOLS.has(t.name)) return tool;
-  const schema = structuredClone(t.inputSchema ?? { type: 'object', properties: {} });
-  if (schema.properties) delete schema.properties.idempotencyKey;
-  if (Array.isArray(schema.required)) schema.required = schema.required.filter((k) => k !== 'idempotencyKey');
-  // Connect's schema for the amount is an anyOf that models misread and fill
-  // with a number, which Connect then rejects. Show a plain string.
-  if (schema.properties?.amountInWeiPerRecipient) {
-    schema.properties.amountInWeiPerRecipient = {
-      type: 'string',
-      description: 'Amount per recipient in base units, as a string of digits: "10000" = 0.01 USDC (6 decimals), "1000000000" = 1 SOL (9), ETH has 18.',
-    };
-  }
-  return { ...tool, description: tool.description + (WRAPPED_NOTE[t.name] ?? ''), input_schema: schema };
-}
+// Write tools offered to the model as Connect defines them and forwarded as-is.
+// connect_drop is how the bot sends; it follows the same hold rules as every
+// other money tool (MONEY_TOOLS in held-actions.js).
+export const MCP_SEND_TOOLS = new Set(['connect_drop']);
 
 export const MCP_REFRESH_MS = 10 * 60 * 1000;
 
@@ -61,8 +35,7 @@ export const MCP_REFRESH_MS = 10 * 60 * 1000;
  *
  * A server that annotates ANY tool is treated as annotation-capable, so an
  * unannotated tool from that server is withheld — fail closed. A tool marked
- * readOnlyHint:false is withheld unless it is named in MCP_CONFIRM_TOOLS or
- * MCP_WRAPPED_TOOLS.
+ * readOnlyHint:false is withheld unless it is named in MCP_CONFIRM_TOOLS.
  */
 export function selectMcpTools(offered) {
   const list = Array.isArray(offered) ? offered : [];
@@ -73,7 +46,7 @@ export function selectMcpTools(offered) {
     if (!t?.name) continue;
     const ro = t.annotations?.readOnlyHint;
     const allow = annotated
-      ? ro === true || (ro === false && (MCP_CONFIRM_TOOLS.has(t.name) || MCP_WRAPPED_TOOLS.has(t.name)))
+      ? ro === true || (ro === false && (MCP_CONFIRM_TOOLS.has(t.name) || MCP_SEND_TOOLS.has(t.name)))
       : MCP_LEGACY_ALLOWLIST.has(t.name);
     (allow ? register : skipped).push(t);
   }
@@ -136,7 +109,7 @@ export function createMcpRegistry({ tools, listTools, logger = console }) {
       names.clear();
       sigs.clear();
       for (const t of next) {
-        tools.push(modelFacingTool(t));
+        tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
         names.add(t.name);
         sigs.set(t.name, signature(t));
       }
@@ -151,8 +124,6 @@ export function createMcpRegistry({ tools, listTools, logger = console }) {
       logger.log(`   Connect MCP: ${names.size ? [...names].join(', ') : 'no tools registered'}`);
       const gated = [...names].filter((n) => MCP_CONFIRM_TOOLS.has(n));
       if (gated.length) logger.log(`   Connect MCP: need confirmation: ${gated.join(', ')}`);
-      const wrapped = [...names].filter((n) => MCP_WRAPPED_TOOLS.has(n));
-      if (wrapped.length) logger.log(`   Connect MCP: sent through the bot: ${wrapped.join(', ')}`);
     } else if (added.length || removed.length || changed.length) {
       logger.log(`[mcp] tools updated — added: ${added.join(', ') || '-'}; removed: ${removed.join(', ') || '-'}; changed: ${changed.join(', ') || '-'}`);
       logger.log(`   Connect MCP: ${[...names].join(', ')}`);

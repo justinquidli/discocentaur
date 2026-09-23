@@ -10,6 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { MCP_SEND_TOOLS } from '../connect-mcp.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -210,17 +211,19 @@ function buildRunTool() {
     summariseRound: (label) => `round ${label}`,
     payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
-    mcpToolNames: new Set(),
+    mcpToolNames: new Set(['connect_drop']),
+    explorerTxUrl: (c, h) => (h ? `https://basescan.org/tx/${h}` : null),
     MCP_CONFIRM_TOOLS,
-    MCP_WRAPPED_TOOLS,
-    AMOUNT_TOOLS: new Function(`${SRC.match(/^const AMOUNT_TOOLS = new Set\(\[[^\]]*\]\);$/m)[0]}\nreturn AMOUNT_TOOLS;`)(),
-    normalizeAmounts,
-    mentionToId: new Function(`${SRC.match(/^function mentionToId[\s\S]*?\n}$/m)[0]}\nreturn mentionToId;`)(),
     shutdown: { stopping: false, track: (p) => p },
-    mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
+    mcpCallTool: async (name, input, key) => {
+      if (!key) throw new Error('MCP tools/call HTTP 401: no key');
+      calls.push({ tool: name, key });
+      return name === 'connect_drop' ? '{"httpStatus":201,"transferHash":"0xabc"}' : '{"ok":true}';
+    },
+    mcpFailureReason: (err) => (/HTTP 401/.test(err?.message ?? '') ? 'auth' : null),
     redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
-    quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { status: 'submitted', transferHash: '0xabc', explorerUrl: null }; },
+    quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { transferHash: '0xabc', explorerUrl: null }; },
     // Any DB touch means a scheduled/conditional/watcher write happened.
     db: { prepare: () => ({ run: () => calls.push({ tool: 'db-write' }), all: () => [], get: () => null }) },
     scheduleDropJob: () => {},
@@ -284,8 +287,8 @@ test('owner with a document is held too; keyless sender is refused, not held', a
   const { runTool, calls, deps } = buildRunTool();
   const owner = JSON.parse(await runTool('connect_drop', drop, { senderId: 'owner', documentInContext: true }));
   assert.equal(owner.status, 'held_for_confirmation');
-  const keyless = JSON.parse(await runTool('connect_drop', drop, { senderId: 'nobody', documentInContext: true }));
-  assert.match(keyless.error, /no Quidli API key/i);
+  const keyless = await runTool('connect_drop', drop, { senderId: 'nobody', documentInContext: true });
+  assert.match(keyless, /own Quidli key/, 'no key: not held, and Connect refuses it');
   assert.equal(deps.heldActions.size, 1);
   assert.deepEqual(calls, []);
 });
@@ -297,7 +300,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const spending = branches
     .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
-  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].sort(),
+  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => !MCP_SEND_TOOLS.has(t)).sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
 });
 
@@ -391,7 +394,7 @@ test('!confirm runs the held call once and records the outcome for the model', a
   const ran = [];
   const { fn, deps, message, replies } = buildConfirm(async (tool, input, ctx) => {
     ran.push({ tool, ctx });
-    return JSON.stringify({ status: 'submitted', transferHash: '0xabc', explorerUrl: 'https://basescan.org/tx/0xabc' });
+    return JSON.stringify({ transferHash: '0xabc', explorerUrl: 'https://basescan.org/tx/0xabc' });
   });
   const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: 'u1', channelId: 'c1', contextId: 'g-c1' });
   await fn(message, { verb: 'confirm', code });
@@ -442,7 +445,7 @@ const REAL = 'https://basescan.org/tx/0x19a9d3ec5281fe69250be4dccf678e8d04f7c9cd
 const FAKE = 'https://basescan.org/tx/0x' + 'ab'.repeat(32);
 
 test('a confirmed drop records its link, and the next turn may repeat it', async () => {
-  const { fn, deps, message } = buildConfirm(async () => JSON.stringify({ status: 'submitted', transferHash: REAL.split('/tx/')[1], explorerUrl: REAL }));
+  const { fn, deps, message } = buildConfirm(async () => JSON.stringify({ transferHash: REAL.split('/tx/')[1], explorerUrl: REAL }));
   const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: 'u1', channelId: 'c1', contextId: 'g-c1' });
   await fn(message, { verb: 'confirm', code });
 
@@ -513,8 +516,7 @@ test('bare !confirm with nothing held explains how to get a code', async () => {
 
 // ─── Connect write tools: always confirmed, document or not ─────────────────
 
-import { MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from '../connect-mcp.js';
-import { normalizeAmounts } from '../connect-drop.js';
+import { MCP_CONFIRM_TOOLS } from '../connect-mcp.js';
 
 const trustInput = { to: { type: 'github', username: 'alice' }, level: 80, context: 'team:quidli' };
 
@@ -540,9 +542,10 @@ for (const tool of ['connect_trust_create', 'connect_trust_revoke']) {
 test('trust write from a keyless non-owner is not held and never gets the host key', async () => {
   const { runTool, calls, deps } = buildRunTool();
   deps.mcpToolNames.add('connect_trust_create');
-  await runTool('connect_trust_create', trustInput, { senderId: 'nobody' });
+  const out = await runTool('connect_trust_create', trustInput, { senderId: 'nobody' });
   assert.equal(deps.heldActions.size, 0);
-  assert.deepEqual(calls, [{ tool: 'connect_trust_create', key: null }], 'anonymous call — the server refuses it');
+  assert.match(out, /own Quidli key/, 'anonymous call — the server refuses it, no host key used');
+  assert.deepEqual(calls, []);
 });
 
 test('read-only MCP tools are never held', async () => {
@@ -581,134 +584,17 @@ test('while the bot is shutting down, new money and trust actions are refused, r
   assert.deepEqual(calls, [{ tool: 'connect_lookup', key: 'k' }]);
 });
 
-// ─── amount check in the real send path ─────────────────────────────────────
-
-import { checkAmountGrounded, tokenInfo } from '../connect-drop.js';
-
-function buildGuardedRunTool() {
-  const verifySrc = SRC.match(/^async function verifyAmount[\s\S]*?\n}$/m)[0];
-  const balance = { assets: [{ type: 'erc20', tokenContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', decimals: 6 }] };
-  const { runTool: _unused, calls, deps } = buildRunTool();
-  deps.mcpCallTool = async (name, input, key) => {
-    calls.push({ tool: name, key });
-    if (name === 'connect_drop_balance') return JSON.stringify(balance);
-    return '{"ok":true}';
-  };
-  const helpers = new Function(...Object.keys(deps), 'tokenInfo', 'checkAmountGrounded',
-    `${verifySrc}\nreturn { verifyAmount };`)(...Object.values(deps), tokenInfo, checkAmountGrounded);
-  const all = { ...deps, ...helpers };
-  const runTool = new Function(...Object.keys(all), `${runToolSrc}\nreturn runTool;`)(...Object.values(all));
-  return { runTool, calls };
-}
-
-const usdcDrop = { chainId: 8453, tokenContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', recipients: [{ type: 'discord', id: '731076204307677226' }] };
-
-test('"0.01 USDC" sent as 100000 is refused before anything is sent', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  const out = JSON.parse(await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' }));
-  assert.equal(out.status, 'refused');
-  assert.match(out.error, /0\.1 USDC per recipient/);
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance'], 'balance read for decimals; no send');
-});
-
-test('the correct amount goes through to the send', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '10000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' });
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance', 'connect_drop']);
-});
-
-test('a confirmed held send is not re-checked (the user approved the readable amount)', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'yes', confirmed: true });
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop']);
-});
-
-// ─── replay of 2026-09-23 19:26: "send @Guillaume 0.01 USDC on solana" ─────────
-// Runs the real runTool → quidliDrop → recipients.js → connect-drop.js with only
-// Connect faked. What failed live: amount sent as a number, recipient sent as
-// the display name "Guillaume".
-
-import { createConnectDrop, checkAmountGrounded as cag, tokenInfo as ti } from '../connect-drop.js';
-import { resolveRecipientsToWallets } from '../recipients.js';
-
-const GUILLAUME = '731076204307677226';
-const G_SOL = '5FM2b3jnxzu122hinVQVQsNZUVwuWpmpoVbzokG5oU4R';
-const G_EVM = '0x6a48ADE3bE3F9f0b8B4c9af61Bb654A219311699';
-const SOL_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-
-function buildLive() {
-  const connect = [];
-  const fakeCall = async (tool, args) => {
-    connect.push({ tool, args });
-    if (tool === 'connect_drop_balance') return JSON.stringify({ assets: [{ type: 'erc20', tokenContract: SOL_USDC, symbol: 'USDC', decimals: 6 }] });
-    if (tool === 'connect_lookup') {
-      const ok = args.recipients.every((r) => r.type === 'discord' && r.id === GUILLAUME);
-      return JSON.stringify(ok
-        ? { status: 'completed', results: [{ type: 'discord', value: GUILLAUME, ethWalletAddress: G_EVM, solWalletAddress: G_SOL }] }
-        : { status: 'completed', results: [], failed: args.recipients });
-    }
-    throw new Error(`unexpected ${tool}`);
-  };
-  const rpc = async (method, params) => {
-    connect.push({ tool: params.name, args: params.arguments });
-    return { content: [{ type: 'text', text: JSON.stringify({ httpStatus: 201, transferHash: '4sig' }) }] };
-  };
-  const { deps } = buildRunTool();
-  const pieces = {
-    ...deps,
-    mcpCallTool: fakeCall,
-    connectDrop: createConnectDrop({ rpc, uuid: () => 'k1', logger: { log() {}, error() {} } }),
-    resolveRecipientsToWallets,
-    explorerTxUrl: (c, h) => (h ? `https://solscan.io/tx/${h}` : null),
-    tokenInfo: ti, checkAmountGrounded: cag,
-    QUIDLI_API_KEY: 'host',
-  };
-  const src = ['quidliDropOnce', 'quidliDrop', 'verifyAmount'].map((n) => SRC.match(new RegExp(`^(?:async )?function ${n}\\(.*?\\n}$`, 'ms'))[0]).join('\n');
-  const helpers = new Function(...Object.keys(pieces), `${src}\nreturn { quidliDrop, verifyAmount };`)(...Object.values(pieces));
-  const all = { ...pieces, ...helpers };
-  const run = new Function(...Object.keys(all), `${runToolSrc}\nreturn runTool;`)(...Object.values(all));
-  return { run, connect };
-}
-
-test('replay: display name + numeric amount → sent to his Solana address, as a string, once', async () => {
-  const { run, connect } = buildLive();
-  const out = JSON.parse(await run('connect_drop',
-    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', username: 'Guillaume' }], amountInWeiPerRecipient: 10000 },
-    { senderId: 'owner', senderApiKey: 'k', userText: '  send   0.01 USDC on solana', mentions: new Map([['guillaume', GUILLAUME]]) }));
-  assert.equal(out.status, 'submitted');
-  const drops = connect.filter((c) => c.tool === 'connect_drop');
-  assert.equal(drops.length, 1);
-  assert.deepEqual(drops[0].args.recipients, [{ type: 'wallet', id: G_SOL }], 'his Solana address, not EVM, not a name');
-  assert.equal(drops[0].args.amountInWeiPerRecipient, '10000');
-  assert.equal(drops[0].args.chainId, 1399811149);
-  assert.deepEqual(connect.find((c) => c.tool === 'connect_lookup').args.recipients, [{ type: 'discord', id: GUILLAUME }]);
-});
-
-test('replay: same send on Base goes to his EVM address', async () => {
-  const { run, connect } = buildLive();
-  await run('connect_drop',
-    { chainId: 8453, tokenContract: SOL_USDC, recipients: [{ type: 'discord', id: GUILLAUME }], amountInWeiPerRecipient: '10000' },
-    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC on base', mentions: new Map() });
-  assert.deepEqual(connect.find((c) => c.tool === 'connect_drop').args.recipients, [{ type: 'wallet', id: G_EVM }]);
-});
-
-test('replay: 10× the amount is refused before any lookup or send', async () => {
-  const { run, connect } = buildLive();
-  const out = JSON.parse(await run('connect_drop',
-    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', id: GUILLAUME }], amountInWeiPerRecipient: '100000' },
-    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC on solana', mentions: new Map() }));
-  assert.equal(out.status, 'refused');
-  assert.deepEqual(connect.map((c) => c.tool), ['connect_drop_balance']);
-});
-
-test('replay: a name nobody mentioned fails before sending — nothing goes out', async () => {
-  const { run, connect } = buildLive();
-  const out = JSON.parse(await run('connect_drop',
-    { chainId: 1399811149, tokenContract: SOL_USDC, recipients: [{ type: 'discord', username: 'Someone' }], amountInWeiPerRecipient: '10000' },
-    { senderId: 'owner', senderApiKey: 'k', userText: 'send 0.01 USDC', mentions: new Map([['guillaume', GUILLAUME]]) }));
-  assert.equal(out.status, 'failed');
-  assert.equal(connect.filter((c) => c.tool === 'connect_drop').length, 0);
+test('connect_drop is forwarded to Connect exactly as the model wrote it', async () => {
+  const { runTool, deps } = buildRunTool();
+  const seen = [];
+  deps.mcpCallTool = undefined;
+  const { runTool: rt } = (() => {
+    const d = { ...deps, mcpCallTool: async (name, input, key) => { seen.push({ name, input, key }); return '{"httpStatus":201,"transferHash":"0xabc"}'; } };
+    return { runTool: new Function(...Object.keys(d), `${runToolSrc}\nreturn runTool;`)(...Object.values(d)) };
+  })();
+  const input = { idempotencyKey: 'from-model', chainId: 1399811149, tokenContract: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', recipients: [{ type: 'discord', id: '731076204307677226' }], amountInWeiPerRecipient: '10000' };
+  const out = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  assert.deepEqual(seen, [{ name: 'connect_drop', input, key: 'k' }], 'same tool, same arguments, sender key');
+  assert.equal(out.transferHash, '0xabc');
+  assert.ok(out.explorerUrl, 'the real explorer link is attached and recorded');
 });

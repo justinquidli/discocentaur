@@ -16,10 +16,10 @@ const quiet = { log: () => {}, error: () => {} };
 // ── selectMcpTools ───────────────────────────────────────────────────────────
 
 test('connect_drop can never be made confirmable', () => {
-  assert.equal(MCP_CONFIRM_TOOLS.has('connect_drop'), false, 'connect_drop is wrapped, not a confirm tool');
+  assert.equal(MCP_CONFIRM_TOOLS.has('connect_drop'), false, 'connect_drop is a send tool, not a confirm tool');
 });
 
-test('write tools are withheld unless named as confirm or wrapped tools', () => {
+test('write tools are withheld unless named as confirm or send tools', () => {
   const { register, skipped } = selectMcpTools([
     ro('connect_lookup'),
     rw('connect_drop'),
@@ -28,7 +28,7 @@ test('write tools are withheld unless named as confirm or wrapped tools', () => 
     rw('connect_something_new'),
   ]);
   assert.deepEqual(register.map((t) => t.name), ['connect_lookup', 'connect_drop', 'connect_trust_create', 'connect_trust_revoke']);
-  assert.deepEqual(skipped, ['connect_something_new'], 'connect_drop is wrapped; any other new write tool stays out');
+  assert.deepEqual(skipped, ['connect_something_new'], 'any other new write tool stays out');
 });
 
 test('a confirmable name without readOnlyHint:false is still withheld', () => {
@@ -67,8 +67,6 @@ test('first refresh registers the allowed tools next to the hardcoded ones', asy
   assert.equal(r.ok, true);
   assert.deepEqual(toolNames(tools), ['schedule_drop', 'connect_lookup', 'connect_drop']);
   assert.deepEqual([...reg.names], ['connect_lookup', 'connect_drop']);
-  const drop = tools.find((t) => t.name === 'connect_drop');
-  assert.equal(drop.input_schema.properties?.idempotencyKey, undefined, 'registered in its model-facing form');
 });
 
 test('a new tool appears, a retired one goes, without a restart', async () => {

@@ -108,16 +108,6 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
   };
 }
 
-// connect_drop can carry a different amount per recipient instead of one
-// uniform amount; show each one rather than an "invalid amount".
-function amountLabel(input, chainId) {
-  const per = Array.isArray(input.recipients) && input.amountInWeiPerRecipient == null
-    ? input.recipients.map((r) => r?.amountInWei).filter((a) => a != null) : [];
-  return per.length
-    ? `per-recipient amounts (${per.slice(0, 15).map((a) => formatAmount(a, input.tokenContract, chainId)).join(', ')})`
-    : formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
-}
-
 export function formatAmount(amountInWei, tokenContract, chainId = 8453) {
   const raw = String(amountInWei ?? '');
   if (!/^\d+$/.test(raw)) return `⚠️ invalid amount "${raw.slice(0, 40)}"`;
@@ -149,7 +139,7 @@ function describeRecipient(r) {
 export function describeHeldAction({ code, tool, input }) {
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
-  const amount = amountLabel(input, chainId);
+  const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
   const lines = [];
 
   const recipients = Array.isArray(input.recipients) ? input.recipients : [];
@@ -272,7 +262,7 @@ function summarise({ tool, input }) {
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
-  const amount = amountLabel(input, chainId);
+  const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
   const n = Array.isArray(input.recipients) ? input.recipients.length : 0;
   const kind = { connect_drop: 'send', schedule_drop: 'scheduled send', conditional_drop: 'conditional send', create_watcher: 'watcher' }[tool] ?? tool;
   const who = n ? `to ${n} recipient${n === 1 ? '' : 's'} (${input.recipients.slice(0, 5).map((r) => `${r.type}:${r.id ?? r.username}`).join(', ')}${n > 5 ? ', …' : ''})` : '';
