@@ -4,7 +4,6 @@
  * Features:
  * - Claude assistant with per-channel conversation history
  * - Quidli Connect API: lookup wallet addresses for Discord users
- * - x402 payment support (pay-per-request in USDC on Base, no API key needed)
  * - Per-user Quidli API keys: DM !connect YOUR_KEY to use your own Smart Send wallet
  */
 
@@ -13,9 +12,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { createMindsClient, isReplyHistoryRow } from '@animocabrands/minds-client-lib';
-import { createWalletClient, http, parseUnits, encodeFunctionData } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { base } from 'viem/chains';
 import {
   Client,
   GatewayIntentBits,
@@ -32,7 +28,8 @@ import {
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
-import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
+import { createMcpRegistry, MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from './connect-mcp.js';
+import { createConnectDrop, checkAmountGrounded, tokenInfo } from './connect-drop.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 
@@ -45,7 +42,6 @@ const {
   DISCORD_ACTIVE_CHANNELS = '',
   DISCORD_ALLOWED_USERS = '',
   SYSTEM_PROMPT: SYSTEM_PROMPT_OVERRIDE,
-  BOT_WALLET_PRIVATE_KEY,
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
@@ -94,9 +90,9 @@ const REQUIRE_USER_LLM = REQUIRE_USER_LLM_KEY === 'true';
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is required');
-if (!BOT_WALLET_PRIVATE_KEY && !QUIDLI_API_KEY) {
-  throw new Error('Either BOT_WALLET_PRIVATE_KEY or QUIDLI_API_KEY is required');
-}
+// No host key is allowed: users bring their own. Without one, only people who
+// linked a key can send, and tool discovery runs anonymously.
+if (!QUIDLI_API_KEY) console.warn('⚠️  QUIDLI_API_KEY not set — only users with their own linked key can send.');
 
 const ACTIVE_CHANNELS = new Set(
   DISCORD_ACTIVE_CHANNELS.split(',').map((s) => s.trim()).filter(Boolean)
@@ -152,23 +148,21 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Before a drop that looks large, or after a drop fails for funding reasons, check the balance and say plainly what's short — the token or the gas.
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
-## Sending tokens (quidli_drop)
-- ALWAYS call connect_lookup for every recipient FIRST, before calling quidli_drop.
-- Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
-- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
-- USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
+## Sending tokens (connect_drop)
+- Send with connect_drop — ONE call per request. Pass people directly as recipients, e.g. { type: "discord", id: "<Discord ID>" }, or telegram, discord, email, phone, twitter, farcaster, github (id or username). Connect resolves them and pays the right wallet for the chain (their Ethereum address on EVM chains, their Solana address on Solana), creating a wallet for people who don't have one yet. Do NOT call connect_lookup before a send.
+- linkedin and slack can't be sent to directly: call connect_lookup for them, then send to the address it returns as { type: "wallet", id: "<address>" } — ethWalletAddress on EVM chains, solWalletAddress on Solana. Never mix wallet and social recipients in one call.
+- Amounts are whole numbers of base units (amountInWeiPerRecipient). USDC has 6 decimals: 0.01 USDC = 10000, 1 USDC = 1000000. SOL has 9, ETH 18. For any other token use the decimals from connect_drop_balance. The bot converts your amount back and refuses the send unless it matches a number the user wrote — if it refuses, recompute the decimals; never invent an amount the user didn't give.
+- You don't need connect_drop_balance before a routine send. Use it for balance questions, before a large send, or after a send fails for funds — then say plainly what's short: the token, or gas (ETH on EVM chains, SOL on Solana).
 - connect_get_chains lists every chain Connect supports and which features work on each (drop is true only for Smart Send chains). Use it to answer "what chains do you support" accurately instead of guessing.
 - Base (8453) is the default. Use it unless the user names another chain. Smart Send also supports Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161), Avalanche (43114) and Solana (1399811149) — call connect_get_chains if you need to confirm what is currently available.
-- Omit tokenContract (or set it to null) to send a chain's native token. Pass an ERC-20 contract or an SPL mint to send a token. Never use the zero address.
-- Solana (chainId 1399811149): amounts are in lamports for native SOL (9 decimals). USDC on Solana is the SPL mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (6 decimals). Social recipients are paid at their solWalletAddress, never their ethWalletAddress. Sending native SOL to an empty wallet needs at least 890880 lamports or the transaction fails, and the sender pays roughly 2039280 lamports of rent per new SPL destination account — so an "insufficient funds" error on an SPL send is often missing SOL, not missing tokens.
-- Always check the balance on the chain you are about to send on before sending.
-- Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
-- After success, show the explorer link the drop tool returns (explorerUrl). Do not construct one yourself — it differs per chain, and a link you invent will be stripped before the user sees it.
-- If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
+- USDC is 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 on Base and the mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v on Solana. Never reuse a token address across chains. Omit tokenContract (or set it to null) for the chain's native token; never use the zero address.
+- Solana: native SOL to an empty wallet needs at least 890880 lamports, and each new USDC recipient costs the sender about 0.002 SOL of rent — so "insufficient funds" on a Solana USDC send usually means too little SOL.
+- Results: status "submitted" means it went out — show the explorerUrl from the result, never one you built. "failed" means nothing was sent — say why. "unknown" means it MAY have gone through — say so, tell the user to check their balance, and do NOT send again.
 - Use EXACTLY one of "id" or "username" per recipient, never both.
+- If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 
 ## Looking up wallets (connect_lookup)
-Call connect_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
+Call connect_lookup when the user asks for a wallet address — not before sends; connect_drop resolves people itself. It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
@@ -182,7 +176,7 @@ When a lookup fails, work through ALL available identifiers before giving up:
 7. If none of the above work, ask the user which other social handles the person has (Farcaster, Twitter, email, etc.) and try those.
 Only after exhausting all available identifiers, tell the user the person isn't in the Quidli registry yet.
 
-The same multi-identity fallback applies to quidli_drop and connect_scores_batch — always try the most specific identifier first, then fall back through others.
+The same multi-identity fallback applies to connect_drop and connect_scores_batch — always try the most specific identifier first, then fall back through others.
 
 ## Looking up linked accounts (connect_lookup_exposed)
 Use connect_lookup_exposed when someone asks what accounts a person has linked, or when you only have a username and need a numeric ID. Returns all platforms linked to that identity (email, wallet, smart_wallet, telegram, discord, etc.).
@@ -221,8 +215,8 @@ Every swap, buy or sell goes through bankr_swap_and_drop — including "swap 5 U
 ## Bankr (bankr_agent)
 - Key commands (!bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation, and never suggest posting a key in a server channel — keys go in a DM to the bot only. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare !bankr in DM shows the user their link status.
 Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for market questions (token prices, research, contract addresses) and the user's Bankr wallet balance. It needs the user's own Bankr key (DM !bankr <key>); if it says none is linked, tell them how.
-- Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
-- Swaps never go through bankr_agent — use bankr_swap_and_drop. For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
+- Quidli Connect (connect_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
+- Swaps never go through bankr_agent — use bankr_swap_and_drop. For PAYING people, prefer connect_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
 - To swap and then send the result to people, use bankr_swap_and_drop instead of chaining tools yourself.
 - One clear instruction per call with explicit amounts, token and chain. Bankr has a $0.05 minimum transfer.
 - If the result status is still_running, the job may still execute: say so and do NOT call bankr_agent again for the same thing.
@@ -470,6 +464,12 @@ async function executeScheduledDrop(jobId) {
 
     const result = await quidliDrop(dropInput, keyToUse);
 
+    // Not confirmed as sent: report it as a failure — Connect's reason says
+
+    // whether it may still have gone through (status "unknown").
+
+    if (result.status !== 'submitted') throw Object.assign(new Error(result.error ?? 'Connect did not send it.'), { dropStatus: result.status });
+
     // DM the sender
     const user = await client.users.fetch(job.sender_id).catch(() => null);
     if (user) {
@@ -636,6 +636,12 @@ async function executeConditionalDrop(jobId) {
 
     const result = await quidliDrop(resolvedDrop, keyToUse);
 
+    // Not confirmed as sent: report it as a failure — Connect's reason says
+
+    // whether it may still have gone through (status "unknown").
+
+    if (result.status !== 'submitted') throw Object.assign(new Error(result.error ?? 'Connect did not send it.'), { dropStatus: result.status });
+
     if (senderUser) {
       const recipientCount = resolvedDrop.recipients?.length ?? 1;
       await senderUser.send(
@@ -659,100 +665,6 @@ async function executeConditionalDrop(jobId) {
   }
 }
 
-// ─── Wallet (for x402 payments) ───────────────────────────────────────────────
-
-let walletClient;
-if (BOT_WALLET_PRIVATE_KEY) {
-  const account = privateKeyToAccount(BOT_WALLET_PRIVATE_KEY);
-  walletClient = createWalletClient({
-    account,
-    chain: base,
-    transport: http(),
-  });
-}
-
-// ─── Quidli API ───────────────────────────────────────────────────────────────
-
-/**
- * Call Quidli with x402 payment fallback.
- * If QUIDLI_API_KEY is set, uses that instead of paying.
- */
-async function quidliFetch(path, options = {}, apiKey = QUIDLI_API_KEY) {
-  const url = `${QUIDLI_BASE_URL}${path}`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(apiKey ? { 'x-api-key': apiKey } : {}),
-    ...(options.headers ?? {}),
-  };
-
-  const res = await fetch(url, { ...options, headers });
-
-  // x402: payment required — handle the payment flow (only when using host wallet, not per-user keys)
-  if (res.status === 402 && walletClient && !apiKey) {
-    const paymentDetails = await res.json();
-    console.log('[x402] payment required:', JSON.stringify(paymentDetails, null, 2));
-
-    // Extract payment info from the 402 response
-    // x402 standard: paymentDetails.accepts[] contains payment options
-    const payment = paymentDetails.accepts?.[0];
-    if (!payment) throw new Error('No payment method offered by x402 response');
-
-    const { scheme, network, asset, amount, payTo } = payment;
-
-    if (scheme !== 'exact' || asset?.symbol !== 'USDC') {
-      throw new Error(`Unsupported x402 payment scheme: ${scheme} / ${asset?.symbol}`);
-    }
-
-    // USDC on Base has 6 decimals
-    const amountInUnits = BigInt(amount);
-
-    // USDC contract on Base
-    const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-
-    // Transfer USDC to payTo address
-    const txHash = await walletClient.sendTransaction({
-      to: USDC_BASE,
-      data: encodeFunctionData({
-        abi: [{
-          name: 'transfer',
-          type: 'function',
-          inputs: [
-            { name: 'to', type: 'address' },
-            { name: 'amount', type: 'uint256' },
-          ],
-          outputs: [{ type: 'bool' }],
-        }],
-        functionName: 'transfer',
-        args: [payTo, amountInUnits],
-      }),
-    });
-
-    console.log(`[x402] paid ${amount} USDC, tx: ${txHash}`);
-
-    // Retry the original request with the payment proof
-    const retryRes = await fetch(url, {
-      ...options,
-      headers: {
-        ...headers,
-        'X-Payment': JSON.stringify({ txHash, network, scheme }),
-      },
-    });
-
-    if (!retryRes.ok) {
-      const body = await retryRes.text();
-      throw new Error(`Quidli error after payment ${retryRes.status}: ${body}`);
-    }
-    return retryRes;
-  }
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Quidli error ${res.status}: ${body}`);
-  }
-
-  return res;
-}
 
 /**
  * Lookup wallet addresses for Discord users by username or ID.
@@ -895,27 +807,22 @@ function explorerTxUrl(chainId, hash) {
 // Every drop is tracked, so a restart waits for a submitted transfer to come
 // back before exiting (see shutdown.js). Callers use this; not quidliDropOnce.
 function quidliDrop(args, apiKey) {
-  return shutdown.track(quidliDropOnce(args, apiKey), 'quidli_drop');
+  return shutdown.track(quidliDropOnce(args, apiKey), 'connect_drop');
 }
 
-async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
+// Every send goes through Connect's MCP connect_drop via connect-drop.js: the
+// bot owns the idempotency key and retries uncertain outcomes with the same
+// key. Connect resolves social recipients itself, on the right chain.
+const connectDrop = createConnectDrop({ rpc: (method, params, apiKey, timeoutMs) => mcpRpc(method, params, apiKey, timeoutMs) });
+
+async function quidliDropOnce(args, apiKey = QUIDLI_API_KEY) {
   if (!apiKey) {
-    throw new Error('No Quidli API key available for this drop. DM me `!connect <your-api-key>` to link your account, or ask the bot owner to configure a host key.');
+    throw new Error('No Quidli API key available for this drop. Link one with the connect command, or ask the bot owner to configure a host key.');
   }
-  // Connect's /drop rejects social recipients today, so resolve them to wallets
-  // first. All-or-nothing — see recipients.js.
-  const resolved = await resolveRecipientsToWallets(recipients,
-    async (social) => JSON.parse(await mcpCallTool('connect_lookup', { recipients: social }, apiKey)));
-  if (resolved.error) return { error: resolved.error, failedRecipients: resolved.failed };
-  recipients = resolved.recipients;
-  const idempotencyKey = crypto.randomUUID();
-  const res = await quidliFetch('/drop', {
-    method: 'POST',
-    body: JSON.stringify({ idempotencyKey, chainId, tokenContract, amountInWeiPerRecipient, recipients }),
-  }, apiKey);
-  const body = await res.json();
+  const result = await connectDrop.send(args, apiKey);
+  console.log(`[drop] ${result.status} key=${result.idempotencyKey}${result.transferHash ? ` tx=${result.transferHash}` : ''}${result.error ? ` — ${String(result.error).slice(0, 160)}` : ''}`);
   // Attach the link here so no caller has to know which chain it was.
-  return { ...body, explorerUrl: explorerTxUrl(chainId, body?.transferHash) };
+  return { ...result, explorerUrl: explorerTxUrl(args?.chainId ?? 8453, result.transferHash) };
 }
 
 // ─── Quidli score ─────────────────────────────────────────────────────────────
@@ -1089,21 +996,6 @@ const tools = [
     },
   },
   {
-    name: 'quidli_drop',
-    description:
-      'Send tokens to one or more people by their social identity using Quidli Smart Send. Requires Smart Send to be enabled at connect.quid.li and QUIDLI_API_KEY set. Use whenever someone asks to send, tip, or drop tokens/USDC to a person.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        recipients: { type: 'array', items: RECIPIENT_SCHEMA, description: 'List of recipients' },
-        amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei (smallest unit) per recipient. E.g. "1000000" for 1 USDC (6 decimals).' },
-        tokenContract: { type: 'string', description: 'Token contract address. USDC on Base: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
-        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
-      },
-      required: ['recipients', 'amountInWeiPerRecipient'],
-    },
-  },
-  {
     name: 'discord_search_messages',
     description:
       'Search recent messages in a Discord channel and return the unique users who sent matching messages. Use when asked to find users based on what they typed (e.g. "everyone who said gm in the last hour", "users who mentioned launch today"). If no channelId is specified, searches the current channel.',
@@ -1138,7 +1030,7 @@ const tools = [
   {
     name: 'schedule_drop',
     description:
-      'Schedule a Quidli token drop to execute in the future (e.g. "in 1 hour", "in 30 minutes"). The job is stored in the database so it survives bot restarts. Use when someone says "send X in N minutes/hours" or "schedule a drop for later". Do NOT use for immediate drops — use quidli_drop for those.',
+      'Schedule a Quidli token drop to execute in the future (e.g. "in 1 hour", "in 30 minutes"). The job is stored in the database so it survives bot restarts. Use when someone says "send X in N minutes/hours" or "schedule a drop for later". Do NOT use for immediate drops — use connect_drop for those.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1231,7 +1123,7 @@ const tools = [
   // MCP server as connect_scores_batch, discovered at startup. See registerMcpTools().
   {
     name: 'bankr_swap_and_drop',
-    description: 'Swap tokens for the user. Connect can\'t swap, so this sends the sell amount from the user\'s Connect wallet to their Bankr wallet, swaps there, sends everything the swap returned back to Connect, and then — if recipients are given — sends them exactly amountPerRecipient each (or everything the swap returned, only with sendAll). With no recipients the tokens stay in Connect, ready to send. Use it for EVERY swap/buy/sell request unless the user says to use funds already in Bankr (then source="bankr"). Runs every step itself and stops safely if one fails — never call bankr_agent or quidli_drop for the same request. Takes 1–3 minutes. Tokens must be contract addresses on that chain ("native" for ETH/POL); never guess one.',
+    description: 'Swap tokens for the user. Connect can\'t swap, so this sends the sell amount from the user\'s Connect wallet to their Bankr wallet, swaps there, sends everything the swap returned back to Connect, and then — if recipients are given — sends them exactly amountPerRecipient each (or everything the swap returned, only with sendAll). With no recipients the tokens stay in Connect, ready to send. Use it for EVERY swap/buy/sell request unless the user says to use funds already in Bankr (then source="bankr"). Runs every step itself and stops safely if one fails — never call bankr_agent or connect_drop for the same request. Takes 1–3 minutes. Tokens must be contract addresses on that chain ("native" for ETH/POL); never guess one.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1250,7 +1142,7 @@ const tools = [
   },
   {
     name: 'bankr_agent',
-    description: 'Ask Bankr (bankr.bot), a crypto trading agent, to do something with the SENDER\'S OWN Bankr wallet: token prices, research and contract addresses, Bankr wallet balances, and transfers to wallet addresses, ENS names, or X/Farcaster/Telegram handles that already have a Bankr account. Write one clear natural-language instruction with exact amounts, tokens and chain (e.g. "what is the contract address of HOME on Base", "what is my Bankr balance on Base"). NOT for swaps — use bankr_swap_and_drop. Bankr can only pay people who are already Bankr users — to pay anyone else (email, Discord, GitHub, new Telegram users) use quidli_drop instead. Takes 5–30s. Never resubmit a request whose result says still_running.',
+    description: 'Ask Bankr (bankr.bot), a crypto trading agent, to do something with the SENDER\'S OWN Bankr wallet: token prices, research and contract addresses, Bankr wallet balances, and transfers to wallet addresses, ENS names, or X/Farcaster/Telegram handles that already have a Bankr account. Write one clear natural-language instruction with exact amounts, tokens and chain (e.g. "what is the contract address of HOME on Base", "what is my Bankr balance on Base"). NOT for swaps — use bankr_swap_and_drop. Bankr can only pay people who are already Bankr users — to pay anyone else (email, Discord, GitHub, new Telegram users) use connect_drop instead. Takes 5–30s. Never resubmit a request whose result says still_running.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1264,8 +1156,9 @@ const tools = [
 const mcpRegistry = createMcpRegistry({ tools, listTools: () => mcpRpc('tools/list', {}, QUIDLI_API_KEY) });
 const mcpToolNames = mcpRegistry.names;
 
+// With no host key, discovery runs anonymously — tools/list is public — so
+// users with their own keys can still send.
 function registerMcpTools() {
-  if (!QUIDLI_API_KEY) return;
   mcpRegistry.refresh();
   mcpRegistry.start();
 }
@@ -1303,7 +1196,7 @@ const _pendingExplorerUrls = [];
 
 // Some models (observed: Kimi K2.6 via OpenRouter) will occasionally narrate a
 // fake "transaction sent" message with an invented tx hash instead of actually
-// calling quidli_drop. Since this bot moves real money, never trust a model's
+// calling connect_drop. Since this bot moves real money, never trust a model's
 // own claim of an explorer link — only ever show one that came from a real
 // quidliDrop() result this turn. Anything else gets stripped and flagged.
 const EXPLORER_TX_RE = /https?:\/\/(?:optimistic\.etherscan\.io|etherscan\.io|polygonscan\.com|basescan\.org|arbiscan\.io|snowtrace\.io|solscan\.io)\/tx\/([A-Za-z0-9]+)/g;
@@ -1328,14 +1221,55 @@ function trackedRunTool(name, input, ctx) {
   return MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name) ? shutdown.track(p, name) : p;
 }
 
+// Tools whose input carries an amount the user must have stated. See
+// checkAmountGrounded() in connect-drop.js for why.
+const AMOUNT_TOOLS = new Set(['connect_drop', 'schedule_drop', 'conditional_drop', 'create_watcher']);
+
+async function verifyAmount(input, { senderId, senderApiKey, userText }) {
+  const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+  const key = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+  if (!key) return null; // the tool refuses keyless senders on its own
+  const recipients = Array.isArray(input?.recipients) ? input.recipients : [];
+  const perRecipient = recipients.map((r) => r?.amountInWei).filter((a) => a != null).map(String);
+  const amounts = perRecipient.length ? perRecipient : [String(input?.amountInWeiPerRecipient ?? '')];
+  if (!amounts.every((a) => /^\d+$/.test(a))) {
+    return 'Nothing was sent: amounts must be whole numbers of base units (e.g. "10000" for 0.01 USDC).';
+  }
+  const chainId = input?.chainId ?? 8453;
+  let balance;
+  try {
+    balance = JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, key));
+  } catch (err) {
+    return `Nothing was sent: the amount could not be checked (balance lookup failed: ${String(err?.message ?? err).slice(0, 120)}). Try again.`;
+  }
+  const info = tokenInfo(balance, input?.tokenContract ?? null);
+  if (!info) {
+    return `Nothing was sent: the wallet holds none of ${input?.tokenContract ?? 'the native token'} on chain ${chainId}, so the amount can't be checked and the send would fail. Check the token contract and chain.`;
+  }
+  const count = input?.presenceFilter ? null : (recipients.length || null);
+  return checkAmountGrounded({ amounts, recipientCount: count, decimals: info.decimals, symbol: info.symbol, userText });
+}
+
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null,
+  senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null, userText = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
     return JSON.stringify({ status: 'refused', executed: false, error: 'The bot is restarting. Nothing was sent or changed — tell the user to ask again in a minute.' });
   }
+  // ── Amount check ──────────────────────────────────────────────────────────────
+  // The raw amount must convert back to a number the user wrote. See
+  // connect-drop.js. Skipped for !confirm/ /confirm (the user approved the
+  // readable amount) and for callers that aren't answering a user message.
+  if (!confirmed && userText != null && AMOUNT_TOOLS.has(name)) {
+    const refusal = await verifyAmount(input, { senderId, senderApiKey, userText });
+    if (refusal) {
+      console.log(`[amount] refused ${name}: ${refusal.slice(0, 160)}`);
+      return JSON.stringify({ status: 'refused', executed: false, error: refusal });
+    }
+  }
+
   // ── Held-transfer gate ───────────────────────────────────────────────────────
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
@@ -1374,7 +1308,7 @@ async function runTool(name, input, {
   // sender with no key still gets a call: the public tools answer anonymously
   // and the rest 401, which is the server telling us a key is needed rather
   // than a name list here guessing.
-  if (mcpToolNames.has(name)) {
+  if (mcpToolNames.has(name) && !MCP_WRAPPED_TOOLS.has(name)) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
     try {
@@ -1402,7 +1336,13 @@ async function runTool(name, input, {
       getConnectBalance: async (chainId) => JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, quidliKey)),
       resolveRecipients: (list) => resolveRecipientsToWallets(list,
         async (social) => JSON.parse(await mcpCallTool('connect_lookup', { recipients: social }, quidliKey))),
-      drop: (args) => quidliDrop(args, quidliKey),
+      // bankr.js reads a thrown drop as "unknown" and a hashless result as
+      // "failed, funds still in Connect" — so an unconfirmed send must throw.
+      drop: async (args) => {
+        const r = await quidliDrop(args, quidliKey);
+        if (r.status === 'unknown') throw new Error(r.error);
+        return r;
+      },
       explorerUrl: explorerTxUrl,
     });
     for (const url of result.explorerUrls ?? []) _pendingExplorerUrls.push(url);
@@ -1573,7 +1513,7 @@ async function runTool(name, input, {
     const results = await searchDiscordMessages({ ...input, excludeIds, currentChannelId });
     return JSON.stringify(results, null, 2);
   }
-  if (name === 'quidli_drop') {
+  if (name === 'connect_drop') {
     // Key priority: personal key → owner fallback to host key → block
     const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
     const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
@@ -1753,7 +1693,7 @@ const documentTaint = createDocumentTaint({ turns: MAX_HISTORY });
 // which matters because quidliDrop() mints a fresh crypto.randomUUID() idempotencyKey
 // on every call, so a runaway loop would issue repeated *distinct* transfers rather
 // than idempotent retries. (The model does not supply the key — it isn't in the
-// quidli_drop schema — but that makes the hazard worse, not better: nothing dedupes.)
+// connect_drop schema — but that makes the hazard worse, not better: nothing dedupes.)
 // Longest legitimate chain is ~10 (lookup retries → drop), so 25 leaves headroom.
 const MAX_TOOL_ROUNDS = 25;
 
@@ -1985,7 +1925,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
     const toolResults = await Promise.all(
       msg.tool_calls.map(async (tc) => {
         // A parse failure must NOT fall through to runTool with {} — an argument-less
-        // quidli_drop is a call we never want to make. Report it back as a tool error
+        // connect_drop is a call we never want to make. Report it back as a tool error
         // so the model can retry with well-formed arguments.
         let args;
         try {
@@ -2390,6 +2330,8 @@ async function handleMessage(message) {
     botId: message.client.user.id,
     senderApiKey,
     senderUser: message.author,
+    // What the user wrote this turn — amounts are checked against it.
+    userText: message.content,
     currentChannelId: message.channelId,
     contextId,
     documentInContext,
@@ -2799,14 +2741,15 @@ async function handleConfirmCommand(message, { verb, code }) {
   // error and returns an 'Error: …' string when the key is missing.
   const isConnectWrite = MCP_CONFIRM_TOOLS.has(action.tool);
   const succeeded = isConnectWrite ? !String(raw ?? '').startsWith('Error:')
-    : action.tool === 'quidli_drop' ? !!result.transferHash
+    : action.tool === 'connect_drop' ? result.status === 'submitted'
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
     : !!result.success;
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
   if (action.tool === 'bankr_swap_and_drop') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
-  if ((action.tool === 'bankr_agent' && result.status === 'still_running') || (action.tool === 'bankr_swap_and_drop' && ['partial', 'unknown'].includes(result.status))) {
-    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', result.message ?? `Bankr job ${result.jobId} still running`));
+  if ((action.tool === 'bankr_agent' && result.status === 'still_running') || (action.tool === 'bankr_swap_and_drop' && ['partial', 'unknown'].includes(result.status))
+    || (action.tool === 'connect_drop' && result.status === 'unknown')) {
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', result.error ?? result.message ?? `Bankr job ${result.jobId} still running`));
   } else heldOutcomeRecords.push(action.contextId, succeeded
     ? formatOutcomeRecord(action, 'executed', result.transferHash ? `tx ${result.transferHash}` : (result.jobId ? `job ${result.jobId}` : result.watcherId ? `watcher ${result.watcherId}` : ''), result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? (isConnectWrite ? String(raw ?? '') : '')));
@@ -2826,10 +2769,12 @@ async function handleConfirmCommand(message, { verb, code }) {
     await say(succeeded
       ? `✅ Done (\`${action.code}\`): ${String(result.message ?? raw).slice(0, 800)}`
       : `❌ \`${action.code}\` did not go through: ${String(raw ?? '').slice(0, 300)}`);
-  } else if (action.tool === 'quidli_drop') {
-    await say(result.transferHash
-      ? `✅ Sent (\`${action.code}\`).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: \`${result.transferHash}\``}`
-      : `❌ \`${action.code}\` did not go through: ${String(result.error ?? result.message ?? raw).slice(0, 300)}`);
+  } else if (action.tool === 'connect_drop') {
+    await say(result.status === 'submitted'
+      ? `✅ Sent (\`${action.code}\`).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : result.transferHash ? `\nTransfer hash: \`${result.transferHash}\`` : ''}`
+      : result.status === 'unknown'
+        ? `⚠️ \`${action.code}\`: Connect didn't confirm it — it may have gone through. Check your balance before sending again.`
+        : `❌ \`${action.code}\` did not go through: ${String(result.error ?? result.message ?? raw).slice(0, 300)}`);
   } else if (result.success) {
     await say(`✅ \`${action.code}\`: ${result.message ?? 'done'}${result.jobId ? ` (job \`${result.jobId}\`)` : ''}${result.watcherId ? ` (watcher \`${result.watcherId}\`)` : ''}`);
   } else {
@@ -2870,6 +2815,9 @@ async function checkWatchers(message) {
         recipients: [{ type: 'discord', id: message.author.id }],
       };
       const result = await quidliDrop(dropInput, keyToUse);
+      // Not confirmed as sent: report it as a failure — Connect's reason says
+      // whether it may still have gone through (status "unknown").
+      if (result.status !== 'submitted') throw Object.assign(new Error(result.error ?? 'Connect did not send it.'), { dropStatus: result.status });
       if (result.transferHash) {
         const url = result.explorerUrl;
         message.author.send(`🎉 You triggered the drop by typing "${watcher.trigger_phrase}"! Tokens are on the way.\nTransaction: ${url}`).catch(() => {});
