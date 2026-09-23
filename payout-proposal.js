@@ -1,10 +1,9 @@
-// Read-only bridge to the contributor-payout agent.
+// Bridge to the contributor-payout agent.
 //
-// The bot can ask for a PROPOSAL and nothing else: the child process runs a dry
-// run, so no wallet is touched, nothing is signed, and no contributor gets a
-// wallet provisioned. Execution stays on the operator's terminal on purpose —
-// a Discord message is untrusted input, and nothing reachable from one should
-// be able to move money.
+// A proposal is a dry run: nothing is signed and no contributor gets a wallet
+// provisioned. Paying (payoutExecute) happens only after the owner's !confirm,
+// and reads every amount from the saved round file — a Discord message can
+// name a round, and nothing else about what moves.
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

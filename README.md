@@ -16,6 +16,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Presence-based drops** — target only online/idle/dnd members at execution time, not when scheduled
 - **Conditional drops** — "if BTC is above $100k, send everyone 1 USDC" — evaluated automatically using real-time web search
 - **Channel watchers** — send tokens to the first person who types a trigger phrase
+- **Contributor payouts** — "pay the contributors of <repo> 5000 BNKR for the last 3 days": scores merged PRs, posts the split, pays after `!confirm` (owner only, [details](#contributor-payouts))
 - **Cancel / reschedule** — manage pending scheduled drops and watchers
 - **Per-user API keys** — users can DM `!connect <key>` to link their own Quidli account
 - **Web search** — real-time data via Brave Search for conditional drops and factual questions
@@ -398,6 +399,50 @@ Scheduled drops survive bot restarts. Conditional drops use Brave Search to eval
 @DiscoCentaur list my watchers
 @DiscoCentaur cancel watcher <id>
 ```
+
+## Contributor payouts
+
+```
+@DiscoCentaur pay the contributors of https://github.com/owner/repo 5000 BNKR for the last 3 days
+```
+
+Rewards the authors of a repo's **merged** pull requests from a budget you name. It runs the
+[contributor-payout](https://github.com/justinquidli/contributor-payout) CLI as a child process,
+so that repo must be checked out next to this one (or at `PAYOUT_DIR`) with its own `.env`.
+
+1. **Propose.** One `payout` tool call scores the PRs in the window (`--payer connect
+   --skip-resolve`: a dry run — nothing is signed and nobody gets a wallet provisioned) and saves
+   the split as a round file, `rounds/<label>.json`. Takes 60–120 s.
+2. **The bot posts the split itself**, read from the round file. The model never sees the amounts,
+   because a model that retyped them once got two rows wrong while the total still matched.
+3. **Confirm.** The payment is always held — document or not — and runs only after the owner's
+   `!confirm <code>`. Execution reads everything (repo, token, every amount) from the round file,
+   pays from the agent's Dynamic wallet and comments on the PRs.
+
+Guards:
+
+- **Owner only** (`BOT_OWNER_ID`); anyone else is refused.
+- **Every parameter must come from the message.** The repo name, the budget and the window
+  ("3d", "3 days", "a week" …) must appear in what the user wrote, or nothing runs — a window the
+  model filled in on its own silently pays a different set of people.
+- **One proposal per repo** for 15 minutes (`PAYOUT_REPROPOSE_TTL_MS`): asking again returns the
+  same round instead of a new, different split. A round already marked paid can't be paid again.
+- **Paid means broadcast.** Exit code 0 isn't success: a run counts as paid only if it printed
+  `Sent.` and transaction hashes. Otherwise the bot says why nothing was paid.
+- A run that times out (`PAYOUT_EXEC_TIMEOUT_MS`, 10 min) is reported as **unknown** — check the
+  round's ledger and Basescan before re-running.
+- Shares the Bankr rate limit per user.
+
+| Variable | Default | |
+|---|---|---|
+| `PAYOUT_DIR` | `../contributor-payout` | where the payout CLI lives |
+| `PAYOUT_TIMEOUT_MS` | 180000 | proposal time limit |
+| `PAYOUT_EXEC_TIMEOUT_MS` | 600000 | execution time limit |
+| `PAYOUT_REPROPOSE_TTL_MS` | 900000 | how long a proposal is reused |
+
+**Don't restart during a payout.** The CLI runs in its own process, and a pm2 restart stops it too;
+the bot's 10-second shutdown wait doesn't cover a run that takes minutes. Check
+`pgrep -fl payout.js` before deploying.
 
 ## Role management
 
