@@ -127,3 +127,36 @@ test('overlapping refreshes share one tools/list call', async () => {
   await Promise.all([reg.refresh(), reg.refresh(), reg.refresh()]);
   assert.equal(listCalls(), 1);
 });
+
+// ── plain types for the model (2026-09-23: a free model sent USDC's address as
+// 7.49e+47 through tokenContract: ["string","null"]) ─────────────────────────
+
+import { plainSchema } from '../connect-mcp.js';
+
+test('unions the model misreads become plain types; nothing else changes', () => {
+  const live = {
+    type: 'object',
+    properties: {
+      tokenContract: { type: ['string', 'null'], description: 'mint' },
+      amountInWeiPerRecipient: { anyOf: [{ anyOf: [{ not: {} }, { type: 'string' }] }, { type: 'null' }], description: 'amt' },
+      chainId: { type: 'integer' },
+      recipients: { type: 'array', items: { type: 'object', properties: { type: { type: 'string', enum: ['discord', 'wallet'] } } } },
+      either: { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    },
+    required: ['chainId'],
+  };
+  const p = plainSchema(live);
+  assert.deepEqual(p.properties.tokenContract, { type: 'string', description: 'mint' });
+  assert.deepEqual(p.properties.amountInWeiPerRecipient, { type: 'string', description: 'amt' });
+  assert.deepEqual(p.properties.chainId, { type: 'integer' });
+  assert.deepEqual(p.properties.recipients, live.properties.recipients);
+  assert.equal(p.properties.either.anyOf.length, 2, 'a real choice between types is kept');
+  assert.deepEqual(p.required, ['chainId']);
+  assert.equal(live.properties.tokenContract.type.length, 2, 'the input is not mutated');
+});
+
+test('registered tools are shown with plain types', async () => {
+  const { tools, reg } = setup([[{ ...rw('connect_drop'), inputSchema: { type: 'object', properties: { tokenContract: { type: ['string', 'null'] } } } }]]);
+  await reg.refresh();
+  assert.equal(tools.find((t) => t.name === 'connect_drop').input_schema.properties.tokenContract.type, 'string');
+});

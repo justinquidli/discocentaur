@@ -27,6 +27,39 @@ export const MCP_CONFIRM_TOOLS = new Set(['connect_trust_create', 'connect_trust
 // other money tool (MONEY_TOOLS in held-actions.js).
 export const MCP_SEND_TOOLS = new Set(['connect_drop']);
 
+/**
+ * Plain types for what the model is shown. Connect's schemas use unions —
+ * tokenContract is ["string","null"], the amount an anyOf with an empty
+ * `not: {}` branch — and some models then emit the value as a number: the
+ * free Nous model sent USDC's address as 7.49e+47 (2026-09-23), while the same
+ * model filled a plain `string` field correctly. So "X or null" becomes X, and
+ * an anyOf whose only real branch is one type becomes that type. The call is
+ * still forwarded to Connect exactly as the model writes it. Pure; exported
+ * for tests.
+ */
+export function plainSchema(node) {
+  if (Array.isArray(node)) return node.map(plainSchema);
+  if (!node || typeof node !== 'object') return node;
+  let out = { ...node };
+  if (Array.isArray(out.type)) {
+    const t = out.type.filter((x) => x !== 'null');
+    out.type = t.length === 1 ? t[0] : t;
+  }
+  if (Array.isArray(out.anyOf)) {
+    const flat = (list) => list.flatMap((b) => (b && Array.isArray(b.anyOf) && Object.keys(b).length === 1 ? flat(b.anyOf) : [b]));
+    const real = flat(out.anyOf).filter((b) => !(b && (b.type === 'null' || (b.not && Object.keys(b.not).length === 0))));
+    if (real.length === 1) {
+      const { anyOf, ...rest } = out;
+      out = { ...plainSchema(real[0]), ...rest };
+    } else out.anyOf = real.map(plainSchema);
+  }
+  for (const k of ['properties', 'patternProperties', '$defs', 'definitions']) {
+    if (out[k] && typeof out[k] === 'object') out[k] = Object.fromEntries(Object.entries(out[k]).map(([n, v]) => [n, plainSchema(v)]));
+  }
+  if (out.items) out.items = plainSchema(out.items);
+  return out;
+}
+
 export const MCP_REFRESH_MS = 10 * 60 * 1000;
 
 /**
@@ -109,7 +142,7 @@ export function createMcpRegistry({ tools, listTools, logger = console }) {
       names.clear();
       sigs.clear();
       for (const t of next) {
-        tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
+        tools.push({ name: t.name, description: t.description ?? '', input_schema: plainSchema(t.inputSchema) });
         names.add(t.name);
         sigs.set(t.name, signature(t));
       }
