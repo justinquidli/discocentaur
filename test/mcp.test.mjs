@@ -28,7 +28,7 @@ const build = (body, ret, args = {}) =>
 // selectMcpTools lives in connect-mcp.js now; more cases in connect-mcp.test.mjs.
 const buildSelect = () => selectMcpTools;
 
-test('read-only tools auto-register; connect_drop registers only as a wrapped tool', () => {
+test('read-only tools auto-register, and connect_drop registers as the send tool', () => {
   const selectMcpTools = buildSelect();
   const { register, skipped, annotated } = selectMcpTools([
     { name: 'connect_lookup', annotations: { readOnlyHint: true } },
@@ -38,7 +38,7 @@ test('read-only tools auto-register; connect_drop registers only as a wrapped to
   ]);
 
   assert.equal(annotated, true);
-  assert.deepEqual(skipped, [], 'connect_drop is wrapped — see the runTool test below');
+  assert.deepEqual(skipped, [], 'connect_drop is offered as Connect defines it');
   assert.ok(register.map((t) => t.name).includes('connect_get_chains'));
   assert.equal(register.length, 4);
 });
@@ -144,14 +144,9 @@ test('explorer links follow the chain the drop was sent on', () => {
   assert.equal(url(8453, undefined), null, 'no hash, no link');
 });
 
-test('connect_drop is never forwarded raw: runTool routes it to the bot\'s own send', () => {
-  // The generic MCP branch must skip wrapped tools, or a model call would reach
-  // Connect with no bot-owned idempotency key and no amount check.
-  const runTool = SRC.match(/^async function runTool[\s\S]*?\n}$/m)[0];
-  assert.match(runTool, /if \(mcpToolNames\.has\(name\) && !MCP_WRAPPED_TOOLS\.has\(name\)\) \{/);
-  assert.match(runTool, /if \(name === 'connect_drop'\) \{[\s\S]*?await quidliDrop\(input, keyToUse\)/);
-  assert.ok(!/name: 'quidli_drop'/.test(SRC), 'the hand-written drop tool is gone');
-  assert.ok(!/quidliFetch|walletClient/.test(SRC), 'the REST + x402 client is gone');
+test('the hand-written drop tool and the REST + x402 client are gone', () => {
+  assert.ok(!/name: '(quidli|connect)_drop'/.test(SRC), 'connect_drop comes from the MCP, not a local definition');
+  assert.ok(!/quidliFetch|walletClient/.test(SRC));
 });
 
 // ── fabricated transaction links ──────────────────────────────────────────────
