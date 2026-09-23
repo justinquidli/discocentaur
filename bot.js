@@ -146,7 +146,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
 ## Sending tokens (connect_drop)
-- ALWAYS call connect_lookup for every recipient FIRST, before calling connect_drop.
+- Pass people straight to connect_drop as recipients — Connect resolves them to the right wallet for the chain and creates one if they don't have one yet. You don't need connect_lookup first. If Connect answers "processing", call connect_drop again with the same idempotencyKey.
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
@@ -161,12 +161,12 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
 ## Looking up wallets (connect_lookup)
-Call connect_lookup whenever the user asks for a wallet address, AND always before every connect_drop (see above). It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
+Call connect_lookup when the user asks for a wallet address. It is not needed before connect_drop. It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
 When a lookup fails, work through ALL available identifiers before giving up:
-1. If a Discord mention is in the message, try { type: "discord", id: "<DISCORD_ID>" } first (ID is in the message context as "(Discord ID: 123456)"), then { type: "discord", username: "<display_name>" }
+1. If a Discord mention is in the message, use the recipient written next to it, exactly: { "type": "discord", "id": "<DISCORD_ID>" }. Never send to a Discord display name — Connect cannot resolve names.
 2. If a Farcaster handle is mentioned (e.g. @name.eth or /name), try { type: "farcaster", username: "<handle>" }
 3. If a Twitter/X handle is mentioned, try { type: "twitter", username: "<handle>" }
 4. If a Telegram username is mentioned, try { type: "telegram", username: "<handle>" }
@@ -191,7 +191,7 @@ When someone asks about themselves — "tell me about myself", "who am I?", "wha
 Then synthesize everything into a warm, conversational paragraph: who they are professionally, what they build or work on, their on-chain presence and wallet addresses, and their reputation standing. Make it feel like a smart introduction, not a data dump. If LinkedIn or GitHub is linked, lean into those for professional context.
 
 ## Resolving Discord mentions
-Every message includes context like: "@Guillaume (Discord ID: 712682660786602035)". Always extract and use the Discord ID — it's more reliable than display names. If only a username is available, use connect_lookup_exposed to resolve it first.
+Every mention in a message is written like: @Guillaume = {"type":"discord","id":"712682660786602035"}. Use that object as the recipient, exactly as written. If you only have a name and no mention, use connect_lookup_exposed to find their ID first.
 
 ## Checking reputation (connect_scores_batch)
 Use connect_scores_batch when asked about trust, reputation, or scores. Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
@@ -2078,7 +2078,8 @@ async function handleMessage(message) {
     return;
   }
 
-  // Replace @user mentions with "username (Discord ID: 123456)"
+  // Replace @user mentions with the recipient Connect takes:
+  // @name = {"type":"discord","id":"123456"}
   // Replace @role mentions with "roleName (Role ID: 123456)"
   // Strip the bot's own mention
   const botId = message.client.user.id;
@@ -2101,7 +2102,7 @@ async function handleMessage(message) {
       if (userId === botId) return '';
       const member = message.guild?.members.cache.get(userId);
       const name = member?.displayName ?? member?.user?.username ?? userId;
-      return `@${name} (Discord ID: ${userId})`;
+      return `@${name} = {"type":"discord","id":"${userId}"}`;
     })
     .replace(/<@&(\d+)>/g, (match, roleId) => {
       const role = message.guild?.roles.cache.get(roleId);
