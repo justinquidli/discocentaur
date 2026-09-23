@@ -33,6 +33,8 @@ import {
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
+import { createShutdown } from './shutdown.js';
+import { createSecretBox } from './secrets.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -265,32 +267,12 @@ If a tool call returns an error or empty result:
 
 // AES-256-GCM encryption using MASTER_ENCRYPTION_KEY from .env.
 // If no key is set, values are stored in plaintext (with a warning on startup).
-const encKey = MASTER_ENCRYPTION_KEY ? Buffer.from(MASTER_ENCRYPTION_KEY, 'hex') : null;
-
-function encrypt(plaintext) {
-  if (!encKey) return plaintext;
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', encKey, iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  // Store as iv:tag:ciphertext (all hex)
-  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
-}
-
-function decrypt(stored) {
-  if (!encKey) return stored;
-  // If not in iv:tag:data format, it was stored before encryption was enabled — return as-is
-  const parts = stored.split(':');
-  if (parts.length !== 3) return stored;
-  try {
-    const [ivHex, tagHex, dataHex] = parts;
-    const decipher = createDecipheriv('aes-256-gcm', encKey, Buffer.from(ivHex, 'hex'));
-    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-    return decipher.update(Buffer.from(dataHex, 'hex')) + decipher.final('utf8');
-  } catch {
-    return stored;
-  }
-}
+// See secrets.js. A stored key that can't be decrypted comes back as null
+// ("no key") with a log line, never as ciphertext sent upstream as a key.
+const secretBox = createSecretBox(MASTER_ENCRYPTION_KEY);
+const encKey = secretBox.enabled;
+const encrypt = (plaintext) => secretBox.encrypt(plaintext);
+const decrypt = (stored) => secretBox.decrypt(stored);
 
 // ─── Per-user key store ───────────────────────────────────────────────────────
 
@@ -397,7 +379,8 @@ function deleteUserBankrKey(userId) {
 function getUserLlmKeyFor(discordId, provider) {
   const row = db.prepare('SELECT api_key, model FROM user_llm_keys WHERE user_id = ? AND provider = ?').get(discordId, provider);
   if (!row?.api_key) return null;
-  return { provider, apiKey: decrypt(row.api_key), model: row.model ?? null };
+  const apiKey = decrypt(row.api_key);
+  return apiKey ? { provider, apiKey, model: row.model ?? null } : null;
 }
 
 function hasAnyUserLlmKey(discordId) {
@@ -428,9 +411,11 @@ function deleteUserLlmKey(discordId, provider) {
 function getUserMindsCredentials(discordId) {
   const row = db.prepare('SELECT minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at FROM user_keys WHERE discord_id = ?').get(discordId);
   if (!row?.minds_alias || !row?.minds_api_key) return null;
+  const apiKey = decrypt(row.minds_api_key);
+  if (!apiKey) return null;
   return {
     alias: row.minds_alias,
-    apiKey: decrypt(row.minds_api_key),
+    apiKey,
     name: row.minds_name ?? 'Minds',
     mindId: row.minds_mind_id ?? null,
     aliasCreatedAt: row.minds_alias_created_at ?? null,
@@ -907,7 +892,13 @@ function explorerTxUrl(chainId, hash) {
   return base ? `${base}${hash}` : null;
 }
 
-async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
+// Every drop is tracked, so a restart waits for a submitted transfer to come
+// back before exiting (see shutdown.js). Callers use this; not quidliDropOnce.
+function quidliDrop(args, apiKey) {
+  return shutdown.track(quidliDropOnce(args, apiKey), 'quidli_drop');
+}
+
+async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
   if (!apiKey) {
     throw new Error('No Quidli API key available for this drop. DM me `!connect <your-api-key>` to link your account, or ask the bot owner to configure a host key.');
   }
@@ -1281,6 +1272,8 @@ function registerMcpTools() {
 
 // Transfers parked while a document is in context. See held-actions.js.
 const heldActions = createHeldActionStore();
+// Declared before anything can send money. See shutdown.js and the Launch section.
+const shutdown = createShutdown();
 // Bankr conversation threads, per chat per user.
 const bankrThreads = createBankrThreads();
 // Each bankr_agent call can trade, and the model mints the calls, so a runaway
@@ -1328,11 +1321,21 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
   });
 }
 
+// Money and write tools are tracked for the whole call — bankr swaps and the
+// agent move funds without going through quidliDrop.
+function trackedRunTool(name, input, ctx) {
+  const p = runTool(name, input, ctx);
+  return MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name) ? shutdown.track(p, name) : p;
+}
+
 async function runTool(name, input, {
   senderId, botId, senderApiKey, senderUser, currentChannelId, contextId = null,
   documentInContext = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+  if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
+    return JSON.stringify({ status: 'refused', executed: false, error: 'The bot is restarting. Nothing was sent or changed — tell the user to ask again in a minute.' });
+  }
   // ── Held-transfer gate ───────────────────────────────────────────────────────
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
@@ -1848,7 +1851,7 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
         toolUseBlocks.map(async (block) => {
           editor.update((accumulated || '_Thinking…_') + '\n_Looking up…_');
           try {
-            const result = await runTool(block.name, block.input, toolCtx);
+            const result = await trackedRunTool(block.name, block.input, toolCtx);
             return { type: 'tool_result', tool_use_id: block.id, content: result };
           } catch (err) {
             console.error(`[tool] ${block.name} error:`, err.message);
@@ -1911,7 +1914,7 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
         const { name, args } = part.functionCall;
         console.log(`[tool/gemini] ${name}`, JSON.stringify(args).slice(0, 120));
         try {
-          const result = await runTool(name, args, toolCtx);
+          const result = await trackedRunTool(name, args, toolCtx);
           return { functionResponse: { name, response: { result } } };
         } catch (err) {
           console.error(`[tool/gemini] ${name} error:`, err.message);
@@ -1993,7 +1996,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
         }
         console.log(`[tool/openai] ${tc.function.name}`, JSON.stringify(args).slice(0, 120));
         try {
-          const result = await runTool(tc.function.name, args, toolCtx);
+          const result = await trackedRunTool(tc.function.name, args, toolCtx);
           return { role: 'tool', tool_call_id: tc.id, content: result };
         } catch (err) {
           console.error(`[tool/openai] ${tc.function.name} error:`, err.message);
@@ -2768,7 +2771,7 @@ async function handleConfirmCommand(message, { verb, code }) {
   let raw;
   try {
     // Key is looked up now, not at hold time: a !revoke in between must stick.
-    raw = await runTool(action.tool, action.input, {
+    raw = await trackedRunTool(action.tool, action.input, {
       senderId,
       botId: message.client.user.id,
       senderApiKey: getUserApiKey(senderId),
@@ -2947,5 +2950,13 @@ client.on(Events.MessageCreate, async (message) => {
     console.error('[bot] unhandled error:', err)
   );
 });
+
+// An 'error' event with no listener throws and takes the process down.
+client.on(Events.Error, (err) => console.error('[discord] client error:', err?.message ?? err));
+
+// Before this there were no signal handlers: pm2's SIGINT ended the process
+// at once, mid-drop or not.
+shutdown.onStop(() => client.destroy());
+shutdown.install();
 
 client.login(DISCORD_TOKEN);

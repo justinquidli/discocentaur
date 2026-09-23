@@ -206,6 +206,7 @@ function buildRunTool() {
     heldToolResult,
     mcpToolNames: new Set(),
     MCP_CONFIRM_TOOLS,
+    shutdown: { stopping: false, track: (p) => p },
     mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
     redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
@@ -344,6 +345,7 @@ function buildConfirm(runToolImpl) {
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
     runTool: runToolImpl,
+    trackedRunTool: runToolImpl,
   };
   const fn = new Function(...Object.keys(deps), `${src}\nreturn handleConfirmCommand;`)(...Object.values(deps));
   const replies = [];
@@ -531,4 +533,18 @@ test('!confirm on a trust write reports the server result and records it', async
   await no.fn(no.message, { verb: 'confirm', code: b.code });
   assert.match(no.replies.at(-1), /did not go through: Error: this needs your own Quidli key/);
   assert.match(no.deps.heldOutcomeRecords.take('t')[0], /FAILED/);
+});
+
+test('while the bot is shutting down, new money and trust actions are refused, reads are not', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.shutdown.stopping = true;
+  deps.mcpToolNames.add('connect_trust_create');
+  deps.mcpToolNames.add('connect_lookup');
+  for (const tool of ['quidli_drop', 'connect_trust_create']) {
+    const out = JSON.parse(await runTool(tool, tool === 'quidli_drop' ? drop : trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
+    assert.equal(out.status, 'refused');
+    assert.match(out.error, /restarting/);
+  }
+  await runTool('connect_lookup', {}, { senderId: 'u1', senderApiKey: 'k' });
+  assert.deepEqual(calls, [{ tool: 'connect_lookup', key: 'k' }]);
 });

@@ -123,7 +123,7 @@ npm start
 
 For production with pm2:
 ```bash
-pm2 start bot.js --name claudetaur
+pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
@@ -141,6 +141,22 @@ the legacy fallback, the keyless header), the drop recipient enum, which has sil
 the server's once already, per-chain explorer links, and the fabricated-transaction-link guard. `bot.js` connects to Discord on import, so the tests extract the
 functions under test from its source rather than importing it — a stopgap until it's split into
 modules.
+
+### Restarts and shutdown
+
+`ecosystem.config.cjs` sets pm2's `kill_timeout` to 15 s. On SIGINT/SIGTERM the bot stops taking
+messages, refuses new transfers and trust changes, waits up to 10 s for any drop already submitted
+to come back (`shutdown.js`), then exits 0. With pm2's default 1.6 s, a deploy used to SIGKILL the
+bot — possibly after a transfer went out but before it was recorded.
+
+A process first started with `pm2 start bot.js --name claudetaur` keeps the old timeout; switch it once
+with `pm2 delete claudetaur && pm2 start ecosystem.config.cjs && pm2 save`. A clean restart logs
+`[shutdown] clean exit`, and `~/.pm2/pm2.log` shows `exited with code [0] via signal [SIGINT]`
+rather than `[SIGKILL]`.
+
+Stored keys that can't be decrypted (for example after `MASTER_ENCRYPTION_KEY` changed) are
+treated as missing and logged once as `[keys] ⚠️  a stored key … could not be read` — they are
+never sent upstream as a key. A malformed `MASTER_ENCRYPTION_KEY` stops the bot at startup.
 
 ## Per-user API keys
 
