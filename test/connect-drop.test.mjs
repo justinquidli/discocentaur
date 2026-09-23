@@ -167,3 +167,35 @@ test('unknown recipient count (presence drops) checks the per-recipient amount o
   assert.equal(checkAmountGrounded({ amounts: ['1000000'], recipientCount: null, decimals: 6, symbol: 'USDC', userText: '1 USDC to everyone online' }), null);
   assert.match(checkAmountGrounded({ amounts: ['1000000'], recipientCount: null, decimals: 6, symbol: 'USDC', userText: '10 USDC split among everyone online' }), /nothing was sent/);
 });
+
+// ── amount format (2026-09-23: Connect rejected a numeric amount) ─────────────
+
+import { normalizeAmounts } from '../connect-drop.js';
+
+test('a safe integer number becomes a string; strings pass; everything else is refused', () => {
+  assert.deepEqual(normalizeAmounts({ amountInWeiPerRecipient: 10000 }).input.amountInWeiPerRecipient, '10000');
+  assert.deepEqual(normalizeAmounts({ amountInWeiPerRecipient: '10000' }).input.amountInWeiPerRecipient, '10000');
+  assert.deepEqual(normalizeAmounts({ recipients: [{ type: 'wallet', id: 'x', amountInWei: 7 }] }).input.recipients[0].amountInWei, '7');
+  assert.match(normalizeAmounts({ amountInWeiPerRecipient: 0.01 }).error, /Nothing was sent/);
+  assert.match(normalizeAmounts({ amountInWeiPerRecipient: '0.01' }).error, /Nothing was sent/);
+  assert.match(normalizeAmounts({ amountInWeiPerRecipient: 2 ** 60 }).error, /Nothing was sent/, 'beyond 2^53 the number was already rounded');
+  assert.match(normalizeAmounts({ amountInWeiPerRecipient: -5 }).error, /Nothing was sent/);
+});
+
+test('send() converts a numeric amount before calling Connect, and refuses a bad one without calling', async () => {
+  const { drop, calls } = harness([ok({ httpStatus: 201, transferHash: '0xabc' })]);
+  await drop.send({ ...args, amountInWeiPerRecipient: 10000 }, 'k');
+  assert.equal(calls[0].params.arguments.amountInWeiPerRecipient, '10000');
+  const bad = harness([ok({})]);
+  const r = await bad.drop.send({ ...args, amountInWeiPerRecipient: 0.5 }, 'k');
+  assert.equal(r.status, 'failed');
+  assert.equal(bad.calls.length, 0);
+});
+
+test('the model is shown the amount as a plain string field', () => {
+  const t = modelFacingTool({
+    name: 'connect_drop', description: 'd',
+    inputSchema: { type: 'object', properties: { amountInWeiPerRecipient: { anyOf: [{ anyOf: [{ not: {} }, { type: 'string' }] }, { type: 'null' }] } } },
+  });
+  assert.equal(t.input_schema.properties.amountInWeiPerRecipient.type, 'string');
+});

@@ -42,6 +42,14 @@ export function modelFacingTool(t) {
   const schema = structuredClone(t.inputSchema ?? { type: 'object', properties: {} });
   if (schema.properties) delete schema.properties.idempotencyKey;
   if (Array.isArray(schema.required)) schema.required = schema.required.filter((k) => k !== 'idempotencyKey');
+  // Connect's schema for the amount is an anyOf that models misread and fill
+  // with a number, which Connect then rejects. Show a plain string.
+  if (schema.properties?.amountInWeiPerRecipient) {
+    schema.properties.amountInWeiPerRecipient = {
+      type: 'string',
+      description: 'Amount per recipient in base units, as a string of digits: "10000" = 0.01 USDC (6 decimals), "1000000000" = 1 SOL (9), ETH has 18.',
+    };
+  }
   return { ...tool, description: tool.description + (WRAPPED_NOTE[t.name] ?? ''), input_schema: schema };
 }
 
