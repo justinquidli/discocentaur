@@ -23,7 +23,7 @@ import {
   createDocumentTaint,
 } from './documents.js';
 import {
-  MONEY_TOOLS, ALWAYS_HELD, SELF_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
+  MONEY_TOOLS, ALWAYS_HELD, SELF_HELD, createHeldActionStore, describeHeldAction, holdReason, parseSendGuard, sendGuardPrompt, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { formatReplyContext } from './reply-context.js';
@@ -350,6 +350,30 @@ function setUserApiKey(discordId, apiKey) {
   db.prepare(`INSERT INTO user_keys (discord_id, api_key) VALUES (?, ?)
     ON CONFLICT(discord_id) DO UPDATE SET api_key = excluded.api_key`)
     .run(discordId, encrypt(apiKey));
+}
+
+// Send guardrail — the user's own choice, asked at !connect (or on the first
+// send for keys connected before this existed). See holdReason in held-actions.js.
+// api_key is NOT NULL with no default here, so guard-only rows write ''.
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard TEXT`); } catch { }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard_asked INTEGER`); } catch { }
+
+function getSendGuard(discordId) {
+  return db.prepare('SELECT send_guard FROM user_keys WHERE discord_id = ?').get(String(discordId))?.send_guard ?? null;
+}
+
+function setSendGuard(discordId, guard) {
+  db.prepare(`INSERT INTO user_keys (discord_id, api_key, send_guard, send_guard_asked) VALUES (?, '', ?, unixepoch())
+    ON CONFLICT(discord_id) DO UPDATE SET send_guard = excluded.send_guard, send_guard_asked = excluded.send_guard_asked`)
+    .run(String(discordId), guard);
+}
+
+/** True the first time only — the caller then shows the question once. */
+function claimSendGuardQuestion(discordId) {
+  const r = db.prepare(`INSERT INTO user_keys (discord_id, api_key, send_guard_asked) VALUES (?, '', unixepoch())
+    ON CONFLICT(discord_id) DO UPDATE SET send_guard_asked = unixepoch() WHERE send_guard_asked IS NULL`)
+    .run(String(discordId));
+  return r.changes > 0;
 }
 
 function deleteUserApiKey(discordId) {
@@ -1229,7 +1253,7 @@ function trackedRunTool(name, input, ctx) {
 
 async function runTool(name, input, {
   senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null,
-  documentInContext = false, confirmed = false, heldNotices = null,
+  documentInContext = false, quotesOther = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
@@ -1239,18 +1263,29 @@ async function runTool(name, input, {
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
-  if (MONEY_TOOLS.has(name) && !SELF_HELD.has(name) && (documentInContext || ALWAYS_HELD.has(name)) && !confirmed) {
+  const guard = MONEY_TOOLS.has(name) && !confirmed ? getSendGuard(senderId) : null;
+  const holdWhy = SELF_HELD.has(name) ? null
+    : holdReason({ tool: name, confirmed, documentInContext, quotesOther, guard })
+      ?? (ALWAYS_HELD.has(name) && MONEY_TOOLS.has(name) && !confirmed ? 'document' : null);
+  if (holdWhy) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
       : !!senderApiKey;
     if (hasKey || isOwner) {
-      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
+      const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId, reason: holdWhy });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
-      console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
-      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
-      return heldToolResult(held.code);
+      console.log(`[held] ${name} code=${held.code} sender=${senderId} reason=${holdWhy}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input, reason: holdWhy }));
+      return heldToolResult(held.code, null, holdWhy);
     }
+  }
+
+  // Keys connected before the guardrail existed were never asked. Ask once,
+  // on their first send; this send runs as it always has.
+  const canSend = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID));
+  if (MONEY_TOOLS.has(name) && !SELF_HELD.has(name) && !confirmed && guard === null && canSend && claimSendGuardQuestion(senderId)) {
+    heldNotices?.push(sendGuardPrompt('!'));
   }
   // ── Confirm gate for Connect write tools ────────────────────────────────────
   // connect_trust_create / _revoke sign an attestation from the key owner's
@@ -2338,6 +2373,7 @@ async function handleMessage(message) {
     currentChannelId: message.channelId,
     contextId,
     documentInContext,
+    quotesOther: !!replyContext,
     heldNotices,
   };
 
@@ -2510,6 +2546,11 @@ async function handleDM(message) {
       '⚠️ Your API key is stored encrypted and only has access to your Smart Send balance — not your main wallet. ' +
       'Keep only amounts you\'re comfortable with for sending. DM `!revoke` anytime to disconnect.'
     );
+    // First setup: ask once. Someone reconnecting keeps what they chose.
+    if (!getSendGuard(message.author.id)) {
+      claimSendGuardQuestion(message.author.id);
+      await message.reply(sendGuardPrompt('!')).catch(() => {});
+    }
     return;
   }
 
@@ -2881,6 +2922,24 @@ client.on(Events.MessageCreate, async (message) => {
   const confirmCmd = parseConfirmCommand(message.content, message.client.user?.id);
   if (confirmCmd) {
     handleConfirmCommand(message, confirmCmd).catch((err) => console.error('[held] unhandled error:', err));
+    return;
+  }
+  // !guard works in DMs and channels, mention or not; it only ever changes the
+  // sender's own setting.
+  const guardCmd = message.content.trim().match(/^(?:<@!?\d+>\s*)?!guard(?:\s+(\S+))?\s*$/i);
+  if (guardCmd) {
+    const choice = parseSendGuard(guardCmd[1]);
+    if (!choice) {
+      await message.reply(sendGuardPrompt('!', getSendGuard(message.author.id))).catch(() => {});
+      return;
+    }
+    setSendGuard(message.author.id, choice);
+    const said = {
+      none: '✅ No guardrail — sends run as soon as you ask.',
+      all: '✅ Every send now waits for your `!confirm`.',
+      quotes: '✅ Sends now wait for `!confirm` when your message quotes someone else.',
+    }[choice];
+    await message.reply(`${said} A document in the chat still makes sends wait.`).catch(() => {});
     return;
   }
   // DMs: handle !connect / !revoke commands

@@ -21,7 +21,7 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult,
-  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD } from '../held-actions.js';
+  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD, holdReason, sendGuardPrompt } from '../held-actions.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -229,6 +229,10 @@ function buildRunTool() {
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
     client: { users: { fetch: async () => null } },
+    holdReason, sendGuardPrompt,
+    guards: {}, asked: new Set(),
+    getSendGuard: (id) => deps.guards[String(id)] ?? null,
+    claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
   };
   const runTool = new Function(...Object.keys(deps), `${runToolSrc}\nreturn runTool;`)(...Object.values(deps));
   return { runTool, calls, deps };
@@ -618,4 +622,48 @@ test('connect_drop gets a new key on every call, and a 202 is retried with the s
   assert.equal(second.transferHash, '0xdef');
   assert.notEqual(seen[2], seen[0], 'a new call gets a new key, even when the model repeats its own');
   assert.ok(!seen.includes('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
+});
+
+// ─── send guardrail (each user's own choice, enforced here) ──────────────────
+
+test('guard quotes: a quoting turn is held, a plain one sends', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.guards.u1 = 'quotes';
+  const notices = [];
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', quotesOther: true, heldNotices: notices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.equal(calls.length, 0);
+  assert.match(notices[0], /quotes someone else/);
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
+  assert.equal(calls.length, 1);
+});
+
+test('guard all holds every send; none never adds a hold', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.guards.u1 = 'all';
+  assert.equal(JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' })).status, 'held_for_confirmation');
+  deps.guards.u1 = 'none';
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', quotesOther: true });
+  assert.equal(calls.length, 1);
+});
+
+test('never chose: asked once on the first send, which still runs', async () => {
+  const { runTool, calls } = buildRunTool();
+  const n1 = [], n2 = [];
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n1 });
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
+  assert.equal(calls.length, 2);
+  assert.match(n1.join('\n'), /!guard quotes/);
+  assert.equal(n2.length, 0);
+});
+
+test('a document still holds when the user chose none', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.guards.u1 = 'none';
+  assert.equal(JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', documentInContext: true })).status, 'held_for_confirmation');
+  assert.equal(calls.length, 0);
+});
+
+test('handleMessage passes quotesOther to runTool', () => {
+  assert.match(SRC, /documentInContext,\n\s*quotesOther: !!replyContext,\n\s*heldNotices,/);
 });
