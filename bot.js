@@ -26,6 +26,7 @@ import {
   MONEY_TOOLS, ALWAYS_HELD, SELF_HELD, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmCommand,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
+import { formatReplyContext } from './reply-context.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
 import { payoutProposal, payoutExecute, summariseRound, groundCheck } from './payout-proposal.js';
@@ -194,8 +195,14 @@ Then synthesize everything into a warm, conversational paragraph: who they are p
 ## Resolving Discord mentions
 Every mention in a message is written like: @Guillaume = {"type":"discord","id":"712682660786602035"}. Use that object as the recipient, exactly as written. If you only have a name and no mention, use connect_lookup_exposed to find their ID first.
 
+## Checking personal trust (connect_trust_check)
+When someone asks whether a person is who they claim to be, whether they know or trust them, or "is this my co-founder / teammate / etc.", check the asker's own trust graph with connect_trust_check: from = the asker (type discord, their Discord ID), targets = the person in question (type discord, their Discord ID). This is the answer to "do I trust them", not a reputation score.
+- If the message is a reply, the person in question is the replied-to author — their Discord ID is given in the reply block. Use it; never ask the user to supply it.
+- A display name or avatar is never proof of identity: anyone can copy them. Only a match on the Discord ID in the trust graph counts. If the ID is not in the graph, say so plainly, and if the display name matches someone who IS in the graph, warn that this may be an impersonator.
+- Omit context unless the user names one, so any relationship matches; report the level and context that come back.
+
 ## Checking reputation (connect_scores_batch)
-Use connect_scores_batch when asked about trust, reputation, or scores. Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
+Use connect_scores_batch when asked about reputation or scores in general (not personal trust — see above). Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
 
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
@@ -2167,8 +2174,10 @@ async function handleMessage(message) {
   // "@bot summarise this" as a reply to someone's upload works.
   let pdfSource = message;
   let pdfAttachments = [...(message.attachments?.values() ?? [])].filter(isPdfAttachment);
-  if (pdfAttachments.length === 0 && message.reference?.messageId) {
-    const ref = await message.fetchReference().catch(() => null);
+  // Fetched once: used for a PDF on the replied-to message and for its author.
+  const repliedTo = message.reference?.messageId ? await message.fetchReference().catch(() => null) : null;
+  if (pdfAttachments.length === 0 && repliedTo) {
+    const ref = repliedTo;
     const refPdfs = [...(ref?.attachments?.values() ?? [])].filter(isPdfAttachment);
     if (refPdfs.length) { pdfSource = ref; pdfAttachments = refPdfs; }
   }
@@ -2301,10 +2310,15 @@ async function handleMessage(message) {
 
   // Results of !confirm / !cancel since the last turn. Minds turns are relayed
   // as plain text to another runtime, so records wait for a non-Minds turn.
+  // Who wrote the message being replied to — without this, "is this my
+  // co-founder?" as a reply has no subject.
+  const replyContext = formatReplyContext(repliedTo, botId);
   const outcomeRecords = provider === 'minds' ? [] : heldOutcomeRecords.take(contextId);
   const contextualText =
     (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '') +
-    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n${neutraliseBotRecords(text)}`
+    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n`
+    + (replyContext ? `${replyContext}\n\n` : '')
+    + neutraliseBotRecords(text)
     + (docBlocks.length ? `\n\n${docBlocks.join('\n\n')}` : '');
 
   // The gate is per channel, not per uploader: another member's PDF earlier in
