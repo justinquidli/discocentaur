@@ -357,6 +357,8 @@ function setUserApiKey(discordId, apiKey) {
 // api_key is NOT NULL with no default here, so guard-only rows write ''.
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard_asked INTEGER`); } catch { }
+// 'quotes' was the first name for 'replies'.
+db.exec("UPDATE user_keys SET send_guard = 'replies' WHERE send_guard = 'quotes'");
 
 function getSendGuard(discordId) {
   return db.prepare('SELECT send_guard FROM user_keys WHERE discord_id = ?').get(String(discordId))?.send_guard ?? null;
@@ -2937,7 +2939,7 @@ client.on(Events.MessageCreate, async (message) => {
     const said = {
       none: '✅ No guardrail — sends run as soon as you ask.',
       all: '✅ Every send now waits for your `!confirm`.',
-      quotes: '✅ Sends now wait for `!confirm` when your message quotes someone else.',
+      replies: '✅ Sends now wait for `!confirm` when you\'re replying to someone else\'s message.',
     }[choice];
     await message.reply(`${said} A document in the chat still makes sends wait.`).catch(() => {});
     return;

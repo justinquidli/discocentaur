@@ -626,14 +626,14 @@ test('connect_drop gets a new key on every call, and a 202 is retried with the s
 
 // ─── send guardrail (each user's own choice, enforced here) ──────────────────
 
-test('guard quotes: a quoting turn is held, a plain one sends', async () => {
+test('guard replies: a replying turn is held, a plain one sends', async () => {
   const { runTool, calls, deps } = buildRunTool();
-  deps.guards.u1 = 'quotes';
+  deps.guards.u1 = 'replies';
   const notices = [];
   const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', quotesOther: true, heldNotices: notices }));
   assert.equal(out.status, 'held_for_confirmation');
   assert.equal(calls.length, 0);
-  assert.match(notices[0], /quotes someone else/);
+  assert.match(notices[0], /replying to someone else/);
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
   assert.equal(calls.length, 1);
 });
@@ -653,7 +653,7 @@ test('never chose: asked once on the first send, which still runs', async () => 
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n1 });
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
   assert.equal(calls.length, 2);
-  assert.match(n1.join('\n'), /!guard quotes/);
+  assert.match(n1.join('\n'), /!guard replies/);
   assert.equal(n2.length, 0);
 });
 
