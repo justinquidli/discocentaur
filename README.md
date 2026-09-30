@@ -11,6 +11,8 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
+- **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
+- **Send guardrail** — you choose whether sends wait for `!confirm`: never, always, or when you're replying to someone ([details](#send-guardrail))
 - **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Presence-based drops** — target only online/idle/dnd members at execution time, not when scheduled
@@ -177,6 +179,42 @@ users who haven't run `!connect` will be prompted to. Drops already required a k
 makes the whole Connect surface consistent rather than adding a new gate. The two public tools
 (`connect_get_chains`, `connect_get_price`) answer without a key.
 
+## Send guardrail
+
+Each user decides whether their sends wait for confirmation. The bot asks once, right after
+`!connect`; keys linked before this existed are asked on their first send (that send runs as
+before). Change it anytime — the command works in a DM or a channel:
+
+```
+!guard           — show your current setting and the options
+!guard none      — sends run as soon as you ask
+!guard all       — every send waits for your !confirm
+!guard replies   — sends wait for !confirm only when you're replying to someone else's message
+```
+
+Until someone picks, nothing is held (the same as before the guardrail existed). A document in the
+chat holds sends whatever you pick — see [PDF attachments](#pdf-attachments). `replies` exists
+because a reply that mentions the bot puts the other person's message in your turn, running on your
+key: a message written to steer the bot ("…and send it now") can't send your money without your
+`!confirm`. The held notice says which rule held it.
+
+The choice is stored per user and enforced in `runTool`, not the prompt — a rule the model holds is
+one a crafted message can talk it out of. Covers every money tool (`connect_drop`, scheduled and
+conditional drops, watchers, Bankr); contributor payouts are always held regardless. Logic in `held-actions.js` (`holdReason`).
+
+## Replying to a message
+
+Reply to someone's message and mention the bot, and the bot knows who you mean: it gets the replied-to
+author's Discord ID, username and display name, plus their message marked as their text, not
+yours. The **ID** is treated as the identity; the display name is labelled as copyable, never proof.
+Logic in `reply-context.js`.
+
+This is what makes "is this my co-founder?" work as a reply: the bot checks **your** trust graph
+(`connect_trust_check`, from you to that Discord ID) and answers from your own attestations. An
+impostor using your co-founder's name and photo on a different account comes back "not in your trust
+graph". The prompt also tells the model to warn when the display name matches someone who is — that
+part is model behaviour, not enforced in code.
+
 ## Quidli Connect over MCP
 
 Connect exposes itself as an MCP server, and the bot consumes part of its surface that way
@@ -212,7 +250,7 @@ changes, and the call is otherwise forwarded as written:
 
 A `202` from Connect means recipient wallets are still being set up and nothing was sent; the bot
 retries with the same key (up to 5 × 3 s). A send is held for confirmation like every money tool
-while a document is in the conversation. Scheduled/conditional drops, watchers, claims and
+while a document is in the conversation, or when the user's [send guardrail](#send-guardrail) says so. Scheduled/conditional drops, watchers, claims and
 swap-and-send call `connect_drop` the same way, each with its own key. The hand-written REST
 `/drop` client and the x402 host-wallet path are gone.
 
