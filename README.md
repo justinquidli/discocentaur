@@ -261,6 +261,14 @@ attestation from the key owner's wallet — and are offered only because they ar
 `!confirm <code>`, whether or not a document is in the conversation. Any other write tool Connect
 adds stays withheld until someone deliberately adds it to that set.
 
+**Trusting a group.** Connect attests one identity per call, so "trust everyone in core at level 80,
+context team:quidli" would otherwise mean one `!confirm` per person. The bot's own `trust_many`
+tool holds the whole list (up to 25) behind **one** `!confirm`, then calls `connect_trust_create`
+for each person in turn. Each is still its own transaction on Base, paid in ETH by your Connect wallet.
+The member list comes from `discord_get_role_members` for a role. A failure part way through is reported per person and
+the rest still run. Logic in `held-actions.js` (`validateTrustBatch`); tests in
+`test/pdf.test.mjs`.
+
 How it works:
 
 - `selectMcpTools()` in `connect-mcp.js` (shared with the other bot) is the gate. It is a pure function precisely so it can be tested,

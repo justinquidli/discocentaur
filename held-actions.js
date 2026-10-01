@@ -189,6 +189,12 @@ export function describeHeldAction({ code, tool, input, reason = 'document' }) {
   } else if (tool === 'connect_trust_revoke') {
     lines.push(`**Revoke trust** on Base, signed by your Connect wallet: ${describeRecipient(input.to)}`);
     lines.push(input.context ? `Only context “${String(input.context).slice(0, 64)}”` : 'Every context you trust them in');
+  } else if (tool === TRUST_BATCH_TOOL) {
+    const ts = Array.isArray(input.targets) ? input.targets : [];
+    lines.push(`**Trust ${ts.length} ${ts.length === 1 ? 'person' : 'people'}** on Base, signed by your Connect wallet, at level ${Number(input.level)}/100:`);
+    lines.push(`→ ${ts.map(describeRecipient).join(', ') || '(none)'}`);
+    lines.push(`Context: ${input.context ? `“${String(input.context).slice(0, 64)}”` : 'none'} · Expires: ${input.expiresIn ? `in ${Math.round(Number(input.expiresIn) / 3600)} h` : 'never'}`);
+    lines.push(`One attestation per person, each a transaction paid in ETH on Base. Anyone you already trust exactly this way is returned without a new transaction.`);
   } else if (MCP_CONFIRM_TOOLS.has(tool)) {
     lines.push(`**${tool}** with ${JSON.stringify(input).slice(0, 400)}`);
   } else {
@@ -198,7 +204,7 @@ export function describeHeldAction({ code, tool, input, reason = 'document' }) {
   return (
     (ALWAYS_HELD.has(tool) || SELF_HELD.has(tool)
       ? `⏸️ **Held for confirmation** — this one moves money, so it never runs automatically.\n`
-      : MCP_CONFIRM_TOOLS.has(tool)
+      : isTrustAction(tool)
         ? `⏸️ **Needs your confirmation** — changes to your trust graph never run automatically.\n`
       : `⏸️ **Held for confirmation** — ${HOLD_REASONS[reason] ?? HOLD_REASONS.document}.\n`) +
     lines.join('\n') +
@@ -208,7 +214,7 @@ export function describeHeldAction({ code, tool, input, reason = 'document' }) {
 
 /** What the model sees instead of a transfer result. */
 export function heldToolResult(code, tool = null, reason = 'document') {
-  if (MCP_CONFIRM_TOOLS.has(tool)) {
+  if (isTrustAction(tool)) {
     return JSON.stringify({
       status: 'held_for_confirmation',
       executed: false,
@@ -257,6 +263,7 @@ export function neutraliseBotRecords(text) {
 
 function summarise({ tool, input }) {
   if (tool === 'connect_trust_create') return `trust attestation for ${input.to?.type}:${input.to?.id ?? input.to?.username} at level ${input.level}${input.context ? ` in context ${input.context}` : ''}`;
+  if (tool === TRUST_BATCH_TOOL) return `trust attestations for ${(input.targets ?? []).length} people (${(input.targets ?? []).slice(0, 10).map((t) => `${t?.type}:${t?.id ?? t?.username}`).join(', ')}${(input.targets ?? []).length > 10 ? ', …' : ''}) at level ${input.level}${input.context ? ` in context ${input.context}` : ''}`;
   if (tool === 'connect_trust_revoke') return `trust revocation for ${input.to?.type}:${input.to?.id ?? input.to?.username}${input.context ? ` in context ${input.context}` : ' in every context'}`;
   if (tool === 'bankr_swap_and_drop') return `swap via Bankr of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} (source ${input.source ?? 'connect'}), then ${Array.isArray(input.recipients) && input.recipients.length ? (input.sendAll === true ? `all of it split to ${input.recipients.length} recipients` : `${input.amountPerRecipient} each to ${input.recipients.length} recipients`) : 'kept in Connect'}`;
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
@@ -282,7 +289,7 @@ export function formatOutcomeRecord(action, outcome, detail = '', explorerUrl = 
     cancelled: 'was CANCELLED by the user. Nothing was sent',
   }[outcome];
   const link = explorerUrl ? ` Explorer link (verified): ${explorerUrl}` : '';
-  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held ${MCP_CONFIRM_TOOLS.has(action.tool) ? 'action' : 'transfer'} ${action.code} (${what}) ${status}.${link}]`;
+  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held ${isTrustAction(action.tool) ? 'action' : 'transfer'} ${action.code} (${what}) ${status}.${link}]`;
 }
 
 export function createRecordQueue({ maxPerContext = 10 } = {}) {
@@ -371,4 +378,36 @@ export function sendGuardPrompt(cmd, current = null) {
     `• ${c('guard replies')} — sends wait for ${c('confirm')} only when you're replying to someone else's message\n\n` +
     `A document in the chat always makes sends wait, whatever you pick. Change it anytime with ${c('guard')}.`
   );
+}
+
+// ─── Trusting several people at once ─────────────────────────────────────────
+// Connect attests one identity per call. trust_many holds a whole list behind
+// ONE confirmation and then calls connect_trust_create for each, so trusting a
+// team is one !confirm instead of one per person. Each is still its own
+// onchain transaction.
+
+export const TRUST_BATCH_TOOL = 'trust_many';
+export const TRUST_BATCH_MAX = 25;
+
+/** Trust tools always wait for confirmation, whatever the send guardrail says. */
+export function isTrustAction(tool) {
+  return MCP_CONFIRM_TOOLS.has(tool) || tool === TRUST_BATCH_TOOL;
+}
+
+/** An error message for the model, or null if the batch is valid. */
+export function validateTrustBatch(input) {
+  const ts = input?.targets;
+  if (!Array.isArray(ts) || ts.length === 0) return 'targets must be a non-empty list of identities.';
+  if (ts.length > TRUST_BATCH_MAX) return `At most ${TRUST_BATCH_MAX} people per batch — split the list and ask again.`;
+  const level = Number(input.level);
+  if (!Number.isInteger(level) || level < 1 || level > 100) return 'level must be a whole number from 1 to 100.';
+  if (input.expiresIn != null && !(Number(input.expiresIn) > 0)) return 'expiresIn must be a positive number of seconds.';
+  const seen = new Set();
+  for (const t of ts) {
+    if (!t || typeof t !== 'object' || !t.type || !(t.id || t.username)) return 'Every target needs a type and an id or username.';
+    const k = `${String(t.type).toLowerCase()}:${String(t.id ?? t.username).toLowerCase().replace(/^@/, '')}`;
+    if (seen.has(k)) return `${k} is listed twice — remove the duplicate.`;
+    seen.add(k);
+  }
+  return null;
 }

@@ -21,7 +21,8 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult,
-  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD, holdReason, sendGuardPrompt } from '../held-actions.js';
+  formatAmount, parseConfirmCommand, ALWAYS_HELD, SELF_HELD, holdReason, sendGuardPrompt,
+  TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction } from '../held-actions.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -229,7 +230,7 @@ function buildRunTool() {
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
     client: { users: { fetch: async () => null } },
-    holdReason, sendGuardPrompt,
+    holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     guards: {}, asked: new Set(),
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
     claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
@@ -379,7 +380,7 @@ function buildConfirm(runToolImpl) {
     heldOutcomeRecords: createRecordQueue(),
     verifiedTxLinks: createVerifiedLinkStore(),
     describeHeldAction, formatOutcomeRecord,
-    MCP_CONFIRM_TOOLS,
+    MCP_CONFIRM_TOOLS, TRUST_BATCH_TOOL,
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
     runTool: runToolImpl,
@@ -666,4 +667,45 @@ test('a document still holds when the user chose none', async () => {
 
 test('handleMessage passes quotesOther to runTool', () => {
   assert.match(SRC, /documentInContext,\n\s*quotesOther: !!replyContext,\n\s*heldNotices,/);
+});
+
+// ─── trust_many: several people behind one !confirm ──────────────────────────
+
+const team = { targets: [{ type: 'discord', id: '1' }, { type: 'discord', id: '2' }, { type: 'github', username: 'alice' }], level: 80, context: 'team:quidli' };
+
+test('trust_many is held behind one code and writes nothing until confirmed', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.mcpToolNames.add('connect_trust_create');
+  const notices = [];
+  const out = JSON.parse(await runTool(TRUST_BATCH_TOOL, team, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.equal(calls.length, 0);
+  assert.equal(deps.heldActions.listFor('u1').length, 1);
+  assert.match(notices[0], /Trust 3 people/);
+  assert.match(notices[0], /!confirm/);
+});
+
+test('trust_many confirmed: one connect_trust_create per person with the sender key', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.mcpToolNames.add('connect_trust_create');
+  const out = JSON.parse(await runTool(TRUST_BATCH_TOOL, team, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
+  assert.equal(calls.filter((c) => c.tool === 'connect_trust_create' && c.key === 'k').length, 3);
+  assert.deepEqual([out.success, out.trusted, out.total], [true, 3, 3]);
+});
+
+test('trust_many refuses invalid lists and keyless senders without holding', async () => {
+  const { runTool, deps } = buildRunTool();
+  deps.mcpToolNames.add('connect_trust_create');
+  assert.equal(JSON.parse(await runTool(TRUST_BATCH_TOOL, { targets: [], level: 50 }, { senderId: 'u1', senderApiKey: 'k' })).status, 'refused');
+  assert.match(await runTool(TRUST_BATCH_TOOL, team, { senderId: 'u1', senderApiKey: null }), /needs your own Quidli key/);
+  assert.equal(deps.heldActions.listFor('u1').length, 0);
+});
+
+test('!confirm on trust_many reports partial success and who failed', async () => {
+  const { fn, deps, message, replies } = buildConfirm(async () => JSON.stringify({ success: false, trusted: 2, total: 3, failed: [{ to: 'discord:2', error: 'insufficient gas' }], message: 'Trusted 2 of 3. Failed: discord:2' }));
+  const { code } = deps.heldActions.hold({ tool: TRUST_BATCH_TOOL, input: team, senderId: 'u1', channelId: 'c1', contextId: 'g' });
+  await fn(message, { verb: 'confirm', code });
+  assert.match(replies.join('\n'), /⚠️ .*Trusted 2 of 3/s);
+  assert.match(replies.join('\n'), /discord:2: insufficient gas/);
+  assert.match(deps.heldOutcomeRecords.take('g')[0], /partially: Trusted 2 of 3/);
 });
