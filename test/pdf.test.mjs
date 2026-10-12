@@ -709,3 +709,17 @@ test('!confirm on trust_many reports partial success and who failed', async () =
   assert.match(replies.join('\n'), /discord:2: insufficient gas/);
   assert.match(deps.heldOutcomeRecords.take('g')[0], /partially: Trusted 2 of 3/);
 });
+
+// ─── the sanitizer is host-agnostic: no chain's explorer is a free pass ──────
+
+test('invented tx links are stripped on every explorer host, real ones kept', () => {
+  const sanitize = buildSanitize();
+  const hash = '0x' + 'ab'.repeat(32);
+  for (const host of ['explorer.monad.xyz', 'monadscan.com', 'worldscan.org', 'explorer.chain.robinhood.com', 'basescan.org']) {
+    const url = `https://${host}/tx/${hash}`;
+    assert.match(sanitize(`Explorer link: [View](${url})`, []), /unverified transaction link removed/, host);
+    assert.match(sanitize(`sent ${url}.`, []), /unverified transaction link removed/, host);
+    assert.equal(sanitize(`sent ${url}`, [url]), `sent ${url}`, `${host} real link kept`);
+  }
+  assert.match(sanitize('https://explorer.monad.xyz/tx/0xabc123...', []), /unverified transaction link removed/);
+});

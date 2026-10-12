@@ -820,6 +820,8 @@ const CHAIN_EXPLORERS = {
   8453: 'https://basescan.org/tx/',
   42161: 'https://arbiscan.io/tx/',
   43114: 'https://snowtrace.io/tx/',
+  143: 'https://monadscan.com/tx/',
+  4663: 'https://robinhoodchain.blockscout.com/tx/',
   1399811149: 'https://solscan.io/tx/',
 };
 function explorerTxUrl(chainId, hash) {
@@ -1260,7 +1262,9 @@ const _pendingExplorerUrls = [];
 // calling connect_drop. Since this bot moves real money, never trust a model's
 // own claim of an explorer link — only ever show one that came from a real
 // quidliDrop() result this turn. Anything else gets stripped and flagged.
-const EXPLORER_TX_RE = /https?:\/\/(?:optimistic\.etherscan\.io|etherscan\.io|polygonscan\.com|basescan\.org|arbiscan\.io|snowtrace\.io|solscan\.io)\/tx\/([A-Za-z0-9]+)/g;
+// Host-agnostic on purpose: a per-explorer allowlist let invented links on any
+// chain it didn't list (Monad, World Chain, Robinhood) straight through.
+const EXPLORER_TX_RE = /https?:\/\/[^\s)\]>]+?\/tx\/([A-Za-z0-9]+)/g;
 function sanitizeUnverifiedTxClaims(text, realUrls) {
   // EVM hashes are case-insensitive hex. Solana signatures are case-SENSITIVE
   // base58 — lowercasing one would never match, so compare exactly first and

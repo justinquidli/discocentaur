@@ -139,6 +139,8 @@ test('explorer links follow the chain the drop was sent on', () => {
 
   assert.equal(url(8453, '0xabc'), 'https://basescan.org/tx/0xabc');
   assert.equal(url(1399811149, '5xTr'), 'https://solscan.io/tx/5xTr');
+  assert.equal(url(143, '0xabc'), 'https://monadscan.com/tx/0xabc');
+  assert.equal(url(4663, '0xabc'), 'https://robinhoodchain.blockscout.com/tx/0xabc');
   assert.equal(url('8453', '0xabc'), 'https://basescan.org/tx/0xabc', 'chainId may arrive as a string');
   assert.equal(url(999999, '0xabc'), null, 'unknown chains get no link rather than a wrong one');
   assert.equal(url(8453, undefined), null, 'no hash, no link');
