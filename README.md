@@ -8,7 +8,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Swap, then send** — "swap 5 USDC to DEGEN and send 500 to @alice": the bot moves the sell amount from your Connect wallet to your [Bankr](https://bankr.bot) wallet, swaps, brings the result back, and sends the exact amount you asked for ([details](#bankr--swaps-and-market-data))
 - **Market questions** — token prices, contract addresses and your Bankr wallet balance, via Bankr
 - **Pay invoices from a PDF** — drop an invoice in chat; the bot reads it and prepares the payment to the vendor's email or social handle, held until you `!confirm` ([details](#pdf-attachments))
-- **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
+- **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche, Monad, Robinhood Chain and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
 - **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
@@ -306,13 +306,20 @@ Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid
 
 Note on chains: drops are **multi-chain**. Base (8453) is the default and what the model uses
 unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161),
-Avalanche (43114) and Solana (1399811149) all work. `connect_get_chains` lets the model answer
-chain questions from the server rather than guessing.
+Avalanche (43114), Monad (143), Robinhood Chain (4663) and Solana (1399811149) all work. World Chain (480)
+is also listed by Connect as drop-capable but has no explorer link here yet. `connect_get_chains` lets the
+model answer chain questions from the server rather than guessing; the system prompt's own chain list is
+shorter than that, so the server is the source of truth.
 
 Explorer links follow the chain. `CHAIN_EXPLORERS` maps a chainId to its explorer and `quidliDrop()` (Connect's MCP `connect_drop`)
 attaches the right link to its own result, so no caller has to know which chain was used. A chain
 absent from that map yields no link rather than a wrong one — which is safer than the previous
 behaviour, where every link was hardcoded to `basescan.org`.
+
+The fabricated-link guard is host-agnostic: any `.../tx/<hash>` URL in a model reply is stripped unless it
+came from a real drop result (this turn, or a confirmed action earlier in the chat). It does not depend on
+`CHAIN_EXPLORERS`, so an invented link on a chain with no explorer entry is still removed. It strips links
+only — a plain-text "sent!" with no link is not caught.
 
 Solana specifics the model is told about: amounts are lamports for native SOL (9 decimals), USDC is
 the SPL mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (6 decimals), social recipients are paid
