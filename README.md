@@ -138,9 +138,9 @@ the box are both `claudetaur`.
 npm run check     # syntax check + tests
 ```
 
-10 tests, covering the MCP tool gate (read-only registration, fail-closed on unannotated tools,
+`npm test` prints the current count (140+ at the time of writing; don't trust a number written here). The suite covers the MCP tool gate (read-only registration, fail-closed on unannotated tools,
 the legacy fallback, the keyless header), the drop recipient enum, which has silently drifted from
-the server's once already, per-chain explorer links, and the fabricated-transaction-link guard. `bot.js` connects to Discord on import, so the tests extract the
+the server's once already, per-chain explorer links, the host-agnostic fabricated-transaction-link guard, held transfers and the send guardrail, reply context, and group trust. `bot.js` connects to Discord on import, so the tests extract the
 functions under test from its source rather than importing it — a stopgap until it's split into
 modules.
 
