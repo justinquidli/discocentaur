@@ -105,7 +105,7 @@ cp .env.example .env
 | `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
 | `HOST_KEY_ALLOWED_ROLES` | — | Discord role names allowed to spend the host's LLM keys |
 | `DISCORD_ACTIVE_CHANNELS` | — | Comma-separated channel IDs where the bot responds to all messages (not just @mentions) |
-| `DISCORD_ALLOWED_ROLES` | — | Comma-separated Discord role names allowed to use the bot. Empty = everyone |
+| `DISCORD_ALLOWED_ROLES` | — | Comma-separated Discord role names allowed to use the bot in servers (DMs are not role-checked). Empty = everyone |
 | `DISCORD_ALLOWED_USERS` | — | Comma-separated Discord user IDs allowed to use the bot. Empty = everyone |
 | `SYSTEM_PROMPT` | — | Override the default system prompt |
 
@@ -499,7 +499,9 @@ the bot's 10-second shutdown wait doesn't cover a run that takes minutes. Check
 
 ## Role management
 
-Access to DiscoCentaur is controlled by `DISCORD_ALLOWED_ROLES` in `.env`. Only members with those roles can interact with the bot or switch providers.
+Access to DiscoCentaur in servers is controlled by `DISCORD_ALLOWED_ROLES` in `.env`. Only members with those roles can interact with the bot or switch providers there.
+
+**DMs are not role-checked.** The role check runs only for server messages; a direct message to the bot skips it (`DISCORD_ALLOWED_USERS` still applies in DMs, and the host's LLM keys still need `BOT_OWNER_ID`, `HOST_KEY_ALLOWED_USERS` or `HOST_KEY_ALLOWED_ROLES`). If the role list is meant to be a hard gate, set `DISCORD_ALLOWED_USERS` too.
 
 **Granting access:**
 Assign the allowed role to a user in Discord (Server Settings → Roles, or right-click the user). There is no bot command for this — it's managed through Discord's native role system.
@@ -526,7 +528,7 @@ Attach a PDF (or reply to a message that has one) and mention the bot — it rea
 - Text extraction only (`unpdf`). Scanned / image-only PDFs are refused with a message, not guessed at. Password-protected PDFs are refused.
 - The text goes into the channel's conversation history, so follow-ups ("now pay line 3") work until it ages out of the 40-message window or the provider is switched.
 
-**Transfers are held while a document is in context.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads a document to a channel — long enough for both the document and every reply that quoted it to leave the 40-message history — `connect_drop`, `schedule_drop`, `conditional_drop` and `create_watcher` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
+**Transfers are held while a document is in context.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads a document to a channel — long enough for both the document and every reply that quoted it to leave the 40-message history — `connect_drop`, `schedule_drop`, `conditional_drop`, `create_watcher`, `bankr_agent`, `bankr_swap_and_drop` and `payout` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
 
 ```
 !confirm K7QM2P   — run it
@@ -567,7 +569,7 @@ request, or switch providers — nothing after the cap was executed.
 
 **Drop returns 400:** Ensure Smart Send is enabled and funded at [connect.quid.li](https://connect.quid.li).
 
-**Score returns 404:** Confirm `QUIDLI_API_KEY` is set in `.env`.
+**Lookup, score or balance says a key is needed:** the person asking must link their own key with `!connect <key>` in a DM. The host key (`QUIDLI_API_KEY`) only covers `BOT_OWNER_ID`. If *nobody* gets Connect tools, check `QUIDLI_API_KEY` is set in `.env`: the bot registers Connect's MCP tools only when it has a host key.
 
 **Conditional drop fires at wrong time:** Make sure `BRAVE_SEARCH_API_KEY` is set — without it the bot can't look up event schedules and will guess the check time.
 
