@@ -146,6 +146,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Balances come back as balanceInWei with a decimals field — divide before showing a human number, and use the symbol from the response.
 - Before a drop that looks large, or after a drop fails for funding reasons, check the balance and say plainly what's short — the token or the gas.
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
+- In a server channel, never state how much anyone holds — not a balance, not what's left after a send (leftInConnect included). Say only whether it covers the send ("You've got enough for that"). If they ask for their balance in a channel, tell them to DM you for it.
 
 ## Sending tokens (connect_drop)
 - Pass people straight to connect_drop as recipients — Connect resolves them to the right wallet for the chain and creates one if they don't have one yet. You don't need connect_lookup first. If the result still says "processing", Connect is setting up the recipient's wallet and nothing was sent: tell the user to ask again in a minute.
@@ -1287,7 +1288,7 @@ function trackedRunTool(name, input, ctx) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null,
+  senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null, isPrivateChat = false,
   documentInContext = false, quotesOther = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
@@ -1411,6 +1412,13 @@ async function runTool(name, input, {
         if (explorerUrl) _pendingExplorerUrls.push(explorerUrl);
         console.log('[drop] result:', JSON.stringify(body));
         return JSON.stringify({ ...body, explorerUrl }, null, 2);
+      }
+      if (name === 'connect_drop_balance' && !isPrivateChat) {
+        return JSON.stringify({
+          groupChat: true,
+          instruction: 'Server channel: do not state any amount from this result. Say only whether it covers the send; for the actual balance, tell the user to DM you.',
+          result: mcpOut,
+        });
       }
       return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
     } catch (err) {
@@ -2452,6 +2460,7 @@ async function handleMessage(message) {
     senderUser: message.author,
     userText: message.content,
     currentChannelId: message.channelId,
+    isPrivateChat: isDM,
     contextId,
     documentInContext,
     quotesOther: !!replyContext,

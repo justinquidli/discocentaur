@@ -13,7 +13,7 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
 - **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
 - **Send guardrail** — you choose whether sends wait for `!confirm`: never, always, or when you're replying to someone ([details](#send-guardrail))
-- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero. In a server channel it only says whether you can cover a send; ask in a DM for the amounts
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Presence-based drops** — target only online/idle/dnd members at execution time, not when scheduled
 - **Conditional drops** — "if BTC is above $100k, send everyone 1 USDC" — evaluated automatically using real-time web search
