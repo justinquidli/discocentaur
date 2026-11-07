@@ -135,6 +135,7 @@ export function createWorldGate({
   maxPending = 3,
   log = console,
   debug = false,
+  sendClaims = true, // diagnostic only: false drops the acr `claims` extension; validation still enforces acr
 } = {}) {
   const pending = new Map();      // attempt id -> attempt
   const seenJti = new Set();
@@ -182,7 +183,7 @@ export function createWorldGate({
         continue;
       }
 
-      if (debug) log.error?.(`[world] poll -> http ${r.status} ${r.body?.error ?? (typeof r.body?.id_token === 'string' ? 'id_token' : 'no error field')}`);
+      if (debug) log.error?.(`[world] poll -> http ${r.status} ${r.body?.error ?? (typeof r.body?.id_token === 'string' ? 'id_token' : 'no error field')}${r.body?.error_description ? ` | ${String(r.body.error_description).slice(0, 200)}` : ''}`);
       if (r.status === 200 && typeof r.body.id_token === 'string') {
         const v = await validateIdToken(r.body.id_token, {
           cfg, keys, startedAtSec: Math.floor(attempt.startedAtMs / 1000), nowSec: Math.floor(now() / 1000), seenJti, enroll: attempt.enroll,
@@ -231,8 +232,9 @@ export function createWorldGate({
       let r;
       try {
         r = await postForm(fetchImpl, meta.device_authorization_endpoint, {
-          client_id: cfg.clientId, client_secret: cfg.clientSecret, scope: 'openid', claims,
+          client_id: cfg.clientId, client_secret: cfg.clientSecret, scope: 'openid', ...(sendClaims ? { claims } : {}),
         }, REQUEST_TIMEOUT_MS);
+        if (debug) log.error?.(`[world] device start -> http ${r.status} fields: ${Object.keys(r.body ?? {}).join(',')} interval=${r.body?.interval} expires_in=${r.body?.expires_in} claims_sent=${sendClaims}`);
       } catch {
         release();
         throw new WorldError('unavailable', 'Could not reach World ID. Nothing was paid; try again shortly.');

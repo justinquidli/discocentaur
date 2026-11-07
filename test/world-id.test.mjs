@@ -166,3 +166,20 @@ test('validateIdToken: enrolment skips only the allowlist', async () => {
   const bad = await validateIdToken(await mint({ sub: 'new-person', amr: ['pop', 'mfa'] }), { ...base, enroll: true });
   assert.equal(bad.status, 'insufficient_assurance');
 });
+
+test('diagnostic switch: claims can be left out of the device request, validation still enforces acr', async () => {
+  let t = T0;
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const body = init.body ? Object.fromEntries(new URLSearchParams(init.body)) : null;
+    calls.push({ url: String(url), body });
+    const json = (status, obj) => ({ ok: status < 400, status, json: async () => obj });
+    if (String(url).endsWith('/.well-known/openid-configuration')) return json(200, { issuer: ISS, device_authorization_endpoint: `${ISS}/api/v1/device_authorization`, token_endpoint: `${ISS}/api/v1/token`, jwks_uri: `${ISS}/jwks` });
+    if (String(url).endsWith('/device_authorization')) return json(200, { device_code: 'D', user_code: 'U', expires_in: 1200, interval: 1 });
+    return json(200, { id_token: await mint({ acr: 'https://world.org/oidc/acr/selfie' }) });
+  };
+  const gate = createWorldGate({ cfg, fetchImpl, now: () => t, sleep: async (ms) => { t += ms; }, keysFor: () => keys, sendClaims: false, log: { error() {} } });
+  const out = await (await begin(gate)).done;
+  assert.equal(calls.find((c) => c.url.endsWith('/device_authorization')).body.claims, undefined);
+  assert.equal(out.status, 'insufficient_assurance', 'a non-Orb acr is still refused without the claims request');
+});

@@ -18,7 +18,7 @@ if (!cfg.clientId || !cfg.clientSecret) {
 }
 
 // The allowlist is what we are about to build, so it may be empty here.
-const gate = createWorldGate({ cfg: { ...cfg, ok: true }, allowEnroll: true, debug: !!process.env.WORLD_ID_DEBUG });
+const gate = createWorldGate({ cfg: { ...cfg, ok: true }, allowEnroll: true, debug: !!process.env.WORLD_ID_DEBUG, sendClaims: process.env.WORLD_ID_DEVICE_CLAIMS !== 'off' });
 
 let attempt;
 try {
