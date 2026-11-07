@@ -5,6 +5,7 @@
 // and reads every amount from the saved round file — a Discord message can
 // name a round, and nothing else about what moves.
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -34,6 +35,18 @@ const TOKEN = /^(0x[0-9a-fA-F]{40}|[A-Za-z0-9]{1,12})$/;
 const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
 
 const roundPath = (label) => resolve(DIR, 'rounds', `${label}.json`);
+
+/**
+ * Fingerprint of a saved round: sha256 of the file's bytes. Taken when the
+ * owner is shown the plan and checked again before anything is paid, so an
+ * approval can only ever release the exact round that was shown.
+ */
+export function roundHash(label) {
+  if (!LABEL.test(label ?? '')) return null;
+  const path = roundPath(label);
+  if (!existsSync(path)) return null;
+  try { return createHash('sha256').update(readFileSync(path)).digest('hex'); } catch { return null; }
+}
 
 /** Run the payout CLI and hand back its output. */
 function run(args, timeoutMs) {
@@ -131,7 +144,7 @@ export async function payoutExecute({ label }) {
   const { code, signal, out, err } = await run([
     '--env-file=.env', 'payout.js',
     '--repo', round.repo, '--token', round.token.address, '--budget', String(round.total),
-    '--payer', 'dynamic', '--plan-file', `rounds/${label}.json`, '--round', label,
+    '--payer', 'connect', '--plan-file', `rounds/${label}.json`, '--round', label,
     '--execute', '--yes', '--comment',
   ], EXEC_TIMEOUT_MS);
 

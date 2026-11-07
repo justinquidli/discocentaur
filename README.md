@@ -470,7 +470,7 @@ so that repo must be checked out next to this one (or at `PAYOUT_DIR`) with its 
    because a model that retyped them once got two rows wrong while the total still matched.
 3. **Confirm.** The payment is always held — document or not — and runs only after the owner's
    `!confirm <code>`. Execution reads everything (repo, token, every amount) from the round file,
-   pays from the agent's Dynamic wallet and comments on the PRs.
+   pays from the Quidli Connect wallet once the owner approves with World ID and comments on the PRs.
 
 Guards:
 

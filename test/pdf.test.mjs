@@ -229,7 +229,20 @@ function buildRunTool() {
     db: { prepare: () => ({ run: () => calls.push({ tool: 'db-write' }), all: () => [], get: () => null }) },
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
-    client: { users: { fetch: async () => null } },
+    client: { users: { fetch: async () => null }, channels: { fetch: async () => null } },
+    worldGate: { configured: true },
+    payoutApprover: {
+      requests: [],
+      cancelled: 0,
+      async request(r) {
+        this.requests.push(r);
+        const self = this;
+        return { ok: true, planHash: 'h', userCode: 'ABCD-1234', verificationUri: 'https://world.test/d', verificationUriComplete: 'https://world.test/d?c=ABCD-1234', expiresInSec: 1200, cancel() { self.cancelled++; } };
+      },
+    },
+    formatPayoutResult: (r) => `result ${r?.status}`,
+    formatOutcomeRecord,
+    heldOutcomeRecords: createRecordQueue(),
     holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     guards: {}, asked: new Set(),
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
@@ -261,18 +274,44 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
   });
 }
 
-test('payout proposes, posts the split itself, and holds — in one call', async () => {
-  const { runTool, calls } = buildRunTool();
+test('payout proposes, posts the split, and asks World ID — never !confirm', async () => {
+  const { runTool, calls, deps } = buildRunTool();
   const heldNotices = [];
-  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices }));
-  assert.equal(out.status, 'held_for_confirmation');
-  assert.deepEqual(calls, [], 'nothing paid before confirmation');
+  const dms = [];
+  const senderUser = { send: async (t) => { dms.push(t); } };
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices, senderUser }));
+  assert.equal(out.status, 'awaiting_world_id');
+  assert.equal(out.executed, false);
+  assert.deepEqual(calls, [], 'nothing paid before World ID approves');
+  assert.equal(deps.heldActions.size, 0, 'no !confirm hold exists for a payout');
   assert.match(heldNotices.join('\n'), /@alice — 100 BNKR/, 'the bot posts the split');
-  assert.match(heldNotices.join('\n'), /moves money/i);
   assert.ok(!out.message?.includes('100 BNKR'), 'the model is not given the amounts');
+  assert.equal(dms.length, 1, 'link goes to the owner by DM');
+  assert.match(dms[0], /world\.test\/d\?c=ABCD-1234/);
+  assert.ok(!heldNotices.join('\n').includes('ABCD-1234'), 'the channel never sees the code');
+  assert.equal(deps.payoutApprover.requests[0].label, 'dc-demo-1');
 
-  await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true });
-  assert.deepEqual(calls, [{ tool: 'payout' }], 'confirmed call executes');
+  const again = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true }));
+  assert.equal(again.status, 'refused', '!confirm can no longer pay a payout');
+  assert.deepEqual(calls, []);
+});
+
+test('payout is cancelled if the owner cannot be DMed the link', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  const senderUser = { send: async () => { throw new Error('DMs closed'); } };
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices: [], senderUser }));
+  assert.equal(out.status, 'refused');
+  assert.equal(deps.payoutApprover.cancelled, 1);
+  assert.deepEqual(calls, []);
+});
+
+test('payout is disabled when World ID is not configured', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.worldGate.configured = false;
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices: [], senderUser: { send: async () => {} } }));
+  assert.equal(out.status, 'refused');
+  assert.deepEqual(deps.payoutApprover.requests, []);
+  assert.deepEqual(calls, []);
 });
 
 test('payout is refused for anyone but the owner', async () => {
@@ -305,7 +344,10 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const spending = branches
     .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
-  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => !MCP_SEND_TOOLS.has(t)).sort(),
+  // payout is gated by World ID (payout-approval.js), not by the hold store, so
+  // runTool must never call payoutExecute itself.
+  assert.ok(!spending.includes('payout'), 'runTool must not execute a payout directly');
+  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => t !== 'payout' && !MCP_SEND_TOOLS.has(t)).sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
 });
 

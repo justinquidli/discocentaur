@@ -29,7 +29,10 @@ import {
 import { formatReplyContext } from './reply-context.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
-import { payoutProposal, payoutExecute, summariseRound, groundCheck } from './payout-proposal.js';
+import { payoutProposal, payoutExecute, summariseRound, groundCheck, roundHash } from './payout-proposal.js';
+import { createWorldGate, loadWorldConfig } from './world-id.js';
+import { createPayoutApprover, formatPayoutResult } from './payout-approval.js';
+import { appendFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
@@ -1204,7 +1207,7 @@ const tools = [
   },
   {
     name: 'payout',
-    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and holds the payment for the user to confirm with a code. You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request.',
+    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and then asks the owner to approve the payment with World ID (a link sent by DM); nothing is paid until they do. You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request. Never say a payout was paid unless a later bot record says it ran.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1251,6 +1254,18 @@ function bankrRateCheck(senderId) {
 }
 // Outcomes of !confirm / !cancel, delivered to the channel's next model turn.
 const heldOutcomeRecords = createRecordQueue();
+// Payouts are approved by a World ID check (device flow), not by !confirm.
+// The audit write throws on failure on purpose: no record, no payment.
+const worldAudit = (event) => appendFileSync(new URL('./world-approvals.jsonl', import.meta.url), JSON.stringify(event) + '\n');
+const worldGate = createWorldGate({ cfg: loadWorldConfig(), audit: worldAudit });
+const payoutApprover = createPayoutApprover({
+  gate: worldGate,
+  roundHash,
+  execute: payoutExecute,
+  audit: worldAudit,
+  track: (p) => shutdown.track(p, 'payout'),
+  isStopping: () => shutdown.stopping,
+});
 // Explorer links from real drops per conversation, so a later turn can repeat them.
 const verifiedTxLinks = createVerifiedLinkStore();
 
@@ -1435,12 +1450,10 @@ async function runTool(name, input, {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run a payout.' });
 
-    if (confirmed) {
-      console.log(`[payout] execute label=${input.label}`);
-      const done = await payoutExecute({ label: input.label });
-      console.log(`[payout] execute ${done.status}`);
-      return JSON.stringify(done, null, 2);
-    }
+    // Payouts are approved only through World ID. A confirmed call (the old
+    // !confirm path) never pays, so nothing can route around the check.
+    if (confirmed) return JSON.stringify({ status: 'refused', executed: false, message: 'Payouts are approved with World ID, not !confirm. Nothing was paid.' });
+    if (!worldGate.configured) return JSON.stringify({ status: 'refused', executed: false, message: 'World ID is not configured on the host, so payouts are disabled. Nothing was paid.' });
 
     // Check the extraction against what the user wrote before spending a
     // scoring run on it. A window or budget the model supplied on its own pays
@@ -1468,17 +1481,47 @@ async function runTool(name, input, {
     // still matched — the hardest kind of error to catch by eye.
     heldNotices?.push('```\n' + String(proposal.proposal).slice(0, 1800) + '\n```');
 
-    const held = heldActions.hold({
-      tool: name,
-      input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined },
-      senderId,
+    const label = proposal.label;
+    const heldInput = { ...input, label, summary: summariseRound(label) ?? undefined };
+    const sayInChannel = async (text) => {
+      const ch = await client.channels.fetch(currentChannelId).catch(() => null);
+      if (ch?.isTextBased?.()) await ch.send(String(text).slice(0, 1900)).catch((e) => console.error('[payout] channel post failed:', e?.message ?? e));
+    };
+    const req = await payoutApprover.request({
+      label,
+      senderId: String(senderId),
       channelId: currentChannelId,
-      contextId,
+      onApproved: () => sayInChannel('✅ World ID approved. Paying now…'),
+      onResult: async (r) => {
+        console.log(`[payout] world result ${r.status} executed=${r.executed}`);
+        // A result object means the payout ran (or may have): report from its
+        // status, never from `executed`, which a timed-out run leaves unset.
+        const st = r.result?.status;
+        const outcome = r.result ? (st === 'ok' ? 'executed' : st === 'unknown' ? 'unknown' : 'failed') : 'cancelled';
+        heldOutcomeRecords.push(contextId, formatOutcomeRecord({ code: 'world', tool: 'payout', input: heldInput }, outcome, r.result ? (r.result.error ?? '') : r.text));
+        await sayInChannel(r.result ? formatPayoutResult(r.result, label) : `❌ Round \`${label}\` not paid: ${r.text}`);
+      },
     });
-    if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
-    console.log(`[held] payout code=${held.code} label=${proposal.label}`);
-    heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: { ...input, label: proposal.label, summary: summariseRound(proposal.label) ?? undefined } }));
-    return heldToolResult(held.code);
+    if (!req.ok) return JSON.stringify({ status: 'refused', executed: false, message: `${req.error} Nothing was paid.` });
+    console.log(`[payout] awaiting World ID label=${label}`);
+
+    // Link and plan go to the owner privately; the channel never sees the code.
+    const dm = senderUser
+      ? await senderUser.send(
+        `**Approve payout \`${label}\` with World ID**\n\`\`\`\n${String(heldInput.summary ?? '').slice(0, 1200)}\n\`\`\`\n` +
+        `Open ${req.verificationUriComplete} (code \`${req.userCode}\`) and approve. Expires in ${Math.round(req.expiresInSec / 60)} min.\n` +
+        `World ID shows who is approving, not this amount — check the split above first. Anything but an approval pays nothing.`,
+      ).then(() => true, () => false)
+      : false;
+    if (!dm) {
+      req.cancel();
+      return JSON.stringify({ status: 'refused', executed: false, message: 'Could not DM the owner the approval link (DMs closed?). Cancelled; nothing was paid.' });
+    }
+    return JSON.stringify({
+      status: 'awaiting_world_id',
+      executed: false,
+      message: 'NOT paid yet. The owner was sent a World ID approval link by DM. Tell them to check their DMs. Do not say it was paid and do not state any figures.',
+    }, null, 2);
   }
 
   if (name === 'bankr_swap_and_drop') {

@@ -15,3 +15,6 @@ node_modules/
 npm-debug.log*
 
 .claude/
+
+# World ID approval audit log
+world-approvals.jsonl

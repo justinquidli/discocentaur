@@ -178,7 +178,7 @@ export function describeHeldAction({ code, tool, input, reason = 'document' }) {
   } else if (tool === 'create_watcher') {
     lines.push(`**Watcher** on ${chain}: ${amount} to each of the first ${input.maxWinners ?? 1} people to type “${String(input.triggerPhrase ?? '').slice(0, 100)}”`);
   } else if (tool === 'payout') {
-    lines.push(`**Pay out round \`${String(input.label ?? '?').slice(0, 64)}\`** from the agent's Dynamic wallet.`);
+    lines.push(`**Pay out round \`${String(input.label ?? '?').slice(0, 64)}\`** from the Quidli Connect wallet, after World ID approval.`);
     // Printed by the bot, read from the round file — so what is approved is the
     // actual split, whatever the model said or left out.
     if (input.summary) lines.push('```\n' + String(input.summary).slice(0, 1200) + '\n```');
