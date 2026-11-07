@@ -9,6 +9,7 @@
     "dev": "node --watch bot.js",
     "test": "node --test",
     "sync-shared": "node scripts/sync-shared.mjs",
+    "demo:world": "node scripts/demo-world-gate.mjs",
     "check": "node --check bot.js && node --test"
   },
   "dependencies": {

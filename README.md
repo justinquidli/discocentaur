@@ -468,9 +468,10 @@ so that repo must be checked out next to this one (or at `PAYOUT_DIR`) with its 
    the split as a round file, `rounds/<label>.json`. Takes 60–120 s.
 2. **The bot posts the split itself**, read from the round file. The model never sees the amounts,
    because a model that retyped them once got two rows wrong while the total still matched.
-3. **Confirm.** The payment is always held — document or not — and runs only after the owner's
-   `!confirm <code>`. Execution reads everything (repo, token, every amount) from the round file,
-   pays from the Quidli Connect wallet once the owner approves with World ID and comments on the PRs.
+3. **Approve with World ID.** The bot DMs the owner the split plus a World ID link and code. Nothing
+   is paid until that approval is validated (see below). `!confirm` does not work for payouts.
+   Execution reads everything (repo, token, every amount) from the round file and pays from the
+   Quidli Connect wallet, then comments on the PRs.
 
 Guards:
 
@@ -492,6 +493,46 @@ Guards:
 | `PAYOUT_TIMEOUT_MS` | 180000 | proposal time limit |
 | `PAYOUT_EXEC_TIMEOUT_MS` | 600000 | execution time limit |
 | `PAYOUT_REPROPOSE_TTL_MS` | 900000 | how long a proposal is reused |
+
+### World ID approval
+
+Payouts are approved by a registered treasurer through
+[World ID Agent Pass](https://auth.world.org/docs/guides/oidc) (OIDC Device Authorization Grant).
+World proves **who** approved. The bot supplies the **what**: the approval is bound to a SHA-256 of
+the saved round file, and the file is re-hashed after approval — if it changed, nothing is paid.
+
+Nothing is paid unless all of these hold (`world-id.js`, `payout-approval.js`):
+
+- the ID token is RS256-signed by the issuer's JWKS, with the exact issuer, our client ID as audience,
+  and a valid expiry;
+- `auth_time` belongs to this attempt (not earlier) and is not in the future;
+- `acr` is an accepted class (default: Orb only) and `amr` shows a World ID proof, not a passkey;
+- the `jti` was not seen before, and `sub` is on the treasurer allowlist;
+- the approval was written to `world-approvals.jsonl` **before** the payout started.
+
+Denied, expired, cancelled, wrong person, stale, replayed, World unavailable, changed round, bot
+restarting, or an unwritable audit log all pay nothing. A payout run that times out or throws is
+reported as **unknown**, never as unpaid.
+
+| Variable | Default | |
+|---|---|---|
+| `WORLD_ID_CLIENT_ID` / `WORLD_ID_CLIENT_SECRET` | — | from the World developer portal (client_secret_post). Payouts are disabled without them. |
+| `WORLD_ID_TREASURER_SUBS` | — | comma-separated World ID subjects allowed to approve |
+| `WORLD_ID_ISSUER` | `https://auth.world.org` | `https://sandbox.auth.world.org` for the sandbox |
+| `WORLD_ID_ACCEPTED_ACR` | Orb | comma-separated acr class URLs to accept |
+
+**Enrol a treasurer** on the host (never from Discord — otherwise whoever held the owner's Discord
+account could enrol their own World ID): `node scripts/world-enroll.mjs`, approve the link, put the
+printed `WORLD_ID_TREASURER_SUBS=...` in `.env`, then `pm2 restart <name> --update-env`.
+`WORLD_ID_DEBUG=1` prints each poll's HTTP status and error code (never tokens or secrets).
+
+**Demo without World:** `npm run demo:world` runs the real gate against a local stand-in for World
+(locally signed tokens, dummy payout, no money moves) through the approved path and every refusal
+path. It is not a live World approval.
+
+What this does **not** protect against: anyone with shell access to the host can run the payout CLI
+directly, and World ID does not show the approver the amount — the owner must read the split in the
+DM before approving.
 
 **Don't restart during a payout.** The CLI runs in its own process, and a pm2 restart stops it too;
 the bot's 10-second shutdown wait doesn't cover a run that takes minutes. Check
