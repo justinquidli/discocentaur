@@ -134,6 +134,7 @@ export function createWorldGate({
   allowEnroll = false,
   maxPending = 3,
   log = console,
+  debug = false,
 } = {}) {
   const pending = new Map();      // attempt id -> attempt
   const seenJti = new Set();
@@ -181,6 +182,7 @@ export function createWorldGate({
         continue;
       }
 
+      if (debug) log.error?.(`[world] poll -> http ${r.status} ${r.body?.error ?? (typeof r.body?.id_token === 'string' ? 'id_token' : 'no error field')}`);
       if (r.status === 200 && typeof r.body.id_token === 'string') {
         const v = await validateIdToken(r.body.id_token, {
           cfg, keys, startedAtSec: Math.floor(attempt.startedAtMs / 1000), nowSec: Math.floor(now() / 1000), seenJti, enroll: attempt.enroll,
