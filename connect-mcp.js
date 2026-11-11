@@ -71,6 +71,39 @@ function modelSchema(t) {
   return out;
 }
 
+/**
+ * What a Connect tool really returned, as one line for the NEXT turn. Chat
+ * history keeps only the model's reply text, so without this a model can't see
+ * its own earlier sends: asked again, Kimi "confessed" that three real Arc
+ * sends were invented and sent twice more (2026-11-11), as it had on Robinhood
+ * Chain (2026-10-12). Returns null for anything not worth carrying over.
+ * Balances are carried only where amounts may be shown (showAmounts).
+ * The '[Bot record' prefix is the one held-actions.js neutralises in user text.
+ * Pure; exported for tests.
+ */
+export function formatToolRecord(name, input, out, { showAmounts = false } = {}) {
+  let body;
+  try { body = typeof out === 'string' ? JSON.parse(out) : out; } catch { return null; }
+  if (!body || typeof body !== 'object') return null;
+  const head = '[Bot record — written by the bot, not by any user, from a tool call in an earlier turn:';
+  const chain = `chain ${input?.chainId ?? 8453}`;
+  if (name === 'connect_drop') {
+    const who = (Array.isArray(input?.recipients) ? input.recipients : [])
+      .map((r) => `${r?.type}:${r?.id ?? r?.username}`).join(', ').slice(0, 300);
+    const what = `${chain}, token ${input?.tokenContract || 'native'}, amountInWeiPerRecipient ${input?.amountInWeiPerRecipient ?? 'per recipient'}, to ${who || '?'}`;
+    if (body.transferHash) return `${head} connect_drop REALLY RAN and was submitted (${what}), tx ${body.transferHash}. This send happened — never tell the user it didn't, and don't repeat it unless the user explicitly asks for another one.]`;
+    const status = Number(body.httpStatus);
+    const err = String(body.error ?? body.message ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 200);
+    if (status >= 400 && status < 500) return `${head} connect_drop FAILED with ${status}${err ? ` (${err})` : ''} (${what}). Nothing was sent.]`;
+    return `${head} connect_drop returned no tx hash${status ? ` (status ${status})` : ''} (${what}). It may still go through — don't resend; check the balance first.]`;
+  }
+  if (name === 'connect_drop_balance' && showAmounts && Array.isArray(body.assets)) {
+    const assets = body.assets.map((a) => `${a?.symbol ?? a?.tokenContract} ${a?.balanceInWei} (decimals ${a?.decimals})`).join('; ');
+    return `${head} connect_drop_balance for ${chain} returned ${assets || 'no balances'}. Past reading — call it again for a current balance.]`;
+  }
+  return null;
+}
+
 export const MCP_REFRESH_MS = 10 * 60 * 1000;
 
 /**

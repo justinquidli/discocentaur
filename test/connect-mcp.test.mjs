@@ -169,3 +169,32 @@ test('the model is not shown connect_drop\'s idempotencyKey; other tools are unc
   assert.deepEqual(drop, { type: 'object', properties: { chainId: { type: 'integer' } }, required: ['chainId'] });
   assert.deepEqual(tools.find((t) => t.name === 'connect_lookup').input_schema, schema);
 });
+
+// ─── Records of what really ran, for the next turn (Kimi disowned three real
+// Arc sends, 2026-11-11) ─────────────────────────────────────────────────────
+
+import { formatToolRecord } from '../connect-mcp.js';
+
+test('a submitted drop is recorded as real, with its tx hash and what was sent', () => {
+  const rec = formatToolRecord('connect_drop',
+    { chainId: 5042, amountInWeiPerRecipient: '50000000000000000', recipients: [{ type: 'telegram', username: 'guillaume' }] },
+    JSON.stringify({ httpStatus: 201, transferHash: '0xb283' }));
+  assert.ok(rec.startsWith('[Bot record'), 'uses the marker held-actions.js neutralises in user text');
+  for (const s of ['REALLY RAN', 'chain 5042', 'token native', '50000000000000000', 'telegram:guillaume', 'tx 0xb283']) assert.ok(rec.includes(s), s);
+});
+
+test('a 4xx drop is recorded as nothing sent; anything else without a hash as unknown', () => {
+  const bad = formatToolRecord('connect_drop', { chainId: 8453 }, JSON.stringify({ httpStatus: 400, error: 'Insufficient\nfunds]' }));
+  assert.match(bad, /FAILED with 400 \(Insufficient funds \).*Nothing was sent\.\]$/);
+  for (const out of [{ httpStatus: 202 }, { httpStatus: 502 }, { error: 'timeout' }]) {
+    assert.match(formatToolRecord('connect_drop', { chainId: 8453 }, out), /may still go through — don't resend/);
+  }
+});
+
+test('a balance is recorded only where amounts may be shown; other tools never', () => {
+  const out = JSON.stringify({ assets: [{ symbol: 'USDC', balanceInWei: '5320524381614292000', decimals: 18 }] });
+  assert.match(formatToolRecord('connect_drop_balance', { chainId: 5042 }, out, { showAmounts: true }), /chain 5042 returned USDC 5320524381614292000 \(decimals 18\)/);
+  assert.equal(formatToolRecord('connect_drop_balance', { chainId: 5042 }, out), null);
+  assert.equal(formatToolRecord('connect_lookup', {}, '{"results":[]}', { showAmounts: true }), null);
+  assert.equal(formatToolRecord('connect_drop', {}, 'not json'), null);
+});

@@ -33,7 +33,7 @@ import { payoutProposal, payoutExecute, summariseRound, groundCheck, roundHash }
 import { createWorldGate, loadWorldConfig } from './world-id.js';
 import { createPayoutApprover, formatPayoutResult } from './payout-approval.js';
 import { appendFileSync } from 'node:fs';
-import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
+import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 
@@ -826,6 +826,7 @@ const CHAIN_EXPLORERS = {
   43114: 'https://snowtrace.io/tx/',
   143: 'https://monadscan.com/tx/',
   4663: 'https://robinhoodchain.blockscout.com/tx/',
+  5042: 'https://explorer.arc.io/tx/',
   1399811149: 'https://solscan.io/tx/',
 };
 function explorerTxUrl(chainId, hash) {
@@ -1420,6 +1421,12 @@ async function runTool(name, input, {
         await new Promise((r) => setTimeout(r, 3000));
         mcpOut = await mcpCallTool(name, callInput, keyToUse);
       }
+      // History keeps only reply text, so the next turn learns what really ran
+      // from this record. A confirmed held send records its own outcome.
+      if (!confirmed) {
+        const rec = formatToolRecord(name, input, mcpOut, { showAmounts: isPrivateChat });
+        if (rec) heldOutcomeRecords.push(contextId ?? currentChannelId, rec);
+      }
       if (name === 'connect_drop') {
         let body;
         try { body = JSON.parse(mcpOut); } catch { return mcpOut; }
@@ -1437,6 +1444,8 @@ async function runTool(name, input, {
       }
       return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
     } catch (err) {
+      // A thrown drop may still have landed; say so next turn rather than nothing.
+      if (name === 'connect_drop' && !confirmed) heldOutcomeRecords.push(contextId ?? currentChannelId, formatToolRecord(name, input, { error: err.message }));
       if (keyToUse) throw err;
       const reason = mcpFailureReason(err);
       if (reason === 'auth') return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Takes a minute, and it only has to be done once.';

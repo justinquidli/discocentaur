@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MCP_SEND_TOOLS } from '../connect-mcp.js';
+import { MCP_SEND_TOOLS, formatToolRecord } from '../connect-mcp.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -223,6 +223,7 @@ function buildRunTool() {
     },
     mcpFailureReason: (err) => (/HTTP 401/.test(err?.message ?? '') ? 'auth' : null),
     redactConnectMe: (t) => t,
+    formatToolRecord,
     _pendingExplorerUrls: [],
     quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { transferHash: '0xabc', explorerUrl: null }; },
     // Any DB touch means a scheduled/conditional/watcher write happened.
@@ -764,4 +765,26 @@ test('invented tx links are stripped on every explorer host, real ones kept', ()
     assert.equal(sanitize(`sent ${url}`, [url]), `sent ${url}`, `${host} real link kept`);
   }
   assert.match(sanitize('https://explorer.monad.xyz/tx/0xabc123...', []), /unverified transaction link removed/);
+});
+
+// History keeps only reply text; the next turn learns what really ran from a
+// record (Kimi disowned three real Arc sends, 2026-11-11).
+test('a sent drop leaves a record for the next turn; a confirmed held one does not add a second', async () => {
+  const { runTool, deps } = buildRunTool();
+  await runTool('connect_drop', { ...drop, chainId: 5042 }, { senderId: 'u1', senderApiKey: 'k', contextId: 'c' });
+  const [rec, ...more] = deps.heldOutcomeRecords.take('c');
+  assert.match(rec, /^\[Bot record.*connect_drop REALLY RAN.*chain 5042.*tx 0xabc/);
+  assert.equal(more.length, 0);
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', contextId: 'c', confirmed: true });
+  assert.equal(deps.heldOutcomeRecords.take('c').length, 0, 'the held path writes its own record');
+});
+
+test('a balance is carried to the next turn in private only', async () => {
+  const { deps } = buildRunTool();
+  const d = { ...deps, mcpToolNames: new Set(['connect_drop_balance']), mcpCallTool: async () => '{"assets":[{"symbol":"USDC","balanceInWei":"5","decimals":18}]}' };
+  const rt = new Function(...Object.keys(d), `${runToolSrc}\nreturn runTool;`)(...Object.values(d));
+  await rt('connect_drop_balance', { chainId: 5042 }, { senderId: 'u1', senderApiKey: 'k', contextId: 'dm', isPrivateChat: true });
+  assert.match(d.heldOutcomeRecords.take('dm')[0], /connect_drop_balance for chain 5042 returned USDC 5/);
+  await rt('connect_drop_balance', { chainId: 5042 }, { senderId: 'u1', senderApiKey: 'k', contextId: 'grp', isPrivateChat: false });
+  assert.equal(d.heldOutcomeRecords.take('grp').length, 0);
 });
