@@ -8,12 +8,12 @@ A Claude-powered Discord bot with [Quidli Connect](https://connect.quid.li) inte
 - **Swap, then send** — "swap 5 USDC to DEGEN and send 500 to @alice": the bot moves the sell amount from your Connect wallet to your [Bankr](https://bankr.bot) wallet, swaps, brings the result back, and sends the exact amount you asked for ([details](#bankr--swaps-and-market-data))
 - **Market questions** — token prices, contract addresses and your Bankr wallet balance, via Bankr
 - **Pay invoices from a PDF** — drop an invoice in chat; the bot reads it and prepares the payment to the vendor's email or social handle, held until you `!confirm` ([details](#pdf-attachments))
-- **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche, Monad, Robinhood Chain, Arc and Solana. Explorer links follow the chain
+- **Multi-chain** — Base by default, or any chain Connect offers for drops; the bot reads that list from Connect rather than keeping its own (on 2026-11-11: Ethereum, Optimism, Polygon, Arbitrum, Avalanche, World Chain, Monad, Robinhood Chain, Arc and Solana). Explorer links follow the chain
 - **Look up wallets** — resolve any Discord user, Farcaster handle, Twitter, email, GitHub, LinkedIn, Slack, Telegram, or phone number to their ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos) for any user by social identity
 - **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
 - **Send guardrail** — you choose whether sends wait for `!confirm`: never, always, or when you're replying to someone ([details](#send-guardrail))
-- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero. In a server channel it only says whether you can cover a send; ask in a DM for the amounts
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Which tokens show up is Connect's call; a token it doesn't report reads as zero. In a server channel it only says whether you can cover a send; ask in a DM for the amounts
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Presence-based drops** — target only online/idle/dnd members at execution time, not when scheduled
 - **Conditional drops** — "if BTC is above $100k, send everyone 1 USDC" — evaluated automatically using real-time web search
@@ -303,13 +303,14 @@ How it works:
 
 Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
 
-Note on chains: drops are **multi-chain**. Base (8453) is the default and what the model uses
-unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161),
-Avalanche (43114) and Solana (1399811149) all work. Connect also lists Monad (143), Robinhood Chain (4663)
-and Arc (5042, USDC is the native token) as drop-capable, and the bot builds explorer links for all three;
-Robinhood Chain and Arc sends have run through this bot (2026-10-12, 2026-11-11). World Chain (480) is listed as drop-capable too but has no explorer link here yet. `connect_get_chains` lets the
-model answer chain questions from the server rather than guessing; the system prompt's own chain list is
-shorter than that, so the server is the source of truth.
+Note on chains: drops are **multi-chain**, and the bot keeps **no chain list of its own**. The system
+prompt says only that Base (8453) is the default; when the user names any other chain, the model calls
+`connect_get_chains` and uses the chainId whose name matches, never a guess or a similar-sounding chain.
+A hardcoded list drifted once already: it lacked Arc, and Kimi read "ARC" as Arbitrum (2026-11-11). So a
+chain Connect adds works with no bot change, apart from its explorer link (below). Native-token and
+Solana rules (lamports, account rent, `solWalletAddress`) come from Connect's own `connect_drop`
+description, not from the prompt. Sends on Robinhood Chain and Arc have run through this bot
+(2026-10-12, 2026-11-11).
 
 Note on history: a chat's history keeps only the model's reply text, not its tool calls. So that a
 later turn knows what really ran, every `connect_drop` the model makes (and, in private chats, every
@@ -327,10 +328,8 @@ came from a real drop result (this turn, or a confirmed action earlier in the ch
 `CHAIN_EXPLORERS`, so an invented link on a chain with no explorer entry is still removed. It strips links
 only — a plain-text "sent!" with no link is not caught.
 
-Solana specifics the model is told about: amounts are lamports for native SOL (9 decimals), USDC is
-the SPL mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (6 decimals), social recipients are paid
-at their `solWalletAddress`, and a native send to an empty wallet needs at least 890880 lamports.
-Omit `tokenContract` (or set it null) to send a chain's native token.
+`CHAIN_EXPLORERS` covers Ethereum, Optimism, Polygon, Base, Arbitrum, Avalanche, Monad, Robinhood Chain,
+Arc and Solana. World Chain has none yet, so its sends go out without a link.
 
 To see what the server currently offers and how it is annotated:
 
