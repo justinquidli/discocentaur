@@ -253,6 +253,13 @@ while a document is in the conversation, or when the user's [send guardrail](#se
 swap-and-send call `connect_drop` the same way, each with its own key. The hand-written REST
 `/drop` client and the x402 host-wallet path are gone.
 
+NFTs: since Connect MCP added ERC-721/ERC-1155 to `connect_drop` (`tokenStandard`, plus `tokenId` /
+`tokenAmount` on each recipient, Nov 2026), the model is shown those fields like any other and the
+call is forwarded unchanged. Not yet exercised through this bot (2026-11-12). Known gaps: Connect's
+balance tool lists no NFTs, so the user has to give the collection and token id; the held-send
+summary and the `[Bot record]` assume an amount, so an NFT send reads oddly there; and the bot's own
+features (scheduled/conditional drops, watchers, claims) send fungible tokens only.
+
 Trust tools: `connect_trust_check` and `connect_trust_graph` are read-only and register like the
 rest. `connect_trust_create` and `connect_trust_revoke` are write tools — they sign an EAS
 attestation from the key owner's wallet — and are offered only because they are named in
