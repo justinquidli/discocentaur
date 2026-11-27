@@ -36,7 +36,7 @@ import { appendFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
-import { parseDefaultChain, defaultChainPrompt } from './default-chain.js';
+import { parseDefaultChain, defaultChainPrompt, defaultChainWarning } from './default-chain.js';
 import { createRepeatGuard, repeatNote } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -3068,6 +3068,10 @@ client.once(Events.ClientReady, (c) => {
     : CLAUDE_MODEL;
   console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
+  console.log(`   Default chain: ${DEFAULT_CHAIN_INFO.name}`);
+  mcpCallTool('connect_get_chains', {}, QUIDLI_API_KEY)
+    .then((out) => { const w = defaultChainWarning(DEFAULT_CHAIN_INFO, JSON.parse(out)?.chains); if (w) console.warn(`⚠️  ${w}`); })
+    .catch(() => {});
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);
