@@ -78,7 +78,7 @@ const {
   //
   // Paid tiers can use any of the 200+ slugs (anthropic/claude-sonnet-4.6, etc).
   // Users can override per-channel with: !llm hermes <key> <model>
-  NOUS_MODEL = 'poolside/laguna-s-2.1:free',
+  NOUS_MODEL = 'tencent/hy4-flash:free',
   REQUIRE_USER_LLM_KEY = 'false', // Legacy — host keys are now owner/allowlist-only regardless
   // Who may spend the HOST's LLM keys. The owner always can. Everyone else must
   // either be listed here (handle or numeric ID), hold a role in
