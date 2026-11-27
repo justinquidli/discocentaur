@@ -344,6 +344,7 @@ const HOLD_REASONS = {
   document: "a document is in this conversation, so transfers don't run automatically",
   guard_all: 'you asked to confirm every send',
   guard_replies: "you're replying to someone else's message, and you asked to confirm sends in that case",
+  repeat: 'you just sent this same payment',
 };
 
 /** Map a user's reply to a guard value, or null if it isn't one. */

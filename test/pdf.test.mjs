@@ -9,6 +9,7 @@
  * mcp.test.mjs.
  */
 import { test } from 'node:test';
+import { createRepeatGuard, repeatNote } from '../repeat-guard.js';
 import assert from 'node:assert/strict';
 import { MCP_SEND_TOOLS, formatToolRecord } from '../connect-mcp.js';
 import { readFileSync } from 'node:fs';
@@ -247,6 +248,8 @@ function buildRunTool() {
     holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     guards: {}, asked: new Set(),
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
+    repeatGuard: createRepeatGuard(),
+    repeatNote,
     claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
   };
   const runTool = new Function(...Object.keys(deps), `${runToolSrc}\nreturn runTool;`)(...Object.values(deps));
@@ -662,7 +665,7 @@ test('connect_drop gets a new key on every call, and a 202 is retried with the s
   const first = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
   assert.equal(first.transferHash, '0xabc');
   assert.equal(seen[0], seen[1], '202 retry reuses the same key');
-  const second = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  const second = JSON.parse(await rt('connect_drop', { ...input, amountInWeiPerRecipient: '20000' }, { senderId: 'u1', senderApiKey: 'k' }));
   assert.equal(second.transferHash, '0xdef');
   assert.notEqual(seen[2], seen[0], 'a new call gets a new key, even when the model repeats its own');
   assert.ok(!seen.includes('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
@@ -695,7 +698,7 @@ test('never chose: asked once on the first send, which still runs', async () => 
   const { runTool, calls } = buildRunTool();
   const n1 = [], n2 = [];
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n1 });
-  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
+  await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '2000000' }, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
   assert.equal(calls.length, 2);
   assert.match(n1.join('\n'), /!guard replies/);
   assert.equal(n2.length, 0);
@@ -787,4 +790,18 @@ test('a balance is carried to the next turn in private only', async () => {
   assert.match(d.heldOutcomeRecords.take('dm')[0], /connect_drop_balance for chain 5042 returned USDC 5/);
   await rt('connect_drop_balance', { chainId: 5042 }, { senderId: 'u1', senderApiKey: 'k', contextId: 'grp', isPrivateChat: false });
   assert.equal(d.heldOutcomeRecords.take('grp').length, 0);
+});
+
+test('the same payment twice in a row: the second waits for !confirm, a different one runs', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.guards.u1 = 'none';
+  const ctx = { senderId: 'u1', senderApiKey: 'k', currentChatId: 1 };
+  await runTool('connect_drop', drop, ctx);
+  const notices = [];
+  const again = JSON.parse(await runTool('connect_drop', drop, { ...ctx, heldNotices: notices }));
+  assert.equal(again.status, 'held_for_confirmation');
+  assert.match(notices.join('\n'), /same payment .*ago/);
+  assert.equal(calls.length, 1, 'paid once');
+  await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '3000000' }, ctx);
+  assert.equal(calls.length, 2);
 });

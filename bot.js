@@ -36,6 +36,8 @@ import { appendFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
+import { parseDefaultChain, defaultChainPrompt } from './default-chain.js';
+import { createRepeatGuard, repeatNote } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,8 @@ const {
   SYSTEM_PROMPT: SYSTEM_PROMPT_OVERRIDE,
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,
+  // Chain for sends that don't name one: base (default, gas sponsored) or solana.
+  DEFAULT_CHAIN,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
@@ -135,7 +139,11 @@ const QUIDLI_BASE_URL = 'https://api.connect.quid.li';
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = SYSTEM_PROMPT_OVERRIDE || `
+const { chain: DEFAULT_CHAIN_INFO, warning: DEFAULT_CHAIN_WARNING } = parseDefaultChain(DEFAULT_CHAIN);
+const DEFAULT_CHAIN_ID = DEFAULT_CHAIN_INFO.id;
+if (DEFAULT_CHAIN_WARNING) console.warn(`⚠️  ${DEFAULT_CHAIN_WARNING}`);
+const repeatGuard = createRepeatGuard();
+const BASE_SYSTEM_PROMPT = SYSTEM_PROMPT_OVERRIDE || `
 You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Quidli Connect. Your job is to EXECUTE — not explain, not ask for confirmation, not hedge. When someone asks you to do something, do it.
 
 ## Core philosophy
@@ -156,7 +164,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
-- Base (8453) is the default. If the user names any other chain, call connect_get_chains first and use the chainId whose name matches what they said. Never guess a chain ID and never substitute a similar-sounding chain; if nothing matches, say so.
+- If the user names no chain, use the default chain (see "Default chain for this server" below). If the user names any other chain, call connect_get_chains first and use the chainId whose name matches what they said. Never guess a chain ID and never substitute a similar-sounding chain; if nothing matches, say so.
 - Always check the balance on the chain you are about to send on before sending.
 - Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
 - After success, show the explorer link the drop tool returns (explorerUrl). Do not construct one yourself — it differs per chain, and a link you invent will be stripped before the user sees it.
@@ -267,6 +275,8 @@ If a tool call returns an error or empty result:
 - Failure: state what you tried and what the user can do next. No raw JSON, no stack traces.
 - Never show internal error messages verbatim to the user.
 `.trim();
+// Last, so it wins over a "Base is the default" line in a custom prompt.
+const SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + defaultChainPrompt(DEFAULT_CHAIN_INFO);
 
 // ─── Encryption helpers ───────────────────────────────────────────────────────
 
@@ -824,6 +834,8 @@ const CHAIN_EXPLORERS = {
   143: 'https://monadscan.com/tx/',
   4663: 'https://robinhoodchain.blockscout.com/tx/',
   5042: 'https://explorer.arc.io/tx/',
+  42220: 'https://celoscan.io/tx/',
+  480: 'https://worldscan.org/tx/',
   1399811149: 'https://solscan.io/tx/',
 };
 function explorerTxUrl(chainId, hash) {
@@ -841,7 +853,7 @@ function quidliDrop(args, apiKey) {
 // Scheduled and conditional drops, watchers, claims and swap-and-send send
 // through Connect's MCP connect_drop. Recipients go as given; Connect resolves
 // them for the chain.
-async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
+async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = DEFAULT_CHAIN_ID, tokenContract }, apiKey = QUIDLI_API_KEY) {
   if (!apiKey) {
     throw new Error('No Quidli API key available for this drop. Link your Connect key, or ask the bot owner to configure a host key.');
   }
@@ -1100,7 +1112,7 @@ const tools = [
         },
         amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per recipient.' },
         tokenContract: { type: 'string', description: 'Token contract address.' },
-        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+        chainId: { type: 'number', description: `Chain ID. Default: ${DEFAULT_CHAIN_INFO.name} (${DEFAULT_CHAIN_ID}).` },
       },
       required: ['delayMinutes', 'amountInWeiPerRecipient', 'tokenContract'],
     },
@@ -1148,7 +1160,7 @@ const tools = [
         maxWinners: { type: 'number', description: 'How many people can win. Default 1 ("first person only").' },
         amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per winner.' },
         tokenContract: { type: 'string', description: 'Token contract address.' },
-        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+        chainId: { type: 'number', description: `Chain ID. Default: ${DEFAULT_CHAIN_INFO.name} (${DEFAULT_CHAIN_ID}).` },
       },
       required: ['triggerPhrase', 'amountInWeiPerRecipient', 'tokenContract'],
     },
@@ -1313,9 +1325,18 @@ async function runTool(name, input, {
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
   const guard = MONEY_TOOLS.has(name) && !confirmed ? getSendGuard(senderId) : null;
-  const holdWhy = SELF_HELD.has(name) ? null
+  let holdWhy = SELF_HELD.has(name) ? null
     : holdReason({ tool: name, confirmed, documentInContext, quotesOther, guard })
       ?? (ALWAYS_HELD.has(name) && MONEY_TOOLS.has(name) && !confirmed ? 'document' : null);
+  // The same payment twice in a row (a message sent twice, a retry) waits for
+  // !confirm. Claimed before it runs, so two copies at once can't both pass.
+  let repeatClaimed = false;
+  const canPayHere = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID));
+  if (!holdWhy && name === 'connect_drop' && !confirmed && canPayHere) {
+    const ago = repeatGuard.claim(senderId, input);
+    if (ago != null) { holdWhy = 'repeat'; heldNotices?.push(repeatNote(ago, '!')); }
+    else repeatClaimed = true;
+  }
   if (holdWhy) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
@@ -1427,9 +1448,13 @@ async function runTool(name, input, {
       if (name === 'connect_drop') {
         let body;
         try { body = JSON.parse(mcpOut); } catch { return mcpOut; }
-        const explorerUrl = explorerTxUrl(input?.chainId ?? 8453, body?.transferHash);
+        const explorerUrl = explorerTxUrl(input?.chainId ?? DEFAULT_CHAIN_ID, body?.transferHash);
         if (explorerUrl) _pendingExplorerUrls.push(explorerUrl);
         console.log('[drop] result:', JSON.stringify(body));
+        // Sent: a copy in the next couple of minutes waits for confirmation.
+        // Clearly refused: a retry isn't a repeat. Unclear keeps the claim.
+        if (body?.transferHash) repeatGuard.mark(senderId, input);
+        else if (repeatClaimed && Number(body?.httpStatus) >= 400) repeatGuard.release(senderId, input);
         return JSON.stringify({ ...body, explorerUrl }, null, 2);
       }
       if (name === 'connect_drop_balance' && !isPrivateChat) {
@@ -1613,7 +1638,7 @@ async function runTool(name, input, {
       return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
     }
     const watcherId = crypto.randomUUID();
-    const dropInput = { amountInWeiPerRecipient: input.amountInWeiPerRecipient, tokenContract: input.tokenContract, chainId: input.chainId ?? 8453 };
+    const dropInput = { amountInWeiPerRecipient: input.amountInWeiPerRecipient, tokenContract: input.tokenContract, chainId: input.chainId ?? DEFAULT_CHAIN_ID };
     db.prepare('INSERT INTO watchers (id, sender_id, channel_id, trigger_phrase, drop_input, max_winners) VALUES (?, ?, ?, ?, ?, ?)')
       .run(watcherId, senderId, input.channelId ?? currentChannelId, input.triggerPhrase, JSON.stringify(dropInput), input.maxWinners ?? 1);
     return JSON.stringify({ success: true, watcherId, message: `Watching for "${input.triggerPhrase}" in this channel. First person to type it gets the drop.` });
