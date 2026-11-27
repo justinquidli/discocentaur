@@ -37,7 +37,7 @@ import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connec
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 import { parseDefaultChain, defaultChainPrompt, defaultChainWarning } from './default-chain.js';
-import { createRepeatGuard, repeatNote } from './repeat-guard.js';
+import { createRepeatGuard } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1334,7 +1334,7 @@ async function runTool(name, input, {
   const canPayHere = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID));
   if (!holdWhy && name === 'connect_drop' && !confirmed && canPayHere) {
     const ago = repeatGuard.claim(senderId, input);
-    if (ago != null) { holdWhy = 'repeat'; heldNotices?.push(repeatNote(ago, '!')); }
+    if (ago != null) holdWhy = 'repeat';
     else repeatClaimed = true;
   }
   if (holdWhy) {

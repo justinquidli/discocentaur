@@ -800,7 +800,7 @@ test('the same payment twice in a row: the second waits for !confirm, a differen
   const notices = [];
   const again = JSON.parse(await runTool('connect_drop', drop, { ...ctx, heldNotices: notices }));
   assert.equal(again.status, 'held_for_confirmation');
-  assert.match(notices.join('\n'), /same payment .*ago/);
+  assert.match(notices.join('\n'), /you just sent this same payment/);
   assert.equal(calls.length, 1, 'paid once');
   await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '3000000' }, ctx);
   assert.equal(calls.length, 2);

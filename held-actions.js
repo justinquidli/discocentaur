@@ -18,6 +18,7 @@
  * Side-effect free so tests can import it.
  */
 import { randomInt } from 'node:crypto';
+import { CHAINS } from './default-chain.js';
 import { MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 
 // Tools whose execution commits the sender's funds, now or later.
@@ -37,17 +38,12 @@ export const MAX_HELD_PER_USER = 5;
 // No 0/O/1/I/L — these get read aloud and retyped.
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
-// Native USDC per chain. Anything not listed is shown in base units with its
-// contract, rather than guessing decimals and showing a wrong amount.
-const KNOWN_TOKENS = {
-  '8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': { symbol: 'USDC', decimals: 6 },
-  '1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': { symbol: 'USDC', decimals: 6 },
-  '10:0x0b2c639c533813f4aa9d7837caf62653d097ff85': { symbol: 'USDC', decimals: 6 },
-  '137:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359': { symbol: 'USDC', decimals: 6 },
-  '42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831': { symbol: 'USDC', decimals: 6 },
-  '43114:0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e': { symbol: 'USDC', decimals: 6 },
-  '1399811149:epjfwdd5aufqsseqm2qn1xzybapc8g4weggkzwytdt1v': { symbol: 'USDC', decimals: 6 },
-};
+// USDC per chain, from the onchain-verified list in default-chain.js (a
+// hand-typed copy here once had a typo in the Solana mint). Anything not
+// listed is shown in base units with its contract, rather than guessing
+// decimals and showing a wrong amount.
+const KNOWN_TOKENS = Object.fromEntries(Object.values(CHAINS).filter((c) => c.usdc)
+  .map((c) => [`${c.id}:${c.usdc.toLowerCase()}`, { symbol: 'USDC', decimals: 6 }]));
 
 const CHAIN_NAMES = {
   1: 'Ethereum', 10: 'Optimism', 137: 'Polygon', 8453: 'Base',
@@ -108,16 +104,25 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
   };
 }
 
+function trimUnits(raw, decimals) {
+  const s = raw.padStart(decimals + 1, '0');
+  const whole = s.slice(0, -decimals);
+  const frac = s.slice(-decimals).replace(/0+$/, '');
+  return `${BigInt(whole).toLocaleString('en-US')}${frac ? '.' + frac : ''}`;
+}
+
 export function formatAmount(amountInWei, tokenContract, chainId = 8453) {
   const raw = String(amountInWei ?? '');
   if (!/^\d+$/.test(raw)) return `⚠️ invalid amount "${raw.slice(0, 40)}"`;
-  if (!tokenContract) return `${raw} base units of the default token`;
+  if (!tokenContract) {
+    const c = Object.values(CHAINS).find((x) => x.id === Number(chainId));
+    const decimals = !c || c.nativeIsUsdc ? null : c.native === 'SOL' ? 9 : 18;
+    if (decimals == null) return `${raw} base units of the native token`;
+    return `${trimUnits(raw, decimals)} ${c.native}`;
+  }
   const tok = KNOWN_TOKENS[`${Number(chainId)}:${String(tokenContract).toLowerCase()}`];
   if (!tok) return `${raw} base units of token \`${tokenContract}\` (unrecognised — check decimals)`;
-  const s = raw.padStart(tok.decimals + 1, '0');
-  const whole = s.slice(0, -tok.decimals);
-  const frac = s.slice(-tok.decimals).replace(/0+$/, '');
-  return `${BigInt(whole).toLocaleString('en-US')}${frac ? '.' + frac : ''} ${tok.symbol}`;
+  return `${trimUnits(raw, tok.decimals)} ${tok.symbol}`;
 }
 
 // Email and phone identifiers are the address itself — "email arnaud@x.com",
