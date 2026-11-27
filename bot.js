@@ -2894,6 +2894,11 @@ async function handleDM(message) {
 
 async function handleConfirmCommand(message, { verb, code }) {
   const senderId = message.author.id;
+  // Exactly one transfer waiting and no code typed: the bare command means that one.
+  if (!code) {
+    const mine = heldActions.listFor(senderId);
+    if (mine.length === 1) code = mine[0].code;
+  }
   if (!code) {
     const mine = heldActions.listFor(senderId);
     await message.reply(mine.length
