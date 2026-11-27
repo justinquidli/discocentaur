@@ -2834,7 +2834,7 @@ async function handleDM(message) {
         '  Example: `!llm openrouter sk-or-... meta-llama/llama-3-70b-instruct`\n' +
         '  Default model: openai/gpt-4o\n' +
         '  `!llm hermes <key> [model]`\n' +
-        '  Example: `!llm hermes sk-... poolside/laguna-s-2.1:free`  (free tier)\n' +
+        '  Example: `!llm hermes sk-... tencent/hy4-flash:free`  (free tier)\n' +
         '  Nous Portal proxies 200+ models — see portal.nousresearch.com/info\n\n' +
         'Your key is stored encrypted and used instead of the host key. DM `!llm-remove` to disconnect.'
       );
